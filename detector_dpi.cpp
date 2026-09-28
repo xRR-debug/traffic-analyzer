@@ -445,6 +445,13 @@ std::vector<std::string> detectDpiInjection(const std::vector<Packet>& packets,
     return detectDpiInjection(buildTcpConnTable(packets, localIp));
 }
 
+// VPN-туннель «шлём — в ответ почти ничего»: ≥10 пакетов ушло, ≤2 пришло.
+// Не строго 0: ТСПУ часто пропускает первое рукопожатие (ответ на handshake
+// виден) и режет поток уже после него. Одно правило для журнала, таблицы и обзора.
+static bool udpTunnelStarved(long long out, long long in) {
+    return out >= 10 && in <= 2;
+}
+
 // Собирает множество IP (без порта) с признаками блокировки на ТСПУ:
 //  - TCP: RST-инъекция / молчаливый дроп после ClientHello (по SNI) — только
 //    если на этом адресе не работал другой сайт (иначе адрес общий, CDN);
@@ -516,8 +523,9 @@ std::set<std::string> collectTspuBlockedIps(const std::vector<Packet>& packets,
     // UDP-часть: VPN-туннель, в который долго шлём, а в ответ — ничего.
     // Помечаем мягко (в таблице — «ТСПУ?»): то же самое дают неверный ключ и
     // лежащий сервер. Требуем: входящий UDP в дампе вообще есть (иначе дамп
-    // однонаправленный), ответов 0, попытки идут ≥10 с (WireGuard повторяет
-    // handshake раз в 5 с) и это точно туннель (сигнатура WG или VPN-порт).
+    // однонаправленный), ответов почти нет (udpTunnelStarved), попытки идут ≥10 с
+    // (WireGuard повторяет handshake раз в 5 с) и это точно туннель (сигнатура WG
+    // или VPN-порт).
     struct U { long long out = 0, in = 0; bool wg = false; long long t0 = -1, t1 = -1; };
     std::map<std::string, U> uc;
     bool anyInboundUdp = false;
@@ -544,7 +552,7 @@ std::set<std::string> collectTspuBlockedIps(const std::vector<Packet>& packets,
     if (anyInboundUdp)
         for (auto& kv : uc) {
             const U& u = kv.second;
-            if (u.wg && u.out >= 10 && u.in == 0 && u.t0 >= 0 && u.t1 - u.t0 >= 10000000LL)
+            if (u.wg && udpTunnelStarved(u.out, u.in) && u.t0 >= 0 && u.t1 - u.t0 >= 10000000LL)
                 blocked.insert(kv.first);
         }
 
@@ -727,7 +735,7 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
             // Шлём, а в ответ почти ничего. Пассивно НЕ отличить блокировку от
             // неверного ключа/конфига (WireGuard молча игнорирует чужой handshake)
             // и от лежащего сервера — поэтому не «ЗАБЛОКИРОВАН», а перечень причин.
-            bool starved = (c.out >= 10 && c.in <= 2);
+            bool starved = udpTunnelStarved(c.out, c.in);
             // IPsec: судим по ESP-данным, IKE — лишь уточнение. Туннель, поднятый до
             // начала съёма, в дампе виден одним ESP, без IKE, — это норма.
             const bool espSeen = c.espOut + c.espIn > 0;
@@ -1614,7 +1622,7 @@ std::vector<BlockReason> collectBlockReasons(
         put(ipName(kv.first), kv.first, "SYN_DROP", b);
     }
 
-    // UDP: QUIC или VPN-туннель, на который нет ни одного ответа
+    // UDP: QUIC без единого ответа или VPN-туннель, где ответов почти нет
     struct U { long long out = 0, in = 0, t0 = -1, t1 = -1; bool quic = false; const char* vpn = nullptr;
                std::string sni; };
     std::map<std::string, U> uc;
@@ -1641,13 +1649,13 @@ std::vector<BlockReason> collectBlockReasons(
     if (anyInboundUdp) {
         for (const auto& kv : uc) {
             const U& u = kv.second;
-            if (u.in != 0 || u.t0 < 0) continue;
+            if (u.t0 < 0) continue;
             std::string name = !u.sni.empty() ? u.sni : ipName(kv.first);
-            if (u.vpn && u.out >= 10 && u.t1 - u.t0 >= 10000000LL) {
-                snprintf(b, sizeof(b), "%s: %lld пакетов за %.0f с, ответов 0",
-                         u.vpn, u.out, (u.t1 - u.t0) / 1e6);
+            if (u.vpn && udpTunnelStarved(u.out, u.in) && u.t1 - u.t0 >= 10000000LL) {
+                snprintf(b, sizeof(b), "%s: %lld пакетов за %.0f с, ответов %lld",
+                         u.vpn, u.out, (u.t1 - u.t0) / 1e6, u.in);
                 put(name, kv.first, "UDP_DROP", b);
-            } else if (u.quic && !u.vpn && u.out >= 3 && tt.tEnd - u.t0 >= cfg().tailUs &&
+            } else if (u.in == 0 && u.quic && !u.vpn && u.out >= 3 && tt.tEnd - u.t0 >= cfg().tailUs &&
                        !worked.count(name)) {
                 snprintf(b, sizeof(b), "QUIC: %lld датаграмм, ответов 0 (по TCP не открылось)", u.out);
                 put(name, kv.first, "UDP_DROP", b);
