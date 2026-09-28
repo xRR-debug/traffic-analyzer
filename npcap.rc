@@ -1,0 +1,8 @@
+// Ресурс: установщик Npcap, вшитый в exe.
+// При сборке npcap-installer.exe из папки redist встраивается в бинарник.
+// В коде извлекается по имени "NPCAP_INSTALLER" типа RCDATA.
+NPCAP_INSTALLER RCDATA "redist\\npcap-installer.exe"
+
+// Картинка на фон окна для темы «Аниме» (gui_main.cpp, по имени "ANIME_BG").
+// JPEG, а не WebP: кодека WebP нет в LTSC/Server-сборках Windows.
+ANIME_BG RCDATA "gui\\assets\\anime_bg.jpg"

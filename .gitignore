@@ -1,0 +1,30 @@
+# сборка Visual Studio / CMake
+x64/
+Debug/
+Release/
+build/
+.vs/
+*.vcxproj.user
+*.obj
+*.pdb
+*.ipdb
+*.iobj
+*.exe
+*.log
+*.tlog/
+
+# Npcap: лицензия не разрешает распространять (см. README, «Сборка»)
+npcap-sdk/
+redist/
+
+# рабочие данные: настройки, дампы абонентов, базы
+analyzer.ini
+*.pcap
+*.pcapng
+*.cap
+*.BIN
+*.bin
+*.csv
+
+# macOS
+.DS_Store

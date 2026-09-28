@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;hm;inl;inc</Extensions>
+    </Filter>
+    <Filter Include="GUI">
+      <UniqueIdentifier>{6D2E1B7A-3C4F-4E1A-9B2D-7F8A1C0E5D31}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="GUI\imgui">
+      <UniqueIdentifier>{2B9C4E6D-8A1F-4D3B-A5C7-1E0F9D8B7A62}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="analyzer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="detector_dpi.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="detector_vpn.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="report.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="parser.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="network.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ui.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="capture.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="config.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ip2proxy.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="gui\gui.cpp">
+      <Filter>GUI</Filter>
+    </ClCompile>
+    <ClCompile Include="gui\gui_main.cpp">
+      <Filter>GUI</Filter>
+    </ClCompile>
+    <ClCompile Include="gui\gui_log.cpp">
+      <Filter>GUI</Filter>
+    </ClCompile>
+    <ClCompile Include="gui\gui_data.cpp">
+      <Filter>GUI</Filter>
+    </ClCompile>
+    <ClCompile Include="gui\gui_rkn.cpp">
+      <Filter>GUI</Filter>
+    </ClCompile>
+    <ClCompile Include="gui\imgui\imgui.cpp">
+      <Filter>GUI\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="gui\imgui\imgui_draw.cpp">
+      <Filter>GUI\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="gui\imgui\imgui_tables.cpp">
+      <Filter>GUI\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="gui\imgui\imgui_widgets.cpp">
+      <Filter>GUI\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="gui\imgui\imgui_impl_win32.cpp">
+      <Filter>GUI\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="gui\imgui\imgui_impl_dx11.cpp">
+      <Filter>GUI\imgui</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="common.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="analyzer_internal.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="config.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="gui\gui.h">
+      <Filter>GUI</Filter>
+    </ClInclude>
+    <ClInclude Include="gui\gui_app.h">
+      <Filter>GUI</Filter>
+    </ClInclude>
+    <ClInclude Include="gui\imgui\imgui.h">
+      <Filter>GUI\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="gui\imgui\imconfig.h">
+      <Filter>GUI\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="gui\imgui\imgui_internal.h">
+      <Filter>GUI\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="gui\imgui\imgui_impl_win32.h">
+      <Filter>GUI\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="gui\imgui\imgui_impl_dx11.h">
+      <Filter>GUI\imgui</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="analyzer.ini.example" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="npcap.rc" />
+  </ItemGroup>
+</Project>
