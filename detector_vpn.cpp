@@ -619,12 +619,23 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
                          !isOwnIspOrg(topInfo.org, topInfo.asn);
     // не хостинг + сайт по DNS (скачали файл с static.yoomoney.ru у МТС) — не туннель
     const bool plainSite = !dnsSite.empty() && !topHost;
+    const bool looksCdn  = looksCdnOrg(topInfo.org) || !dnsSite.empty();   // сайт по DNS на хостинге — как CDN
+    // Не хостинг и не CDN (банк, магазин, оператор) — баллов нет: VPN-серверы
+    // стоят на VPS, а дамп проверки одного ресурса и так почти весь уходит
+    // в один адрес. Туннель к домашнему роутеру ловят сигнатуры и порты.
+    // Адрес не резолвился (org неизвестна) — судить не по чему, считаем как раньше.
+    const bool topKnown = !topInfo.org.empty() && topInfo.org != "-";
+    const bool plainService = topKnown && !topHost && !looksCdn;
     if (!topFlow.first.empty() && topShare >= 0.80 && topFlow.second.bytes > 200000 && !plainSite) {
         const IpInfo& i = topInfo;
-        bool looksCdn  = looksCdnOrg(i.org) || !dnsSite.empty();   // сайт по DNS на хостинге — как CDN
         bool looksHost = topHost;
         char buf[512];
-        if (!dnsSite.empty())
+        if (plainService)
+            snprintf(buf, sizeof(buf),
+                "Один IP %s (%s, %s) забирает %.0f%% трафика, но это не хостинг — "
+                "обычный сервис (баллов не даёт)",
+                topFlow.first.c_str(), i.org.c_str(), i.asn.c_str(), topShare * 100.0);
+        else if (!dnsSite.empty())
             snprintf(buf, sizeof(buf),
                 "Один IP %s (%s, %s) забирает %.0f%% трафика — это сайт %s (адрес из DNS "
                 "совпадает с SNI) на хостинге; слабый признак",
@@ -636,20 +647,21 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
                 topFlow.first.c_str(), i.org.c_str(), i.asn.c_str(),
                 (looksHost && !looksCdn) ? " [хостинг]" : "", topShare * 100.0);
         reasons.push_back(buf);
-        // Сама по себе концентрация трафика на одной точке — сильный признак туннеля,
-        // независимо от того, хостинг это или нет (обычный сёрфинг так не выглядит):
+        // Концентрация трафика на хостинге (или неизвестном адресе) — признак туннеля:
         //   >=95%  -> +3 (почти весь трафик в одну точку, классический VPN/туннель)
         //   >=80%  -> +2
         // CDN снижает значимость (легитимный CDN может давать большую долю): максимум +1.
-        if (looksCdn)            shape += 1;
+        if (plainService)        {}
+        else if (looksCdn)       shape += 1;
         else if (topShare >= 0.95) shape += 3;
         else                       shape += 2;
         // хостинг/датацентр в роли единственной точки — добавочный балл
         if (looksHost && !looksCdn && topShare < 0.95) shape += 1;
     }
 
-    // 3) низкое разнообразие удалённых хостов при большом объёме
-    if (v.byRemote.size() <= 2 && sumRemoteBytes > 500000) {
+    // 3) низкое разнообразие удалённых хостов при большом объёме. Если основной
+    //    адрес — обычный сервис или сайт по DNS, это просто проверка одного ресурса
+    if (v.byRemote.size() <= 2 && sumRemoteBytes > 500000 && !plainService && !plainSite) {
         shape += 1;
         reasons.push_back("Мало удалённых хостов при большом объёме — нетипично для обычного сёрфинга");
     }
