@@ -77,17 +77,23 @@ const char* vpnPortName(int port, const std::string& proto) {
     return it == m->end() ? nullptr : it->second.c_str();
 }
 
-// UDP 500/4500 к НЕ-хостингу — чаще всего Wi-Fi Calling (VoWiFi): телефон
-// строит IPsec до ePDG своего мобильного оператора. Адрес не резолвили
-// (remote == nullptr или пустой IpInfo) — хостинг не подтверждён, и VPN не
-// утверждаем. Одно правило для guessKind, UDP-таблицы, TSPU?-пометки и
-// причин блокировок — иначе VoWiFi в одном месте «звонки», в другом «VPN режут».
-bool likelyVoWifi(int remotePort, const std::string& proto, const IpInfo* remote) {
-    if (proto != "UDP" || (remotePort != 500 && remotePort != 4500)) return false;
-    if (!remote) return true;
-    const bool isHost = (remote->hosting || looksHostingOrg(remote->org, remote->asn)) &&
-                        !isOwnIspOrg(remote->org, remote->asn);
-    return !isHost;
+// UDP 500/4500: IPsec-VPN (в т.ч. корпоративный — не обязательно на хостинге),
+// звонки по Wi-Fi (VoWiFi: телефон строит IPsec до ePDG своего оператора)
+// или не понять. Точные признаки по всему дампу — Packet::ipsecPeer
+// (markIpsecPeers: IKEv1, IKE начат удалённой стороной, DNS-имя ePDG); без них
+// VPN — только адрес на хостинге (ePDG стоят в сети оператора, не на VPS).
+// Адрес не резолвили (remote == nullptr) — хостинг не подтверждён.
+// Одно правило для guessKind, UDP-таблицы, TSPU?-пометки и причин блокировок —
+// иначе VoWiFi в одном месте «звонки», в другом «VPN режут».
+IpsecClass ipsecClass(const Packet& p, int remotePort, const IpInfo* remote) {
+    if (p.proto != "UDP" || (remotePort != 500 && remotePort != 4500)) return IPSEC_NONE;
+    if (p.ipsecPeer == 2) return IPSEC_VOWIFI;
+    if (p.ipsecPeer == 1) return IPSEC_VPN;
+    if (remote && !remote->vpnWhite &&
+        (remote->hosting || looksHostingOrg(remote->org, remote->asn)) &&
+        !isOwnIspOrg(remote->org, remote->asn))
+        return IPSEC_VPN;
+    return IPSEC_UNSURE;
 }
 
 // Справочные подписи сервисов по портам (НЕ влияют на VPN-вердикт —
@@ -212,23 +218,28 @@ const char* proxyPortName(int port) {
 // «Домашние» ISP-сети оператора, которые НЕ нужно метить hosting, даже если
 // внешний geo-API относит их к датацентрам (оператор может иметь и хостинг-
 // услуги, но для диагностики абонентского трафика это его собственная сеть).
-bool isOwnIspOrg(const std::string& org, const std::string& asn) {
-    std::string o = org; for (auto& c : o) c = (char)::tolower((unsigned char)c);
+// Номер AS из списка (с «as» или без) в поле asn — целым числом: подстрокой
+// «39709» совпадал и с AS397091. Возвращает номер без «as» или "" — не найден.
+static std::string asnInList(const std::string& asn, const std::vector<std::string>& list) {
     std::string a = asn; for (auto& c : a) c = (char)::tolower((unsigned char)c);
-    // по умолчанию MARYNONET (AS39709); список — own_isp_org / own_isp_asn в конфиге
-    for (const auto& kw : cfg().ownIspOrgKeywords)
-        if (!kw.empty() && o.find(kw) != std::string::npos) return true;
-    // номер AS — целым числом: подстрокой «39709» совпадал и с AS397091
-    for (const auto& n0 : cfg().ownIspAsns) {
+    for (const auto& n0 : list) {
         const std::string n = n0.compare(0, 2, "as") == 0 ? n0.substr(2) : n0;
         if (n.empty()) continue;
         for (size_t pos = a.find(n); pos != std::string::npos; pos = a.find(n, pos + 1)) {
             const bool l = pos == 0 || !::isdigit((unsigned char)a[pos - 1]);
             const bool r = pos + n.size() >= a.size() || !::isdigit((unsigned char)a[pos + n.size()]);
-            if (l && r) return true;
+            if (l && r) return n;
         }
     }
-    return false;
+    return {};
+}
+
+bool isOwnIspOrg(const std::string& org, const std::string& asn) {
+    std::string o = org; for (auto& c : o) c = (char)::tolower((unsigned char)c);
+    // по умолчанию MARYNONET (AS39709); список — own_isp_org / own_isp_asn в конфиге
+    for (const auto& kw : cfg().ownIspOrgKeywords)
+        if (!kw.empty() && o.find(kw) != std::string::npos) return true;
+    return !asnInList(asn, cfg().ownIspAsns).empty();
 }
 
 bool looksHostingOrg(const std::string& org, const std::string& /*asn*/) {
@@ -293,7 +304,11 @@ std::string guessKind(const Packet& p, const IpInfo& srcI, const IpInfo& dstI) {
     // Метку по трафику (vless, Hysteria2, VPN-порт) не теряем: computeVpnVerdict
     // ищет в ней «vless»/«Hysteria2», и ранний возврат одного флага гасил эти
     // признаки — адрес из базы VPN давал баллов меньше, чем такой же без флага.
-    {
+    // Адрес из белого списка VPN: флаги баз и таблицы портов не смотрим, TLS/QUIC
+    // к нему — как к CDN. Остаются только сигнатуры протокола (WireGuard,
+    // OpenVPN, прокси по L7) — это сам туннель, а не догадка по адресу.
+    const bool white = (isLocalIp(p.srcIp) ? dstI : srcI).vpnWhite;
+    if (!white) {
         const bool remoteIsSrc = !isLocalIp(p.srcIp);
         const IpInfo& remote = remoteIsSrc ? srcI : dstI;
         // источник флага — ipapi.is (is_vpn/is_tor/is_proxy) или база IP2Proxy
@@ -325,11 +340,15 @@ std::string guessKind(const Packet& p, const IpInfo& srcI, const IpInfo& dstI) {
     // локальный эфемерный порт может случайно совпасть (напр. 1194) — это не VPN.
     {
         bool srcLocal = isLocalIp(p.srcIp), dstLocal = isLocalIp(p.dstIp);
-        if (srcLocal != dstLocal) {
+        if (srcLocal != dstLocal && !white) {
             int remotePort = srcLocal ? p.dstPort : p.srcPort;
             int localPort  = srcLocal ? p.srcPort : p.dstPort;
-            if (likelyVoWifi(remotePort, p.proto, srcLocal ? &dstI : &srcI))
-                return "(ipsec: VoWiFi/звонки по Wi-Fi?)";
+            // «(ipsec: …)» — не VPN-порт (см. computeVpnVerdict)
+            switch (ipsecClass(p, remotePort, srcLocal ? &dstI : &srcI)) {
+                case IPSEC_VOWIFI: return "(ipsec: VoWiFi — звонки по Wi-Fi)";
+                case IPSEC_UNSURE: return "(ipsec: IPsec или VoWiFi?)";
+                default: break;   // IPSEC_VPN — ниже, как VPN-порт
+            }
             if (const char* v = vpnPortName(remotePort, p.proto))
                 return std::string("(VPN: ") + v + ")";
             if (const char* px = proxyPortName(remotePort))
@@ -357,7 +376,7 @@ std::string guessKind(const Packet& p, const IpInfo& srcI, const IpInfo& dstI) {
         // а НЕ по длине отдельного пакета (иначе один поток получает разные метки).
         const IpInfo& remote = isLocalIp(p.srcIp) ? dstI : srcI;
 
-        bool isCdn  = looksCdnOrg(remote.org);
+        bool isCdn  = looksCdnOrg(remote.org) || remote.vpnWhite;
         // хостинг: либо флаг от ip-api, либо по названию ASN/организации (резерв)
         bool isHost = (remote.hosting || looksHostingOrg(remote.org, remote.asn)) && !isOwnIspOrg(remote.org, remote.asn);
 
@@ -371,7 +390,7 @@ std::string guessKind(const Packet& p, const IpInfo& srcI, const IpInfo& dstI) {
         const IpInfo& remote = isLocalIp(p.srcIp) ? dstI : srcI;
         bool isHost = (remote.hosting || looksHostingOrg(remote.org, remote.asn)) && !isOwnIspOrg(remote.org, remote.asn);
         // UDP/443 к хостингу — сигнатура Hysteria2/QUIC-VPN => считаем VPN (красный).
-        if (isHost && !looksCdnOrg(remote.org)) return "(VPN: Hysteria2/QUIC)";
+        if (isHost && !looksCdnOrg(remote.org) && !remote.vpnWhite) return "(VPN: Hysteria2/QUIC)";
         return "(udp/quic)";
     }
     // Обычный UDP на прочих портах — это НЕ повод считать VPN/QUIC.
@@ -544,6 +563,7 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
                     if (p.seq < 0) repeat = true;   // без seq повтор не отличить — как раньше
                     else if (c.outMaxEnd >= 0 && !seqLess(c.outMaxEnd, p.seq)) repeat = true;
                     else c.outMaxEnd = p.seq;
+                    if (c.firstOutDataTime < 0) c.firstOutDataTime = t;
                 } else {
                     // 0–1 байт (ACK, keepalive-проба, FIN): повтор, только если на
                     // предыдущий такой пакет сервер не ответил ничем. Живой сервер
@@ -627,6 +647,8 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
             if (it != tt.conns.end()) it->second.lowTtlOut++;
         }
     }
+    for (const auto& kv : tt.conns)
+        if (kv.second.serverBytes >= 200) tt.workedIps.insert(kv.second.ip);
     return tt;
 }
 
@@ -741,6 +763,67 @@ bool isHostingNonCdn(const IpInfo* i) {
 }
 bool isForeignHosting(const IpInfo* i) {
     return isHostingNonCdn(i) && !i->country.empty() && i->country != "-" && i->country != "RU";
+}
+
+// адрес -> имена, для которых DNS в дампе вернул этот адрес (нижний регистр,
+// без точки в конце). Запрос и ответ сводятся по клиент|порт|id.
+std::map<std::string, std::set<std::string>> dnsNamesByIp(const std::vector<Packet>& packets) {
+    std::map<std::string, std::string> qByKey;
+    std::map<std::string, std::set<std::string>> out;
+    for (const auto& p : packets) {
+        if (p.dnsId.empty()) continue;
+        if (!p.dnsIsResponse) {
+            if (!p.dnsQuery.empty())
+                qByKey[p.srcIp + "|" + std::to_string(p.srcPort) + "|" + p.dnsId] = p.dnsQuery;
+            continue;
+        }
+        std::string q = p.dnsQuery;
+        if (q.empty()) {
+            auto it = qByKey.find(p.dstIp + "|" + std::to_string(p.dstPort) + "|" + p.dnsId);
+            if (it != qByKey.end()) q = it->second;
+        }
+        for (auto& c : q) c = (char)::tolower((unsigned char)c);
+        while (!q.empty() && q.back() == '.') q.pop_back();
+        if (q.empty()) continue;
+        for (const auto& ip : p.dnsAnswers) out[ip].insert(q);
+        if (p.dnsAnswers.empty() && !p.dnsAnswerIp.empty()) out[p.dnsAnswerIp].insert(q);
+    }
+    return out;
+}
+
+bool inVpnWhitelistAsn(const std::string& asn) {
+    return !asnInList(asn, cfg().vpnWhitelistAsns).empty();
+}
+
+std::string vpnWhitelistDomain(const std::string& name) {
+    for (const auto& d : cfg().vpnWhitelistDomains)
+        if (domainEndsWith(name, d)) return d;
+    return {};
+}
+
+std::unordered_map<std::string, IpInfo> withVpnWhitelist(
+        const std::vector<Packet>& packets,
+        const std::unordered_map<std::string, IpInfo>* ipCache) {
+    std::unordered_map<std::string, IpInfo> out;
+    if (ipCache) out = *ipCache;
+    for (auto& kv : out) {
+        if (kv.second.vpnWhite) continue;
+        const std::string n = asnInList(kv.second.asn, cfg().vpnWhitelistAsns);
+        if (n.empty()) continue;
+        kv.second.vpnWhite = true;
+        kv.second.whiteWhy = "AS" + n;
+    }
+    if (cfg().vpnWhitelistDomains.empty()) return out;
+    for (const auto& kv : dnsNamesByIp(packets)) {
+        if (isLocalIp(kv.first)) continue;
+        for (const auto& name : kv.second) {
+            if (vpnWhitelistDomain(name).empty()) continue;
+            IpInfo& i = out[kv.first];          // адрес не резолвился — заглушка с пометкой
+            if (!i.vpnWhite) { i.vpnWhite = true; i.whiteWhy = name + " по DNS"; }
+            break;
+        }
+    }
+    return out;
 }
 std::string connWsFilter(const TcpConnState& c) {
     return wsFilter(c.ip, c.rport) + " && tcp.port==" + std::to_string(c.lport);

@@ -52,6 +52,13 @@ struct AppConfig {
     std::vector<std::string> ownIspOrgKeywords;   // подстроки названия организации (нижний регистр)
     std::vector<std::string> ownIspAsns;          // номера AS (подстрока поля asn)
 
+    // --- белый список VPN: крупные сервисы, баллов VPN не дают ---
+    // Адрес в списке, если его AS есть в vpnWhitelistAsns или DNS в этом же
+    // дампе разрезолвил в него имя из vpnWhitelistDomains. Одного SNI мало:
+    // Reality ставит в SNI как раз vk.com / gosuslugi.ru, а ведёт на VPS.
+    std::vector<std::string> vpnWhitelistDomains; // суффиксы доменов (нижний регистр)
+    std::vector<std::string> vpnWhitelistAsns;    // номера AS
+
     // --- служебное ---
     std::string loadedFrom;                  // какой ini прочитан ("" — не найден, всё по умолчанию)
     std::vector<std::string> warnings;       // что в ini не разобралось

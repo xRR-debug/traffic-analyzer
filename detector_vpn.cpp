@@ -19,6 +19,9 @@ void analyzeJa4(const std::vector<Packet>& packets,
         std::set<std::string> snis, servers, hostingSrv;
     };
     std::map<std::string, Agg> by;
+    // адреса из белого списка VPN в «хостинг-серверы» не попадают
+    const auto ipW = withVpnWhitelist(packets, ipCache);
+    if (ipCache || !ipW.empty()) ipCache = &ipW;
     for (const auto& p : packets) {
         if (p.ja4.empty()) continue;
         if (!targetIp.empty() && p.srcIp != targetIp && p.dstIp != targetIp) continue;
@@ -30,7 +33,8 @@ void analyzeJa4(const std::vector<Packet>& packets,
             auto it = ipCache->find(p.dstIp);
             if (it != ipCache->end()) {
                 const IpInfo& ii = it->second;
-                if ((ii.hosting || looksHostingOrg(ii.org, ii.asn)) && !looksCdnOrg(ii.org))
+                if ((ii.hosting || looksHostingOrg(ii.org, ii.asn)) && !looksCdnOrg(ii.org) &&
+                    !ii.vpnWhite)
                     a.hostingSrv.insert(p.dstIp);
             }
         }
@@ -132,11 +136,15 @@ std::vector<RealitySuspect> collectRealitySuspects(
         if (p.dnsAnswers.empty() && !p.dnsAnswerIp.empty()) dnsMap[q].insert(p.dnsAnswerIp);
     }
 
+    // Белый список проверяем по адресу (AS или DNS), а не по SNI: чужой SNI
+    // vk.com на VPS — как раз Reality, и он в список не попадает
+    const auto ipW = withVpnWhitelist(packets, ipCache);
     std::map<std::string, RealitySuspect> agg;   // ip|sni
     for (const auto& kv : tt.conns) {
         const TcpConnState& c = kv.second;
         if (!c.ch || c.sni.empty() || isEchPublicName(c.sni)) continue;
-        if (!isHostingNonCdn(ipInfoOf(ipCache, c.ip))) continue;
+        const IpInfo* ii = ipInfoOf(&ipW, c.ip);
+        if (!isHostingNonCdn(ii) || ii->vpnWhite) continue;
         std::string s = c.sni; for (auto& ch : s) ch = (char)::tolower((unsigned char)ch);
         bool famous = isRealityCoverSni(s);
         auto d = dnsMap.find(s);
@@ -211,7 +219,8 @@ FlowEvidence flowVpnEvidence(const TcpConnTable& tt,
     std::map<std::string, Rem> rem;
     for (const auto& kv : tt.conns) {
         const TcpConnState& c = kv.second;
-        if (!isHostingNonCdn(ipInfoOf(ipCache, c.ip))) continue;
+        const IpInfo* ii = ipInfoOf(ipCache, c.ip);   // из computeVpnVerdict — с белым списком
+        if (!isHostingNonCdn(ii) || ii->vpnWhite) continue;
         Rem& r = rem[c.ip];
         r.in += c.serverBytes; r.out += c.outBytes;
         if (c.firstTime >= 0 && c.lastTime >= c.firstTime && c.lastTime - c.firstTime > r.dur)
@@ -321,6 +330,11 @@ static bool isVpnCountry(const std::string& c) {
 VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTable& tt,
                              const std::unordered_map<std::string, IpInfo>* ipCache) {
     VpnVerdict v;
+    // Белый список VPN (Google, YouTube, Википедия, VK, Госуслуги…): у таких
+    // адресов vpnWhite — ни портов, ни флагов баз, ни «формы» трафика. Дальше
+    // всё (guessKind, Reality, потоковые признаки) видит уже эту копию.
+    const auto ipW = withVpnWhitelist(packets, ipCache);
+    if (ipCache || !ipW.empty()) ipCache = &ipW;
     auto infoFor = [&](const std::string& ip) -> const IpInfo& { return vpnInfoFor(ipCache, ip); };
     const std::map<std::string, int> quicKind = quicFlowKinds(packets);
 
@@ -347,26 +361,19 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
         while (!s.empty() && s.back() == '.') s.pop_back();
         return s;
     };
-    // адрес -> имена, для которых DNS в дампе вернул этот адрес (запрос/ответ по клиент|порт|id)
-    std::map<std::string, std::string> dnsQByKey;
-    std::map<std::string, std::set<std::string>> dnsNamesOfIp;
-    for (const auto& p : packets) {
-        if (p.dnsId.empty()) continue;
-        if (!p.dnsIsResponse) {
-            if (!p.dnsQuery.empty())
-                dnsQByKey[p.srcIp + "|" + std::to_string(p.srcPort) + "|" + p.dnsId] = p.dnsQuery;
-            continue;
-        }
-        std::string q = p.dnsQuery;
-        if (q.empty()) {
-            auto it = dnsQByKey.find(p.dstIp + "|" + std::to_string(p.dstPort) + "|" + p.dnsId);
-            if (it != dnsQByKey.end()) q = it->second;
-        }
-        if (q.empty()) continue;
-        q = normName(q);
-        for (const auto& ip : p.dnsAnswers) dnsNamesOfIp[ip].insert(q);
-        if (p.dnsAnswers.empty() && !p.dnsAnswerIp.empty()) dnsNamesOfIp[p.dnsAnswerIp].insert(q);
+    // адрес -> имена, для которых DNS в дампе вернул этот адрес
+    const std::map<std::string, std::set<std::string>> dnsNamesOfIp = dnsNamesByIp(packets);
+    // Адреса, где SNI соединения — имя, которое абонент сам разрезолвил в этот
+    // же адрес: обычный сайт на хостинге. У Reality SNI чужой, и DNS его на VPS
+    // не ведёт. Такой TLS в долю «похоже на VLESS» не идёт.
+    std::set<std::string> siteByDns;
+    for (const auto& kv : tt.conns) {
+        const TcpConnState& c = kv.second;
+        if (c.sni.empty()) continue;
+        auto dn = dnsNamesOfIp.find(c.ip);
+        if (dn != dnsNamesOfIp.end() && dn->second.count(normName(c.sni))) siteByDns.insert(c.ip);
     }
+    long long vlessDnsBytes = 0;   // TLS к хостингу, но к сайту по DNS (siteByDns)
     for (const auto& p : packets) {
         const std::string* rip = remoteSideOf(p);   // ровно одна сторона локальная
         if (!rip) continue;
@@ -389,11 +396,16 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
         if (remotePort > 0) fl.remotePorts.insert(remotePort);
         if (!p.sni.empty() && srcLocal) fl.snis.insert(normName(p.sni));
         // «probably vless» (хостинг на 443) — копим объём таких потоков
-        if (kind.find("vless") != std::string::npos) vlessBytes += p.length;
+        if (kind.find("vless") != std::string::npos)
+            (siteByDns.count(remote) ? vlessDnsBytes : vlessBytes) += p.length;
         // VPN/прокси-порт засчитываем ТОЛЬКО если он на удалённой (серверной) стороне.
-        // (IPsec к не-хостингу guessKind уже отнёс к VoWiFi — это не VPN-порт)
-        const char* vp = kind.rfind("(ipsec:", 0) == 0 ? nullptr : vpnPortName(remotePort, p.proto);
-        const char* px = proxyPortName(remotePort);
+        // (IPsec, не опознанный как VPN точно, guessKind пометил «(ipsec: …)» —
+        // VoWiFi или не ясно; это не VPN-порт, см. ipsecClass.) Адрес из белого
+        // списка по номеру порта не судим — только по сигнатурам ниже.
+        const bool white = infoFor(remote).vpnWhite;
+        const char* vp = (white || kind.rfind("(ipsec:", 0) == 0) ? nullptr
+                                                                  : vpnPortName(remotePort, p.proto);
+        const char* px = white ? nullptr : proxyPortName(remotePort);
         if (vp || px) {
             const int localPort = srcLocal ? p.srcPort : p.dstPort;
             PortHit& h = portHits[remote + "|" + std::to_string(remotePort) + "|" +
@@ -503,6 +515,8 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
     std::vector<std::pair<std::string, VpnRemote>> proxyFlows;
     long long& sumRemoteBytes = v.sumRemoteBytes;
     std::pair<std::string, VpnRemote> topFlow{"", {}};
+    long long whiteBytes = 0;             // объём к адресам из белого списка
+    std::vector<std::string> whiteIps;
     for (auto& kv : v.byRemote) {
         sumRemoteBytes += kv.second.bytes;
         if (kv.second.bytes > topFlow.second.bytes) topFlow = kv;
@@ -510,7 +524,9 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
         else if (kv.second.proxyPort) proxyFlows.push_back(kv);
         // гео: суммируем объём по стране удалённого IP. CDN не считаем: узел
         // Cloudflare/Akamai «в Нидерландах» говорит о CDN, а не о направлении туннеля.
+        // Белый список — тоже (YouTube из Франкфурта — не туннель в DE).
         const IpInfo& gi = infoFor(kv.first);
+        if (gi.vpnWhite) { whiteBytes += kv.second.bytes; whiteIps.push_back(kv.first); continue; }
         if (looksCdnOrg(gi.org)) continue;
         std::string cc = (gi.country.empty() || gi.country == "-") ? "??" : gi.country;
         v.bytesByCountry[cc] += kv.second.bytes;
@@ -524,6 +540,29 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
     int shape = 0;
     const int kShapeCap = cfg().shapeCap;
     std::vector<std::string>& reasons = v.reasons;
+
+    // Белый список: баллов не дают ни порт, ни база, ни доля/гео/MSS. Сигнатуры
+    // (WireGuard, OpenVPN, прокси по содержимому) засчитываются и здесь: VPS в
+    // облаке Google сидит в той же AS15169.
+    if (!whiteIps.empty()) {
+        std::sort(whiteIps.begin(), whiteIps.end(), [&](const std::string& a, const std::string& b) {
+            return v.byRemote.at(a).bytes > v.byRemote.at(b).bytes;
+        });
+        std::string l; int n = 0;
+        for (const auto& ip : whiteIps) {
+            if (n++ >= 3) { l += "; …"; break; }
+            const IpInfo& i = infoFor(ip);
+            if (!l.empty()) l += "; ";
+            l += ip + " (" + i.whiteWhy;
+            if (!i.org.empty() && i.org != "-") l += ", " + i.org;
+            l += ")";
+        }
+        char pct[48];
+        snprintf(pct, sizeof(pct), " — %.0f%% трафика",
+                 sumRemoteBytes > 0 ? 100.0 * whiteBytes / sumRemoteBytes : 0.0);
+        reasons.push_back("Адреса из белого списка (баллов VPN не дают, проверяются только "
+                          "проблемы соединения): " + l + pct);
+    }
 
     if (!vpnFlows.empty()) {
         v.portScore += 3;
@@ -590,6 +629,7 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
         int n = 0;
         for (const auto& kv : v.byRemote) {
             const IpInfo& i = infoFor(kv.first);
+            if (i.vpnWhite) continue;
             if (!(i.isVpn || i.isProxy || i.isTor) || kv.second.bytes < 100 * 1024) continue;
             if (n++ >= 3) continue;   // баллы одни на всех, в причинах — первые три
             char buf[512];
@@ -620,15 +660,20 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
     // не хостинг + сайт по DNS (скачали файл с static.yoomoney.ru у МТС) — не туннель
     const bool plainSite = !dnsSite.empty() && !topHost;
     const bool looksCdn  = looksCdnOrg(topInfo.org) || !dnsSite.empty();   // сайт по DNS на хостинге — как CDN
-    // Не хостинг и не CDN (банк, магазин, оператор) — баллов нет: VPN-серверы
-    // стоят на VPS, а дамп проверки одного ресурса и так почти весь уходит
-    // в один адрес. Туннель к домашнему роутеру ловят сигнатуры и порты.
+    // Российский не хостинг и не CDN (банк, магазин, оператор) — баллов нет:
+    // VPN-серверы стоят на VPS, а дамп проверки одного ресурса и так почти весь
+    // уходит в один адрес. Туннель к домашнему роутеру ловят сигнатуры и порты.
+    // Только RU: зарубежный адрес, который база не опознала как хостинг
+    // (мелкий VPS-провайдер, домашний сервер за границей), — как раньше, с баллами.
     // Адрес не резолвился (org неизвестна) — судить не по чему, считаем как раньше.
     const bool topKnown = !topInfo.org.empty() && topInfo.org != "-";
-    const bool plainService = topKnown && !topHost && !looksCdn;
-    if (!topFlow.first.empty() && topShare >= 0.80 && topFlow.second.bytes > 200000 && !plainSite) {
+    const bool plainService = topKnown && topInfo.country == "RU" && !topHost && !looksCdn;
+    // основной адрес из белого списка — «один узел» и «мало хостов» не считаем
+    // (весь трафик в YouTube — это просмотр видео)
+    const bool topWhite = topInfo.vpnWhite;
+    if (!topFlow.first.empty() && topShare >= 0.80 && topFlow.second.bytes > 200000 && !plainSite &&
+        !topWhite) {
         const IpInfo& i = topInfo;
-        bool looksHost = topHost;
         char buf[512];
         if (plainService)
             snprintf(buf, sizeof(buf),
@@ -645,23 +690,25 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
             snprintf(buf, sizeof(buf),
                 "Один IP %s (%s, %s)%s забирает %.0f%% трафика — похоже на туннель",
                 topFlow.first.c_str(), i.org.c_str(), i.asn.c_str(),
-                (looksHost && !looksCdn) ? " [хостинг]" : "", topShare * 100.0);
+                (topHost && !looksCdn) ? " [хостинг]" : "", topShare * 100.0);
         reasons.push_back(buf);
         // Концентрация трафика на хостинге (или неизвестном адресе) — признак туннеля:
         //   >=95%  -> +3 (почти весь трафик в одну точку, классический VPN/туннель)
         //   >=80%  -> +2
         // CDN снижает значимость (легитимный CDN может давать большую долю): максимум +1.
-        if (plainService)        {}
-        else if (looksCdn)       shape += 1;
-        else if (topShare >= 0.95) shape += 3;
-        else                       shape += 2;
-        // хостинг/датацентр в роли единственной точки — добавочный балл
-        if (looksHost && !looksCdn && topShare < 0.95) shape += 1;
+        if (!plainService) {
+            if (looksCdn)               shape += 1;
+            else if (topShare >= 0.95)  shape += 3;
+            else                        shape += 2;
+            // хостинг/датацентр в роли единственной точки — добавочный балл
+            if (topHost && !looksCdn && topShare < 0.95) shape += 1;
+        }
     }
 
     // 3) низкое разнообразие удалённых хостов при большом объёме. Если основной
     //    адрес — обычный сервис или сайт по DNS, это просто проверка одного ресурса
-    if (v.byRemote.size() <= 2 && sumRemoteBytes > 500000 && !plainService && !plainSite) {
+    if (v.byRemote.size() <= 2 && sumRemoteBytes > 500000 && !plainService && !plainSite &&
+        !topWhite) {
         shape += 1;
         reasons.push_back("Мало удалённых хостов при большом объёме — нетипично для обычного сёрфинга");
     }
@@ -681,6 +728,16 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
         if      (vlessShare >= 0.50) shape += 3;
         else if (vlessShare >= 0.30) shape += 2;
         else                         shape += 1;
+    }
+    // TLS к хостингу, где SNI абонент сам разрезолвил в этот адрес, — сайт на
+    // VPS (Википедия, форум), а не Reality: только пояснение, без баллов
+    if (vlessDnsBytes > 100000 && sumRemoteBytes > 0 && vlessDnsBytes * 100 >= sumRemoteBytes * 15) {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "%.0f%% трафика — TLS на :443 к хостингу, но к сайтам по DNS (SNI разрезолвлен "
+            "в тот же адрес) — обычные сайты (баллов не даёт)",
+            100.0 * vlessDnsBytes / sumRemoteBytes);
+        reasons.push_back(buf);
     }
 
     // 5) геораспределение: трафик преимущественно в «популярную VPN-страну».
@@ -745,7 +802,7 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
             if (sumRemoteBytes <= 0 || fl.bytes * 5 < sumRemoteBytes) continue;  // только узлы с >=20% трафика
             // CDN и облачные балансировщики урезают MSS у себя (свой оверлей,
             // туннели между PoP) — у скачивания с CDN это не признак VPN
-            if (looksCdnOrg(infoFor(kv.first).org)) continue;
+            if (looksCdnOrg(infoFor(kv.first).org) || infoFor(kv.first).vpnWhite) continue;
             const bool counted = remoteMssScore < kRemoteMssCap;
             char buf[512];
             snprintf(buf, sizeof(buf),
@@ -796,7 +853,10 @@ void runVpnAnalysis(std::vector<Packet>& packets, const std::vector<std::string>
     // добор хостинга через вторичный источник (ipapi.is) для непомеченных IP
     resolveHostingSecondary(ipCache, ipList);
 
-    auto infoFor = [&](const std::string& ip) -> const IpInfo& { return vpnInfoFor(&ipCache, ip); };
+    // Подписи и метки — по копии с белым списком (YouTube не «probably vless»).
+    // Проверки соединения (16 КБ, причины блокировки) ниже — по исходному ipCache.
+    const auto ipW = withVpnWhitelist(packets, &ipCache);
+    auto infoFor = [&](const std::string& ip) -> const IpInfo& { return vpnInfoFor(&ipW, ip); };
 
     // 4) построчный вывод в стиле tcpdump + подпись + догадка
     std::map<std::string, long long> tally; // тип трафика -> счётчик
@@ -899,7 +959,8 @@ void runVpnAnalysis(std::vector<Packet>& packets, const std::vector<std::string>
                         svc += std::string("  [") + appStr + "]";
                 }
                 const IpInfo& rem = sLoc ? di : si;
-                remoteHosting = (rem.hosting || looksHostingOrg(rem.org, rem.asn)) && !isOwnIspOrg(rem.org, rem.asn);
+                remoteHosting = (rem.hosting || looksHostingOrg(rem.org, rem.asn)) &&
+                                !isOwnIspOrg(rem.org, rem.asn) && !rem.vpnWhite;
                 // (hosting) показываем только на 443/8443 — там хостинг важен,
                 // т.к. трафик не отличить от обычного HTTPS. На прочих портах не нужно.
                 bool tlsPort = (rport == 443 || rport == 8443);
@@ -974,10 +1035,12 @@ void runVpnAnalysis(std::vector<Packet>& packets, const std::vector<std::string>
         if (shownF++ >= 8) break;
         const IpInfo& i = infoFor(f.first);
         double share = sumRemoteBytes ? 100.0 * f.second.bytes / sumRemoteBytes : 0;
-        bool host = ((i.hosting || looksHostingOrg(i.org, i.asn)) && !isOwnIspOrg(i.org, i.asn)) && !looksCdnOrg(i.org);
-        printf("  %-16s %8lld B  %5.1f%%  %s %s%s%s\n",
+        bool host = ((i.hosting || looksHostingOrg(i.org, i.asn)) && !isOwnIspOrg(i.org, i.asn)) &&
+                    !looksCdnOrg(i.org) && !i.vpnWhite;
+        printf("  %-16s %8lld B  %5.1f%%  %s %s%s%s%s\n",
             f.first.c_str(), f.second.bytes, share, i.asn.c_str(), i.org.c_str(),
             host ? "  (hosting)" : "",
+            i.vpnWhite ? "  [белый список]" : "",
             f.second.vpnPort ? "  [VPN-PORT]" : "");
     }
 

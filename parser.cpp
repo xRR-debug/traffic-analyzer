@@ -155,6 +155,15 @@ static Packet parseLine(const std::string& raw) {
                               (rest.find("phase 1") != std::string::npos &&
                                rest.find("[E]") == std::string::npos);
             pk.ipsec = init ? 1 : 2;
+            // версия и инициатор: «ikev2_init[I]» — запрос инициатора IKEv2,
+            // «phase 1 I» — сообщение инициатора фазы 1 IKEv1
+            if (rest.find("ikev2") != std::string::npos) {
+                pk.ike = 2;
+                if (rest.find("ikev2_init[I]") != std::string::npos) pk.ike |= 4;
+            } else if (rest.find("phase ") != std::string::npos) {
+                pk.ike = 1;
+                if (rest.find("phase 1 I") != std::string::npos) pk.ike |= 4;
+            }
         }
     }
 
@@ -821,8 +830,18 @@ static bool parseFrame(const unsigned char* d, size_t len, int linkType,
             }
             if (isIke && avail >= 20) {
                 const int ver = ike[17] >> 4, ex = ike[18], fl = ike[19];
-                if (ver == 2)      pk.ipsec = (ex == 34) ? 1 : 2;      // 34 = IKE_SA_INIT
-                else if (ver == 1) pk.ipsec = (fl & 1) ? 2 : 1;        // бит 0 — шифровано
+                bool spiRZero = true;                                  // SPI ответчика ещё не назначен
+                for (int k = 8; k < 16; k++) if (ike[k]) { spiRZero = false; break; }
+                if (ver == 2) {
+                    pk.ipsec = (ex == 34) ? 1 : 2;                     // 34 = IKE_SA_INIT
+                    pk.ike = 2;
+                    // запрос IKE_SA_INIT от инициатора: флаг I (0x08) есть, R (0x20) нет
+                    if (ex == 34 && (fl & 0x08) && !(fl & 0x20)) pk.ike |= 4;
+                } else if (ver == 1) {
+                    pk.ipsec = (fl & 1) ? 2 : 1;                       // бит 0 — шифровано
+                    pk.ike = 1;
+                    if (spiRZero && !(fl & 1)) pk.ike |= 4;            // первое сообщение фазы 1
+                }
             }
         }
         // DNS (порт 53) — разбираем по захваченным байтам, не выходя за кадр
@@ -2146,6 +2165,70 @@ long long tsToMicros(const std::string& ts) {
     return (hms[0] * 3600 + hms[1] * 60 + hms[2]) * 1000000LL + usec;
 }
 
+// Кто на том конце IPsec (UDP 500/4500): VPN или звонки по Wi-Fi (VoWiFi —
+// телефон строит IPsec до ePDG своего мобильного оператора). По одному пакету
+// не понять, поэтому решаем по всему дампу и проставляем Packet::ipsecPeer:
+//  - VoWiFi точно: DNS в этом же дампе отдал адрес на имя ePDG (стандартное
+//    epdg.epc.mncXXX.mccXXX.pub.3gppnetwork.org, 3GPP TS 23.003);
+//  - IPsec-VPN точно: IKEv1 (VoWiFi по 3GPP TS 24.302 — только IKEv2) или
+//    IKE SA начал удалённый адрес — у абонента IPsec-сервер, а ePDG сам к
+//    телефону не подключается;
+//  - признаков нет или они противоречат друг другу — 0, «не ясно».
+// Хостинг тут не учитываем (сведений об адресах ещё нет) — это ipsecClass.
+// Нужен локальный адрес — вызывать после его определения.
+static void markIpsecPeers(std::vector<Packet>& packets) {
+    auto isIpsecPort = [](const Packet& p) {
+        return p.proto == "UDP" && (p.srcPort == 500 || p.srcPort == 4500 ||
+                                    p.dstPort == 500 || p.dstPort == 4500);
+    };
+    // имя ePDG: какая-нибудь метка начинается с «epdg»
+    auto isEpdgName = [](std::string n) {
+        for (auto& c : n) c = (char)tolower((unsigned char)c);
+        for (size_t pos = 0; pos < n.size(); ) {
+            if (n.compare(pos, 4, "epdg") == 0) return true;
+            size_t dot = n.find('.', pos);
+            if (dot == std::string::npos) break;
+            pos = dot + 1;
+        }
+        return false;
+    };
+    // запрос и ответ DNS — по (IP клиента, порт клиента, id), как в analyzeDnsAnomalies
+    std::set<std::string> epdgIps;
+    std::map<std::string, std::string> dnsQByKey;
+    for (const auto& p : packets) {
+        if (p.dnsId.empty()) continue;
+        if (!p.dnsIsResponse) {
+            if (!p.dnsQuery.empty())
+                dnsQByKey[p.srcIp + "|" + std::to_string(p.srcPort) + "|" + p.dnsId] = p.dnsQuery;
+            continue;
+        }
+        std::string q = p.dnsQuery;
+        if (q.empty()) {
+            auto it = dnsQByKey.find(p.dstIp + "|" + std::to_string(p.dstPort) + "|" + p.dnsId);
+            if (it != dnsQByKey.end()) q = it->second;
+        }
+        if (q.empty() || !isEpdgName(q)) continue;
+        for (const auto& a : p.dnsAnswers) epdgIps.insert(a);
+        if (p.dnsAnswers.empty() && !p.dnsAnswerIp.empty()) epdgIps.insert(p.dnsAnswerIp);
+    }
+    std::set<std::string> vpnIps;
+    for (const auto& p : packets) {
+        if (!p.ike || !isIpsecPort(p)) continue;
+        bool sLoc = isLocalIp(p.srcIp), dLoc = isLocalIp(p.dstIp);
+        if (sLoc == dLoc) continue;
+        if ((p.ike & 1) || (!sLoc && (p.ike & 4))) vpnIps.insert(sLoc ? p.dstIp : p.srcIp);
+    }
+    if (epdgIps.empty() && vpnIps.empty()) return;
+    for (auto& p : packets) {
+        if (!isIpsecPort(p)) continue;
+        bool sLoc = isLocalIp(p.srcIp), dLoc = isLocalIp(p.dstIp);
+        if (sLoc == dLoc) continue;
+        const std::string& remote = sLoc ? p.dstIp : p.srcIp;
+        const bool vpn = vpnIps.count(remote) > 0, voWifi = epdgIps.count(remote) > 0;
+        if (vpn != voWifi) p.ipsecPeer = vpn ? 1 : 2;
+    }
+}
+
 // Загрузка набора файлов дампа (один файл или пара «_in»/«_out»): разбор,
 // слияние по времени, удаление дублей, флоу-маркировка WireGuard и
 // определение локального адреса абонента (g_localIp / g_localIp6).
@@ -2465,6 +2548,9 @@ bool loadDumpSet(const std::vector<std::string>& paths,
         g_localIp  = !v4.empty() ? v4 : v6;
         g_localIp6 = (v6 != g_localIp) ? v6 : std::string();
     }
+
+    // IPsec: VPN или VoWiFi — по всему дампу, когда локальный адрес уже известен
+    markIpsecPeers(packets);
 
     // --- сверка половин дампа с их именами ---
     // Направление известно только сейчас, когда определён локальный адрес.

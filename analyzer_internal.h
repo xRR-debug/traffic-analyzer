@@ -47,6 +47,7 @@ struct TcpConnState {
     bool inFin = false;
     long long outBytes = 0;
     int firstOutDataLen = -1;         // длина первого исходящего сегмента с данными
+    long long firstOutDataTime = -1;  // время первого исходящего сегмента с данными (>1 байта)
     int lowTtlOut = 0;                // исходящих сегментов с данными и аномально низким TTL
     // «заморозка» после ~16 КБ: уникальные входящие байты и что было после
     long long inMaxEnd = -1;          // правый край принятых данных (seq)
@@ -70,6 +71,7 @@ struct TcpConnTable {
     long long tEnd = -1;              // время последнего пакета захвата
     bool anyInboundTcp = false;       // нет входящих — дамп однонаправленный, о дропах молчим
     int outTtlTypical = -1;           // медианный TTL исходящих пакетов абонента
+    std::set<std::string> workedIps;  // адреса, где хоть одно соединение получило ≥200 Б
 };
 
 // VLESS/Reality: подозрительный адрес (см. collectRealitySuspects)
@@ -123,8 +125,9 @@ inline const std::string* remoteSideOf(const Packet& p) {
 const char* vpnPortName(int port, const std::string& proto);
 const char* proxyPortName(int port);
 bool isOwnIspOrg(const std::string& org, const std::string& asn);
-// UDP 500/4500 не к хостингу (или адрес не резолвили) — вероятно VoWiFi, не VPN
-bool likelyVoWifi(int remotePort, const std::string& proto, const IpInfo* remote);
+// UDP 500/4500: IPsec-VPN точно, VoWiFi (звонки по Wi-Fi) точно или не ясно
+enum IpsecClass { IPSEC_NONE, IPSEC_VPN, IPSEC_VOWIFI, IPSEC_UNSURE };
+IpsecClass ipsecClass(const Packet& p, int remotePort, const IpInfo* remote);
 std::string guessKind(const Packet& p, const IpInfo& srcI, const IpInfo& dstI);
 std::string sideLabel(const std::string& ip, const IpInfo& info);
 bool flagHas(const std::string& f, char c);
@@ -137,6 +140,18 @@ bool isCommonlyBlockedDomain(const std::string& d);
 const IpInfo* ipInfoOf(const std::unordered_map<std::string, IpInfo>* ipCache,
                        const std::string& ip);
 bool isForeignHosting(const IpInfo* i);
+std::map<std::string, std::set<std::string>> dnsNamesByIp(const std::vector<Packet>& packets);
+// Белый список VPN (vpn_whitelist_domains / vpn_whitelist_asn): суффикс из
+// списка, которому соответствует имя ("" — не в списке).
+std::string vpnWhitelistDomain(const std::string& name);
+// Копия ipCache для анализа VPN: у адресов из белого списка стоит vpnWhite —
+// по номеру AS или по имени из списка, которое DNS в этом дампе разрезолвил в
+// этот адрес. Адрес без записи (не резолвился), попавший в список по DNS,
+// получает заглушку. Проверкам соединения (режим 2) эту копию не отдавать:
+// проблемы связи с такими адресами ищутся как обычно.
+std::unordered_map<std::string, IpInfo> withVpnWhitelist(
+        const std::vector<Packet>& packets,
+        const std::unordered_map<std::string, IpInfo>* ipCache);
 std::string connWsFilter(const TcpConnState& c);
 std::map<std::string, long long> bytesByRemote(const std::vector<Packet>& packets);
 
@@ -151,12 +166,14 @@ std::vector<std::string> detectDpiInjection(const std::vector<Packet>& packets,
                                             const std::string& localIp);
 std::set<std::string> collectTspuBlockedIps(const std::vector<Packet>& packets,
                                             const std::string& localIp,
-                                            const TcpConnTable* ttIn = nullptr);
+                                            const TcpConnTable* ttIn = nullptr,
+                                            const std::unordered_map<std::string, IpInfo>* ipCache = nullptr);
 std::map<std::string,std::string> collectBlockedSnis(const std::vector<Packet>& packets,
                                                      const std::string& localIp,
                                                      const TcpConnTable* ttIn = nullptr);
 void analyzeUdpConns(const std::vector<Packet>& packets, const std::string& localIp,
-                     const std::string& targetIp = "");
+                     const std::string& targetIp = "",
+                     const std::unordered_map<std::string, IpInfo>* ipCache = nullptr);
 void analyzeQuic(const std::vector<Packet>& packets, const std::string& localIp,
                  const std::string& targetIp = "");
 void analyzeConnectivityFailure(const std::vector<Packet>& packets, const std::string& localIp);

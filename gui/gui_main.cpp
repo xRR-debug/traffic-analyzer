@@ -8,8 +8,10 @@
 #include <d3d11.h>
 #include <dwmapi.h>
 #include <wincodec.h>
+#include <windowsx.h>
 
 #pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "windowscodecs.lib")   // WIC: картинка на фоне
 #pragma comment(lib, "ole32.lib")
 
@@ -27,6 +29,35 @@ ID3D11RenderTargetView* g_rtv = nullptr;
 bool g_occluded = false;
 UINT g_resizeW = 0, g_resizeH = 0;
 std::vector<std::string> g_dropped;     // файлы, брошенные на окно (поток окна)
+// пустая часть панели меню — «заголовок» окна (guiSetCaptionArea), клиентские px
+float g_capL = 0, g_capR = 0, g_capH = 0;
+
+// Системного заголовка нет: стиль остаётся WS_OVERLAPPEDWINDOW (Snap, анимации,
+// тень, кнопка на панели задач), но вся рамка отдана клиентской области
+// (WM_NCCALCSIZE), а края и заголовок назначает WM_NCHITTEST.
+LRESULT hitTest(HWND hWnd, LPARAM lParam) {
+    POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+    ScreenToClient(hWnd, &pt);
+    RECT rc;
+    GetClientRect(hWnd, &rc);
+    if (!IsZoomed(hWnd)) {
+        const int b = GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+        // сверху полоса тоньше — под ней меню и кнопки окна
+        const int bt = GetSystemMetrics(SM_CYSIZEFRAME);
+        const bool l = pt.x < b, r = pt.x >= rc.right - b;
+        const bool t = pt.y < bt, d = pt.y >= rc.bottom - b;
+        if (t && l) return HTTOPLEFT;
+        if (t && r) return HTTOPRIGHT;
+        if (d && l) return HTBOTTOMLEFT;
+        if (d && r) return HTBOTTOMRIGHT;
+        if (l) return HTLEFT;
+        if (r) return HTRIGHT;
+        if (t) return HTTOP;
+        if (d) return HTBOTTOM;
+    }
+    if (pt.y >= 0 && pt.y < g_capH && pt.x >= g_capL && pt.x < g_capR) return HTCAPTION;
+    return HTCLIENT;
+}
 
 // std::cout -> журнал окна. Без буфера: каждый << сразу уходит в rawOutput,
 // порядок с printf (rprintf) сохраняется.
@@ -98,6 +129,20 @@ LRESULT WINAPI wndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
         return true;
     switch (msg) {
+    case WM_NCCALCSIZE:
+        if (wParam == TRUE) {
+            // развёрнутое окно Windows выносит за край монитора на толщину рамки —
+            // без неё клиентская часть должна совпасть с рабочей областью
+            if (IsZoomed(hWnd)) {
+                MONITORINFO mi{ sizeof(mi) };
+                if (GetMonitorInfoW(MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST), &mi))
+                    ((NCCALCSIZE_PARAMS*)lParam)->rgrc[0] = mi.rcWork;
+            }
+            return 0;
+        }
+        break;
+    case WM_NCHITTEST:
+        return hitTest(hWnd, lParam);
     case WM_SIZE:
         if (wParam == SIZE_MINIMIZED) return 0;
         g_resizeW = (UINT)LOWORD(lParam);
@@ -262,6 +307,15 @@ void setupFonts() {
 
 HWND mainHwnd() { return g_hwnd; }
 void guiRequestClose() { if (g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0); }
+bool guiCustomTitleBar() { return true; }
+void guiMinimize() { if (g_hwnd) ShowWindow(g_hwnd, SW_MINIMIZE); }
+void guiToggleMaximize() {
+    if (g_hwnd) ShowWindow(g_hwnd, IsZoomed(g_hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+}
+bool guiIsMaximized() { return g_hwnd && IsZoomed(g_hwnd); }
+void guiSetCaptionArea(float left, float right, float height) {
+    g_capL = left; g_capR = right; g_capH = height;
+}
 
 bool wallpaperLoad(const std::wstring& path, std::string& err) {
     if (!g_dev) { err = "Direct3D не готов"; return false; }
@@ -334,6 +388,14 @@ int RunGuiMain(const std::vector<std::string>& files) {
                     L"TrafficAnalyzer", MB_ICONERROR);
         if (SUCCEEDED(comHr)) CoUninitialize();
         return 1;
+    }
+    // без системного заголовка (см. hitTest): пересчитать рамку, а тень и
+    // скругление (Windows 11) оставить — DWM рисует их, пока рамка «есть»
+    {
+        const MARGINS m{ 0, 0, 1, 0 };
+        DwmExtendFrameIntoClientArea(g_hwnd, &m);
+        SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
+                     SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
     ShowWindow(g_hwnd, SW_SHOWDEFAULT);
     UpdateWindow(g_hwnd);

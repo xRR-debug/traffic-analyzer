@@ -149,6 +149,16 @@ void setupFonts() {
 
 HWND mainHwnd() { return nullptr; }
 void guiRequestClose() { if (g_win) glfwSetWindowShouldClose(g_win, GLFW_TRUE); }
+// заголовок окна на macOS системный (светофор) — свои кнопки не нужны
+bool guiCustomTitleBar() { return false; }
+void guiMinimize() { if (g_win) glfwIconifyWindow(g_win); }
+void guiToggleMaximize() {
+    if (!g_win) return;
+    if (glfwGetWindowAttrib(g_win, GLFW_MAXIMIZED)) glfwRestoreWindow(g_win);
+    else glfwMaximizeWindow(g_win);
+}
+bool guiIsMaximized() { return g_win && glfwGetWindowAttrib(g_win, GLFW_MAXIMIZED); }
+void guiSetCaptionArea(float, float, float) {}
 
 bool wallpaperLoad(const std::wstring& path, std::string& err) {
     if (!g_win) { err = "OpenGL не готов"; return false; }

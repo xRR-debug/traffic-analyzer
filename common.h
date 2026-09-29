@@ -227,6 +227,12 @@ struct Packet {
     // IPsec (UDP 500/4500): 1 = IKE_SA_INIT / открытая фаза 1 IKEv1, 2 = IKE дальше
     // (IKE_AUTH, CHILD_SA, INFORMATIONAL, шифрованный IKEv1), 3 = ESP-данные в UDP; 0 = нет/не видно
     int         ipsec = 0;
+    // заголовок IKE: бит 0 — IKEv1, бит 1 — IKEv2, бит 2 — отправитель начинает
+    // новый IKE SA (первый запрос IKE_SA_INIT / Main Mode — он инициатор)
+    uint8_t     ike = 0;
+    // вывод по всему дампу об IPsec-адресе (markIpsecPeers): 1 — IPsec-VPN точно,
+    // 2 — VoWiFi точно (звонки по Wi-Fi через ePDG оператора), 0 — не ясно
+    uint8_t     ipsecPeer = 0;
     uint8_t     l7 = L7_NONE;    // протокол потока по содержимому (L7Proto), только pcap
     // DNS (из текстового tcpdump: "A? domain" / "id 1/0/0 A 1.2.3.4" / NXDomain,
     // либо из UDP-payload бинарного дампа — поля заполняются в том же виде)
@@ -272,6 +278,11 @@ struct IpInfo {
     std::string flagSrc;         // откуда флаги VPN/proxy/Tor: "ipapi.is", "IP2Proxy" ("" — флагов нет)
     std::string pxType;          // тип по базе IP2Proxy: VPN, TOR, PUB, WEB, DCH, RES, CPN, EPN, SES,
                                  // AIC; "-" — в базе, но не прокси; "" — базы нет или не спрашивали
+    // Белый список VPN (vpn_whitelist_*): крупный сервис — баллов VPN не даёт и
+    // VPN не называется. Ставится только в копии кэша для анализа VPN
+    // (withVpnWhitelist), проверки соединения видят адрес как обычно.
+    bool vpnWhite = false;
+    std::string whiteWhy;        // почему: «AS15169» или «youtube.com по DNS»
 };
 
 // ------------------------------------------------------------------
@@ -382,6 +393,9 @@ bool looksCdnOrg(const std::string& org);
 // Хостинг «по-настоящему»: флаг ip-api/ipapi.is или имя организации, но не CDN/
 // крупный сервис (Google, Microsoft, Yandex…) и не сеть самого оператора.
 bool isHostingNonCdn(const IpInfo* i);
+// AS адреса в белом списке VPN (vpn_whitelist_asn). Белый список по DNS так не
+// проверить — для него нужен дамп (withVpnWhitelist).
+bool inVpnWhitelistAsn(const std::string& asn);
 // Фоновая загрузка Windows/Microsoft (Windows Update, Delivery Optimization,
 // BITS, Office, Store, Defender, Edge…) по имени (SNI/Host/DNS), User-Agent или
 // пути HTTP. Скорость такой загрузки Windows ограничивает сама — «низкая

@@ -854,6 +854,37 @@ static int consoleMain(std::vector<std::string> files, int tool) {
     return 0;
 }
 
+// Пакетный режим (--batch 1|2): анализ без меню и вопросов — для прогона
+// тестовых дампов скриптом. Весь вывод (printf и std::cout) — в stdout или в
+// файл --out; консольное окно не открывается.
+static int batchMain(int mode, std::vector<std::string> paths, const std::string& outPath) {
+    if (!outPath.empty()) {
+        FILE* f = nullptr;
+#ifdef _WIN32
+        if (_wfreopen_s(&f, u8w(outPath).c_str(), L"wb", stdout) != 0) f = nullptr;
+#else
+        f = freopen(outPath.c_str(), "wb", stdout);
+#endif
+        if (!f) return 3;
+    }
+    std::ios::sync_with_stdio(true);
+    std::cout.clear();
+    loadConfig();
+    for (const auto& w : cfg().warnings) printf("analyzer.ini: %s\n", w.c_str());
+    if (paths.empty()) { printf("--batch: не указан дамп\n"); return 2; }
+    addSiblingDump(paths);
+    std::vector<Packet> packets;
+    std::vector<int> origin;
+    int rc = 1;
+    if (loadDumpSet(paths, packets, origin)) {
+        if (mode == 2) runConnAnalysis(packets, paths);
+        else           runVpnAnalysis(packets, paths);
+        rc = 0;
+    }
+    std::cout.flush(); fflush(stdout);
+    return rc;
+}
+
 // Аргументы командной строки в UTF-8 (argv у main — в ANSI-кодировке, и
 // путь с кириллицей в нём ломается).
 // На macOS argv уже в UTF-8.
@@ -886,6 +917,8 @@ static void fatalGuiMessage(const std::string& text) {
 //   TrafficAnalyzer.exe --console [дамп]    — прежнее консольное меню
 //   TrafficAnalyzer.exe --tool N [--log]    — один интерактивный режим N (3..13, 0)
 //                                             в своей консоли; так его запускает GUI
+//   TrafficAnalyzer.exe --batch 1|2 [--out файл] дамп ...
+//                                           — анализ 1/2 без меню, вывод в stdout/файл
 // Обёртки try/catch не дают окну «просто закрыться» без объяснения, если где-то
 // всплыло std::bad_alloc / std::out_of_range.
 int main(int argc, char** argv) {
@@ -895,11 +928,14 @@ int main(int argc, char** argv) {
 #endif
     std::vector<std::string> args = commandLineUtf8(argc, argv);
     bool consoleMode = false;
-    int tool = 0;
+    int tool = 0, batch = 0;
+    std::string batchOut;
     std::vector<std::string> files;
     for (size_t i = 1; i < args.size(); i++) {
         const std::string& a = args[i];
         if (a == "--console") consoleMode = true;
+        else if (a == "--batch" && i + 1 < args.size()) batch = atoi(args[++i].c_str()) == 2 ? 2 : 1;
+        else if (a == "--out" && i + 1 < args.size()) batchOut = args[++i];
         else if (a == "--gui") {}
         else if (a == "--log") g_logEnabled = true;
         else if (a.rfind("-psn_", 0) == 0) {}            // macOS Finder: номер процесса
@@ -909,6 +945,12 @@ int main(int argc, char** argv) {
             if (tool < 3 || tool > 13) tool = 0;
             consoleMode = true;
         } else files.push_back(a);
+    }
+
+    if (batch) {
+        try { return batchMain(batch, files, batchOut); }
+        catch (const std::exception& e) { printf("[FATAL] %s\n", e.what()); fflush(stdout); return 1; }
+        catch (...) { printf("[FATAL] неизвестная ошибка\n"); fflush(stdout); return 2; }
     }
 
     if (!consoleMode) {

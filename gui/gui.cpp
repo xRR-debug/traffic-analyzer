@@ -676,7 +676,9 @@ std::string geoOf(const IpCache* cache, const std::string& ip) {
     if (i.asn != "-") as = i.asn;
     if (i.org != "-" && !i.org.empty()) { if (!as.empty()) as += ' '; as += i.org; }
     if (!as.empty()) { if (!s.empty()) s += " · "; s += as; }
-    if (i.isVpn) s += " [VPN]";
+    // белый список VPN (Google, VK, Яндекс…) — флаги баз не показываем
+    if (i.vpnWhite || inVpnWhitelistAsn(i.asn)) s += " [белый список]";
+    else if (i.isVpn) s += " [VPN]";
     else if (i.isProxy) s += " [proxy]";
     else if (i.isTor) s += " [Tor]";
     else if (i.pxType == "RES") s += " [резидентный прокси]";
@@ -805,6 +807,69 @@ void actSaveLog() {
 // ------------------------------------------------------------------
 // меню и панель действий
 // ------------------------------------------------------------------
+// Системного заголовка у окна нет (gui_main.cpp): справа на панели меню —
+// «свернуть / развернуть / закрыть», пустая часть между меню и ними — заголовок
+// (за неё тянут окно, двойной щелчок разворачивает). Зовётся внутри панели меню.
+void drawWindowButtons(float menusEnd) {
+    const ImVec2 wp = ImGui::GetWindowPos();
+    const float h = ImGui::GetFrameHeight();              // высота панели меню
+    const float bw = h * 1.8f;
+    const float x0 = wp.x + ImGui::GetWindowWidth() - bw * 3;
+    guiSetCaptionArea(menusEnd - wp.x, x0 - wp.x, h);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const char* title = "TrafficAnalyzer — MARYNONET";
+    const ImVec2 ts = ImGui::CalcTextSize(title);
+    if (x0 - menusEnd > ts.x + h * 2) {                    // по центру окна, если влезает
+        const float tx = std::clamp(wp.x + (ImGui::GetWindowWidth() - ts.x) * 0.5f,
+                                    menusEnd + h, x0 - h - ts.x);
+        dl->AddText(ImVec2(tx, wp.y + (h - ts.y) * 0.5f), ImGui::GetColorU32(kDim), title);
+    }
+
+    const float th = std::max(1.0f, std::round(h / 24.0f));   // толщина линий значков
+    const float s = std::round(h * 0.2f);                      // полуразмер значка
+    for (int i = 0; i < 3; i++) {
+        ImGui::SetCursorScreenPos(ImVec2(x0 + bw * i, wp.y));
+        ImGui::PushID(i);
+        const bool pressed = ImGui::InvisibleButton("##winbtn", ImVec2(bw, h));
+        const bool hov = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
+        ImGui::PopID();
+        const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+        if (hov || held) {
+            const ImU32 bg = i == 2 ? IM_COL32(196, 43, 28, held ? 190 : 255)
+                                    : ImGui::GetColorU32(held ? ImGuiCol_ButtonActive : ImGuiCol_ButtonHovered);
+            dl->AddRectFilled(a, b, bg);
+        }
+        const ImU32 col = (i == 2 && hov) ? IM_COL32_WHITE : ImGui::GetColorU32(ImGuiCol_Text);
+        const ImVec2 c(std::floor((a.x + b.x) * 0.5f) + 0.5f, std::floor((a.y + b.y) * 0.5f) + 0.5f);
+        if (i == 0) {
+            dl->AddLine(ImVec2(c.x - s, c.y), ImVec2(c.x + s, c.y), col, th);
+        } else if (i == 1) {
+            if (guiIsMaximized()) {        // «восстановить»: два квадрата
+                const float o = std::round(s * 0.4f);
+                dl->AddRect(ImVec2(c.x - s, c.y - s + o), ImVec2(c.x + s - o, c.y + s), col, 0, 0, th);
+                dl->AddLine(ImVec2(c.x - s + o, c.y - s + o), ImVec2(c.x - s + o, c.y - s), col, th);
+                dl->AddLine(ImVec2(c.x - s + o, c.y - s), ImVec2(c.x + s, c.y - s), col, th);
+                dl->AddLine(ImVec2(c.x + s, c.y - s), ImVec2(c.x + s, c.y + s - o), col, th);
+                dl->AddLine(ImVec2(c.x + s, c.y + s - o), ImVec2(c.x + s - o, c.y + s - o), col, th);
+            } else {
+                dl->AddRect(ImVec2(c.x - s, c.y - s), ImVec2(c.x + s, c.y + s), col, 0, 0, th);
+            }
+        } else {
+            dl->AddLine(ImVec2(c.x - s, c.y - s), ImVec2(c.x + s, c.y + s), col, th);
+            dl->AddLine(ImVec2(c.x - s, c.y + s), ImVec2(c.x + s, c.y - s), col, th);
+        }
+        if (hov) ImGui::SetTooltip("%s", i == 0 ? "Свернуть"
+                                        : i == 1 ? (guiIsMaximized() ? "Восстановить" : "Развернуть")
+                                                 : "Закрыть");
+        if (pressed) {
+            if (i == 0) guiMinimize();
+            else if (i == 1) guiToggleMaximize();
+            else guiRequestClose();
+        }
+    }
+}
+
 void drawMenuBar(const View& v) {
     const bool busy = jobBusy();
     if (!ImGui::BeginMenuBar()) return;
@@ -839,7 +904,9 @@ void drawMenuBar(const View& v) {
             if (ImGui::MenuItem(toolTitle(m))) launchConsoleTool(m);
         ImGui::EndMenu();
     }
-    if (ImGui::BeginMenu("Вид")) {
+    const bool viewOpen = ImGui::BeginMenu("Вид");
+    const float menusEnd = ImGui::GetItemRectMax().x;   // дальше — «заголовок» окна
+    if (viewOpen) {
         if (ImGui::MenuItem("Обзор")) s_selectTab = TAB_OVERVIEW;
         if (ImGui::MenuItem("Соединения")) s_selectTab = TAB_FLOWS;
         if (ImGui::MenuItem("Профиль соединения")) s_selectTab = TAB_WATERFALL;
@@ -859,6 +926,7 @@ void drawMenuBar(const View& v) {
         if (ImGui::MenuItem("Анимации", nullptr, &anim)) setAnimations(anim);
         ImGui::EndMenu();
     }
+    if (guiCustomTitleBar()) drawWindowButtons(menusEnd);
     ImGui::EndMenuBar();
 }
 
@@ -2304,6 +2372,10 @@ void drawSettings() {
     ImGui::TextUnformatted(joinList(c.ownIspOrgKeywords).c_str());
     ImGui::TextColored(kDim, "Своя сеть (AS):"); ImGui::SameLine();
     ImGui::TextUnformatted(joinList(c.ownIspAsns).c_str());
+    ImGui::TextColored(kDim, "Белый список VPN (AS):"); ImGui::SameLine();
+    ImGui::TextUnformatted(joinList(c.vpnWhitelistAsns).c_str());
+    ImGui::TextColored(kDim, "Белый список VPN (домены по DNS):"); ImGui::SameLine();
+    ImGui::TextUnformatted(joinList(c.vpnWhitelistDomains).c_str());
     ImGui::PopTextWrapPos();
 }
 
