@@ -69,6 +69,36 @@ void setDefaults(AppConfig& c) {
     // MARYNONET (AS39709) — сеть оператора
     c.ownIspOrgKeywords = {"EXTREME LTD"};
     c.ownIspAsns        = {"39709"};
+    // Белый список VPN. Облака (Google Cloud AS396982, Yandex Cloud AS200350,
+    // VK Cloud) сюда намеренно не входят: там стоят обычные VPS, в том числе с VPN.
+    c.vpnWhitelistDomains = {
+        // Google / YouTube
+        "google.com", "google.ru", "youtube.com", "youtu.be", "googlevideo.com", "ytimg.com",
+        // (googleusercontent.com нет: *.bc.googleusercontent.com — имена VM Google Cloud)
+        "ggpht.com", "gstatic.com", "googleapis.com", "gvt1.com",
+        // Википедия
+        "wikipedia.org", "wikimedia.org", "wikidata.org", "wiktionary.org",
+        // VK, ОК, Mail.ru, MAX
+        "vk.com", "vk.ru", "vk.me", "userapi.com", "vkuser.net", "vkuseraudio.net",
+        "vkuservideo.net", "vk-cdn.net", "mycdn.me", "ok.ru", "mail.ru", "imgsmail.ru",
+        "max.ru", "oneme.ru",
+        // госсервисы
+        "gosuslugi.ru", "gov.ru", "mos.ru",
+        // Яндекс
+        "yandex.ru", "yandex.net", "yandex.com", "ya.ru", "yastatic.net", "dzen.ru",
+        // крупные российские сервисы и банки
+        "rutube.ru", "ozon.ru", "wildberries.ru", "wb.ru", "avito.ru",
+        "sberbank.ru", "sber.ru", "tbank.ru", "tinkoff.ru", "vtb.ru",
+    };
+    c.vpnWhitelistAsns = {
+        "15169",   // Google
+        "36040",   // YouTube
+        "43515",   // YouTube (Google)
+        "14907",   // Wikimedia Foundation
+        "47541",   // VKontakte
+        "47764",   // VK (Mail.ru)
+        "13238",   // Яндекс
+    };
 }
 
 std::string trim(const std::string& s) {
@@ -209,6 +239,21 @@ void applyKey(AppConfig& c, const std::string& key, const std::string& val,
     else if (key == "own_isp_asn") {
         c.ownIspAsns.clear();
         for (const auto& s : splitList(val)) c.ownIspAsns.push_back(lower(s));
+    }
+    // Белый список VPN: значение заменяет встроенный список; «+» в начале —
+    // дополняет его («vpn_whitelist_domains = + example.ru, example.com»).
+    else if (key == "vpn_whitelist_domains" || key == "vpn_whitelist_asn") {
+        std::vector<std::string>& dst = key == "vpn_whitelist_asn" ? c.vpnWhitelistAsns
+                                                                   : c.vpnWhitelistDomains;
+        std::string v = val;
+        if (!v.empty() && v[0] == '+') v.erase(0, 1);
+        else dst.clear();
+        for (auto s : splitList(v)) {
+            s = lower(s);
+            while (!s.empty() && (s.back() == '.')) s.pop_back();
+            if (!s.empty() && s[0] == '.') s.erase(0, 1);
+            if (!s.empty()) dst.push_back(s);
+        }
     }
     else c.warnings.push_back(where + ": неизвестный ключ «" + key + "»");
 }

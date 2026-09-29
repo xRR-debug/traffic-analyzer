@@ -36,9 +36,13 @@ void analyzeThroughput(const std::vector<Packet>& packets,
         int rport = sLoc ? p.dstPort : p.srcPort, lport = sLoc ? p.srcPort : p.dstPort;
         TFlow& f = flows[keyOf(p.proto, rip, rport, lport)];
         f.rip = rip; f.proto = p.proto; f.rport = rport; f.lport = lport;
-        // VoWiFi (UDP 500/4500) — звонок: его ровный поток и есть битрейт приложения
-        if (p.wgType != 0 || (vpnPortName(rport, p.proto) && !likelyVoWifi(rport, p.proto, nullptr)))
-            f.vpn = true;
+        // VoWiFi (UDP 500/4500) — звонок: его ровный поток и есть битрейт приложения;
+        // 500/4500 — VPN, только если это IPsec-VPN точно (ipsecClass)
+        if (p.wgType != 0) f.vpn = true;
+        else if (vpnPortName(rport, p.proto)) {
+            const IpsecClass ic = ipsecClass(p, rport, nullptr);
+            if (ic == IPSEC_NONE || ic == IPSEC_VPN) f.vpn = true;
+        }
         if (sLoc) f.bytesOut += p.length; else f.bytesIn += p.length;
         if (f.tFirst < 0) f.tFirst = absT[i];
         f.tLast = absT[i];
@@ -766,7 +770,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
     if (!targetIp.empty()) ttTarget = buildTcpConnTable(targetScope, localIp);
     const TcpConnTable& ttScope = targetIp.empty() ? ttAll : ttTarget;
 
-    std::set<std::string> tspuBlocked = collectTspuBlockedIps(packets, localIp, &ttAll);
+    std::set<std::string> tspuBlocked = collectTspuBlockedIps(packets, localIp, &ttAll, ipCache);
     // Домены, заблокированные по SNI, и адреса, где они встретились. Если такой
     // адрес не попал в tspuBlocked — он общий (CDN): другие сайты на нём
     // работают, заблокировано только имя. В таблице это SNI-BLOCK, а не TSPU?.
@@ -776,6 +780,57 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
         if (!kv.second.sni.empty() && blockedSnisAll.count(kv.second.sni) &&
             !tspuBlocked.count(kv.second.ip))
             sniBlockIps.insert(kv.second.ip);
+
+    // Причины блокировок — те же, что в разделе «ПРИЧИНЫ БЛОКИРОВОК» ниже, чтобы
+    // ВЫВОД им не противоречил: «~16 КБ» — не «проблема канала», а UDP без
+    // ответа — не «проблем нет».
+    const std::vector<BlockReason> blockReasons =
+        collectBlockReasons(packets, ttAll, ipCache, localIp, targetIp);
+    std::vector<const BlockReason*> frz16;
+    for (const auto& r : blockReasons) if (r.code == "TCP16") frz16.push_back(&r);
+    // UDP без ответа, которого нет среди tspuIps (туннель без ответа туда уже
+    // попал): чаще всего QUIC на :443 — браузер или Hysteria2
+    auto udpOtherOf = [&](const std::set<std::string>& tspuIps) {
+        std::vector<const BlockReason*> v;
+        for (const auto& r : blockReasons)
+            if (r.code == "UDP_DROP" && !tspuIps.count(r.ip)) v.push_back(&r);
+        return v;
+    };
+    auto listOf = [](const std::vector<const BlockReason*>& v) {
+        std::string s; std::set<std::string> seen; int col = 0;
+        for (const BlockReason* r : v) {
+            if (!seen.insert(r->ip).second) continue;
+            if (!s.empty()) s += ", ";
+            if (col >= 6) { s += "\n     "; col = 0; }
+            s += r->ip;
+            if (r->target != r->ip) s += " (" + r->target + ")";
+            col++;
+        }
+        return s;
+    };
+    auto printFreeze = [&](bool also) {
+        printf("%s%sОБРЫВ ПОСЛЕ ~16 КБ к зарубежному хостингу: %s\n"
+               "Соединение встаёт, начало ответа приходит, дальше данные не идут —\n"
+               "ни RST, ни FIN. Почерк ограничения ТСПУ к зарубежным хостингам: сайт\n"
+               "грузится частично, VPN подключается, но не работает. Повторы и потери\n"
+               "по этим адресам — попытки дослать данные в зависшие соединения, а не\n"
+               "плохой канал. Подтвердите режимом «Тест 16 КБ».%s\n",
+               C::RED, also ? "Также: " : "", listOf(frz16).c_str(), C::RST);
+    };
+    auto printUdpOther = [&](const std::vector<const BlockReason*>& udp, bool also) {
+        bool quic = false, other = false;
+        for (const BlockReason* r : udp)
+            (r->detail.rfind("QUIC:", 0) == 0 ? quic : other) = true;
+        printf("%s%sUDP БЕЗ ОТВЕТА: %s\n", C::YEL, also ? "Также: " : "", listOf(udp).c_str());
+        if (quic)
+            printf("QUIC (UDP/443) уходит, в ответ ничего. Браузер сам перейдёт на TCP,\n"
+                   "и сайт откроется; если это VPN поверх QUIC (Hysteria2 и т.п.) —\n"
+                   "протокол, скорее всего, режется ТСПУ или сервер не отвечает.\n");
+        if (other)
+            printf("UDP-туннель: пакеты уходят, ответов нет — протокол режется по пути\n"
+                   "или сервер недоступен.\n");
+        printf("%s", C::RST);
+    };
 
     if (rows.empty()) {
         if (!targetIp.empty())
@@ -789,6 +844,11 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
                 printf("\n%s=== Признаки DPI-блокировки (RST-инъекция / дроп) ===%s\n", C::BOLD, C::RST);
                 for (auto& f : dpiFindings) printf("  %s!%s %s\n", C::RED, C::RST, f.c_str());
             }
+            const auto udpOther = udpOtherOf(tspuBlocked);
+            const bool anyBlock = !tspuBlocked.empty() || !blockedSnisAll.empty() || !dpiFindings.empty();
+            // таблицы проблем нет, но блокировка найдена — ВЫВОД всё равно печатаем
+            if (anyBlock || !frz16.empty() || !udpOther.empty())
+                printf("\n=================== ВЫВОД ===================");
             if (!tspuBlocked.empty()) {
                 std::set<std::string> tcpIps;
                 for (const auto& kv : ttAll.conns) tcpIps.insert(kv.second.ip);
@@ -817,15 +877,25 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             } else if (!dpiFindings.empty()) {
                 printf("\n%sОбнаружены прямые признаки DPI-блокировки — см. раздел выше.%s\n",
                        C::RED, C::RST);
+            } else if (!frz16.empty()) {
+                printf("\n");
+                printFreeze(false);
+            } else if (!udpOther.empty()) {
+                printf("\n");
+                printUdpOther(udpOther, false);
             } else {
                 printf("\n%sЯвных проблем соединения не обнаружено.%s\n", C::GRN, C::RST);
             }
+            if (anyBlock && !frz16.empty()) printFreeze(true);
+            if ((anyBlock || !frz16.empty()) && !udpOther.empty()) printUdpOther(udpOther, true);
         }
     } else {
         printf("\n%s=== ПРОБЛЕМНЫЕ АДРЕСА (единая таблица) ===%s\n", C::BOLD, C::RST);
         printf("  %-16s %-9s %3s %3s %3s %4s %4s %3s %-17s %6s %-10s %-10s %-8s %-32s %-14s %s\n",
                "IP", "PORTS", "SYN", "SA", "RST", "RETR", "SYNr", "ZW",
                "RTT mn/md/mx", "LOSS", "BYTE i/o", "VERDICT", "TAG", "ORG", "REGION", "APP");
+        // белый список VPN — только для тега; вердикт по соединению не меняется
+        const auto ipW = withVpnWhitelist(packets, ipCache);
         int shown = 0;
         for (auto& r : rows) {
             if (shown++ >= 15) break;
@@ -918,7 +988,9 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
                     bool cdn = looksCdnOrg(info.org);
                     // хостинг определяем и по флагу, и по названию org (надёжнее)
                     bool host = (info.hosting || looksHostingOrg(info.org, info.asn)) && !isOwnIspOrg(info.org, info.asn);
-                    if (info.isVpn)        { tag = "VPN";    tagCol = C::RED; }
+                    const IpInfo* wi = ipInfoOf(&ipW, r.ip);
+                    if (wi && wi->vpnWhite) { tag = "WHITE"; tagCol = C::GRY; }   // белый список: не VPN
+                    else if (info.isVpn)   { tag = "VPN";    tagCol = C::RED; }
                     else if (info.isProxy) { tag = "PROXY";  tagCol = C::RED; }
                     else if (info.isTor)   { tag = "TOR";    tagCol = C::RED; }
                     // только показ (в вердикт не идут): резидентный прокси, Private Relay, Zscaler
@@ -1457,7 +1529,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
 
             // все IP с признаками блокировки на ТСПУ (TCP-DPI/SYN-блок + UDP-WG)
             std::set<std::string> tspuIps = targetIp.empty()
-                ? tspuBlocked : collectTspuBlockedIps(dpiScope, localIp, &ttScope);
+                ? tspuBlocked : collectTspuBlockedIps(dpiScope, localIp, &ttScope, ipCache);
             bool tspuBlock = !tspuIps.empty();
             // домены, заблокированные по SNI (в т.ч. на общих адресах CDN)
             const auto blockedSnis = targetIp.empty()
@@ -1479,6 +1551,8 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             // одиночный повтор SYN — потеря одного пакета, не «потери» (порог 3)
             bool someLoss  = (retrPct >= 3.0 || sumDup >= 20 || sumZw >= 10 || totalSynRetr >= 3);
             bool elevated  = (avgRtt >= 300000 && avgRtt < 500000);
+            const auto udpOther = udpOtherOf(tspuIps);
+            const bool anyBlock = tspuBlock || !blockedSnis.empty() || dpiDetected;
 
             if (tspuBlock) {
                 // список ВСЕХ адресов для вывода (с переносом строк для читаемости)
@@ -1509,6 +1583,9 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
                        "молчаливый дроп после ClientHello) — см. раздел выше. Это\n"
                        "указывает на блокировку оператором, а не на проблему сервера.%s\n",
                        C::RED, C::RST);
+            } else if (!frz16.empty()) {
+                // повторы в зависшие соединения — не «потери канала»
+                printFreeze(false);
             } else if (hardBlock && heavyLoss) {
                 printf("%sСоединение работает плохо: часть подключений не\n"
                        "устанавливается, плюс большие потери пакетов. Похоже на\n"
@@ -1525,6 +1602,12 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
                        heavyLoss ? "много потерь пакетов" : "",
                        slowRoute ? (heavyLoss ? " и высокий RTT" : "очень высокий RTT (медленный ответ)") : "",
                        C::RST);
+            } else if (!udpOther.empty()) {
+                // TCP в порядке (или умеренные потери), но UDP без ответа — не «норма»
+                printUdpOther(udpOther, false);
+                if (someLoss || elevated)
+                    printf("%sTCP-соединения в целом рабочие, есть умеренные потери или "
+                           "повышенный RTT.%s\n", C::YEL, C::RST);
             } else if (someLoss || elevated) {
                 printf("%sСоединения в целом рабочие, есть умеренные потери или\n"
                        "повышенный RTT. Возможны кратковременные подтормаживания,\n"
@@ -1534,6 +1617,10 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
                        "мало, время ответа приемлемое. Явных проблем с сетью нет.%s\n",
                        C::GRN, C::RST);
             }
+            // вторичные находки, если ВЫВОД выбрал другую ветку
+            if (anyBlock && !frz16.empty()) printFreeze(true);
+            const bool udpShown = !anyBlock && frz16.empty() && !(hardBlock || heavyLoss || slowRoute);
+            if (!udpOther.empty() && !udpShown) printUdpOther(udpOther, true);
             // оговорка одной строкой, без отдельного блока «Важно»
             printf("(по дампу нельзя на 100%% отличить блокировку провайдером от\n"
                    " недоступности сервера — это признаки для проверки.)\n");
@@ -1598,7 +1685,7 @@ void runConnAnalysisBody(const std::vector<Packet>& packets, const std::string& 
     printBlockReasons(collectBlockReasons(packets, tt, &ipCache, g_localIp, target));
     analyzeDpiBypass(tt);
     printRealitySuspects(collectRealitySuspects(packets, tt, &ipCache), &ipCache);
-    analyzeUdpConns(packets, g_localIp, target);
+    analyzeUdpConns(packets, g_localIp, target, &ipCache);
     analyzeQuic(packets, g_localIp, target);
     analyzeJa4(packets, &ipCache, target);
     analyzeThroughput(packets, g_localIp, target);
@@ -1729,7 +1816,7 @@ DumpSummary summarizeDump(const std::vector<Packet>& packets, const std::string&
         for (long long gap : kv.second) if (gap > thr) s.outRetrans++;
     }
 
-    s.blockedIps  = collectTspuBlockedIps(packets, g_localIp, &tt);
+    s.blockedIps  = collectTspuBlockedIps(packets, g_localIp, &tt, ipCache);
     s.blockedSnis = collectBlockedSnis(packets, g_localIp, &tt);
     s.blockReasons = collectBlockReasons(packets, tt, ipCache, g_localIp);
     // объём по адресам и вердикт VPN — те же функции, что в режиме 1

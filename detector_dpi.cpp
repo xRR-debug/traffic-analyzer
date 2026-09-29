@@ -322,10 +322,19 @@ void analyzeDnsAnomalies(const std::vector<Packet>& packets) {
 // (C) молчаливый дроп: соединение поднялось (SYN-ACK был), ушёл ClientHello
 // с SNI, а сервер не прислал НИЧЕГО (ни данных, ни RST). ClientHello в
 // последние 3 с захвата не берём.
+// Текстовый дамп (tcpdump без содержимого) ClientHello не показывает: там
+// тот же признак — первый сегмент данных на :443 после SYN-ACK и полная
+// тишина сервера. Имени (SNI) у такого соединения нет — c.sni пустой, и
+// отличить «режут этот сайт» от одиночного зависания нечем: если к тому же
+// адресу другое соединение нормально работало, дропом не считаем.
 bool connSilentDrop(const TcpConnTable& tt, const TcpConnState& c) {
-    return tt.anyInboundTcp && c.ch && !c.sni.empty() && c.synack > 0 &&
-           c.firstData < 0 && !c.inRst && !c.inFin &&
-           c.chTime >= 0 && tt.tEnd >= 0 && tt.tEnd - c.chTime >= cfg().tailUs;
+    if (!tt.anyInboundTcp || c.synack <= 0 || c.firstData >= 0 || c.inRst || c.inFin ||
+        tt.tEnd < 0)
+        return false;
+    long long t0 = -1;
+    if (c.ch && !c.sni.empty()) t0 = c.chTime;
+    else if (!c.ch && c.rport == 443 && !tt.workedIps.count(c.ip)) t0 = c.firstOutDataTime;
+    return t0 >= 0 && tt.tEnd - t0 >= cfg().tailUs;
 }
 // (A) RST после ClientHello, пока сервер ещё не отдал данных (<200 Б).
 // Если сервер уже успел переслать существенный объём — это рабочая сессия,
@@ -408,11 +417,19 @@ std::vector<std::string> detectDpiInjection(const TcpConnTable& tt) {
 
         if (connSilentDrop(tt, c)) {
             char b[640];   // кириллица в UTF-8 — 2 байта на букву
-            snprintf(b, sizeof(b),
-                "К %s (SNI: %s): соединение установлено, ClientHello отправлен, но "
-                "сервер не ответил ничем (ни данных, ни RST) — молчаливый дроп, "
-                "характерный для блокировки по SNI (способ ТСПУ).",
-                who.c_str(), c.sni.c_str());
+            if (c.sni.empty())
+                snprintf(b, sizeof(b),
+                    "К %s: соединение установлено, первый сегмент данных (обычно "
+                    "ClientHello) ушёл, но сервер не ответил ничем (ни данных, ни RST) — "
+                    "молчаливый дроп, характерный для блокировки ТСПУ. SNI в дампе не "
+                    "виден (запись без содержимого пакетов).",
+                    who.c_str());
+            else
+                snprintf(b, sizeof(b),
+                    "К %s (SNI: %s): соединение установлено, ClientHello отправлен, но "
+                    "сервер не ответил ничем (ни данных, ни RST) — молчаливый дроп, "
+                    "характерный для блокировки по SNI (способ ТСПУ).",
+                    who.c_str(), c.sni.c_str());
             std::string s = b;
             if (echNote) s += std::string(echNote) + c.sni + ") — похоже на блокировку ECH.";
             findings.push_back(s + "\n    Wireshark: " + wsFilter(c.ip, c.rport));
@@ -445,22 +462,84 @@ std::vector<std::string> detectDpiInjection(const std::vector<Packet>& packets,
     return detectDpiInjection(buildTcpConnTable(packets, localIp));
 }
 
-// VPN-туннель «шлём — в ответ почти ничего»: ≥10 пакетов ушло, ≤2 пришло.
-// Не строго 0: ТСПУ часто пропускает первое рукопожатие (ответ на handshake
-// виден) и режет поток уже после него. Одно правило для журнала, таблицы и обзора.
-static bool udpTunnelStarved(long long out, long long in) {
-    return out >= 10 && in <= 2;
+// ---- UDP-туннели: общее для журнала (analyzeUdpConns), таблицы
+// (collectTspuBlockedIps) и обзора (collectBlockReasons) — одно опознание
+// туннеля и одно правило «ответа нет», чтобы три отчёта не расходились.
+
+// Что за туннель на этом UDP-адресе; nullptr — не туннель. *port — порт,
+// по которому опознан. ii — сведения об удалённом адресе, если есть.
+// IKE/NAT-T (500/4500) — туннель, только если это точно IPsec-VPN (ipsecClass):
+// VoWiFi и «не ясно» VPN не называем.
+static const char* udpTunnelKind(const Packet& p, int rport, int lport,
+                                 const IpInfo* ii, int* port) {
+    *port = rport;
+    if (p.wgType != 0) return "WireGuard";   // сигнатура в payload — самый надёжный признак
+    if (p.l7 == L7_OPENVPN) return "OpenVPN";
+    if (const char* v = vpnPortName(rport, "UDP")) {
+        const IpsecClass ic = ipsecClass(p, rport, ii);
+        return (ic == IPSEC_NONE || ic == IPSEC_VPN) ? v : nullptr;
+    }
+    // листенер на нашей стороне — абонент сам держит WG/AmneziaWG-сервер
+    if (lport == 51820 || lport == 51821 || lport == 55555) {
+        *port = lport;
+        const char* v = vpnPortName(lport, "UDP");
+        return v ? v : "WireGuard";
+    }
+    return nullptr;
+}
+
+namespace {  // имя не должно столкнуться с другими единицами трансляции
+struct UdpTunnelStat {
+    const char* kind = nullptr;         // udpTunnelKind; nullptr — не туннель
+    int kindPort = 0;
+    long long out = 0, in = 0;          // пакетов от абонента / к абоненту
+    long long espOut = 0, espIn = 0;    // из них ESP-данные (IPsec)
+    long long t0 = -1, t1 = -1;         // первый / последний исходящий
+    long long lastIn = -1;              // последний входящий
+    void add(const Packet& p, bool outbound, long long t, int rport, int lport,
+             const IpInfo* ii) {
+        if (outbound) {
+            out++; if (p.ipsec == 3) espOut++;
+            if (t >= 0) { if (t0 < 0) t0 = t; t1 = t; }
+        } else {
+            in++; if (p.ipsec == 3) espIn++;
+            if (t >= 0) lastIn = t;
+        }
+        // сигнатура WireGuard перекрывает догадку по порту
+        if (!kind || p.wgType != 0) {
+            int port = 0;
+            if (const char* k = udpTunnelKind(p, rport, lport, ii, &port)) { kind = k; kindPort = port; }
+        }
+    }
+};
+}  // namespace
+
+// Туннель «шлём — в ответ почти ничего». Вызывать, только если входящий UDP
+// в дампе вообще есть (иначе дамп однонаправленный). Условия:
+//  - попытки идут ≥10 с (WireGuard повторяет handshake раз в 5 с);
+//  - IPsec: судим по ESP-данным — ESP уходит (≥3), в ответ ESP нет;
+//  - иначе ≥10 пакетов ушло, ≤2 пришло. Не строго 0: ТСПУ часто пропускает
+//    первое рукопожатие и режет поток уже после него. Но пара ответов бывает
+//    и у РАБОЧЕГО WG-туннеля, по которому только отдаём: получатель шлёт
+//    keepalive раз в 10 с. Поэтому при ответах нужна ещё тишина ≥15 с между
+//    последним ответом и последней попыткой — у живого туннеля её не бывает.
+static bool udpTunnelStarved(const UdpTunnelStat& s) {
+    if (s.t0 < 0 || s.t1 - s.t0 < 10000000LL) return false;
+    if (s.espOut + s.espIn > 0) return s.espOut >= 3 && s.espIn == 0;
+    if (s.out < 10 || s.in > 2) return false;
+    return s.in == 0 || s.t1 - s.lastIn >= 15000000LL;
 }
 
 // Собирает множество IP (без порта) с признаками блокировки на ТСПУ:
 //  - TCP: RST-инъекция / молчаливый дроп после ClientHello (по SNI) — только
 //    если на этом адресе не работал другой сайт (иначе адрес общий, CDN);
 //  - TCP: рукопожатие не проходит (много SYN, ни одного SYN-ACK/RST);
-//  - UDP: WireGuard-туннель с сильной асимметрией (handshake уходит, ответа нет).
+//  - UDP: VPN-туннель, в который долго шлём, а в ответ почти ничего (udpTunnelStarved).
 // Используется чтобы пометить такие адреса прямо в единой таблице.
 std::set<std::string> collectTspuBlockedIps(const std::vector<Packet>& packets,
                                             const std::string& localIp,
-                                            const TcpConnTable* ttIn /*= nullptr*/) {
+                                            const TcpConnTable* ttIn /*= nullptr*/,
+                                            const std::unordered_map<std::string, IpInfo>* ipCache /*= nullptr*/) {
     auto isLocal = [&](const std::string& ip) {
         return isLocalIp(ip) || (!localIp.empty() && ip == localIp);
     };
@@ -475,6 +554,7 @@ std::set<std::string> collectTspuBlockedIps(const std::vector<Packet>& packets,
     std::map<std::string, PerIp> perIp;
     // IP|SNI, по которым хоть одно соединение получило нормальный ответ:
     // одиночный обрыв среди рабочих параллельных соединений — не блокировка
+    // (дроп без SNI гасится рабочим адресом в самом connSilentDrop)
     std::set<std::string> workedSni;
     // по каждому IP — SNI соединений, получивших нормальный ответ ("" — без SNI)
     std::map<std::string, std::set<std::string>> workedByIp;
@@ -520,14 +600,12 @@ std::set<std::string> collectTspuBlockedIps(const std::vector<Packet>& packets,
         }
     }
 
-    // UDP-часть: VPN-туннель, в который долго шлём, а в ответ — ничего.
-    // Помечаем мягко (в таблице — «ТСПУ?»): то же самое дают неверный ключ и
-    // лежащий сервер. Требуем: входящий UDP в дампе вообще есть (иначе дамп
-    // однонаправленный), ответов почти нет (udpTunnelStarved), попытки идут ≥10 с
-    // (WireGuard повторяет handshake раз в 5 с) и это точно туннель (сигнатура WG
-    // или VPN-порт).
-    struct U { long long out = 0, in = 0; bool wg = false; long long t0 = -1, t1 = -1; };
-    std::map<std::string, U> uc;
+    // UDP-часть: VPN-туннель, в который долго шлём, а в ответ почти ничего
+    // (udpTunnelStarved). Помечаем мягко (в таблице — «ТСПУ?»): то же самое
+    // дают неверный ключ и лежащий сервер. 500/4500 считаем VPN, только если
+    // это точно IPsec-VPN (ipsecClass: по самому дампу или хостинг из ipCache);
+    // иначе это может быть VoWiFi, и «ТСПУ?» на ePDG оператора было бы ложным.
+    std::map<std::string, UdpTunnelStat> uc;
     bool anyInboundUdp = false;
     std::vector<long long> absT = absTimes(packets);
     for (size_t i = 0; i < packets.size(); i++) {
@@ -535,26 +613,15 @@ std::set<std::string> collectTspuBlockedIps(const std::vector<Packet>& packets,
         if (p.proto != "UDP") continue;
         bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
         if (sLoc == dLoc) continue;
+        if (!sLoc) anyInboundUdp = true;
         std::string ip = sLoc ? p.dstIp : p.srcIp;
         int rport = sLoc ? p.dstPort : p.srcPort;
         int lport = sLoc ? p.srcPort : p.dstPort;
-        U& u = uc[ip];
-        if (sLoc) {
-            u.out++;
-            if (absT[i] >= 0) { if (u.t0 < 0) u.t0 = absT[i]; u.t1 = absT[i]; }
-        } else { u.in++; anyInboundUdp = true; }
-        // 500/4500 без хостинга не проверить (ipCache тут нет) — это чаще VoWiFi,
-        // и «TSPU?» на ePDG мобильного оператора было бы ложным (см. likelyVoWifi)
-        if (p.wgType != 0 ||
-            (vpnPortName(rport,"UDP") && !likelyVoWifi(rport, "UDP", nullptr)) ||
-            lport==51820||lport==51821||lport==55555) u.wg = true;
+        uc[ip].add(p, sLoc, absT[i], rport, lport, ipInfoOf(ipCache, ip));
     }
     if (anyInboundUdp)
-        for (auto& kv : uc) {
-            const U& u = kv.second;
-            if (u.wg && udpTunnelStarved(u.out, u.in) && u.t0 >= 0 && u.t1 - u.t0 >= 10000000LL)
-                blocked.insert(kv.first);
-        }
+        for (const auto& kv : uc)
+            if (kv.second.kind && udpTunnelStarved(kv.second)) blocked.insert(kv.first);
 
     return blocked;
 }
@@ -596,19 +663,21 @@ std::map<std::string,std::string> collectBlockedSnis(
 // ------------------------------------------------------------------
 void analyzeUdpConns(const std::vector<Packet>& packets,
                      const std::string& localIp,
-                     const std::string& targetIp /*= ""*/) {
+                     const std::string& targetIp /*= ""*/,
+                     const std::unordered_map<std::string, IpInfo>* ipCache /*= nullptr*/) {
     auto isLocal = [&](const std::string& ip) {
         return isLocalIp(ip) || (!localIp.empty() && ip == localIp);
     };
-    struct UConn {
-        long long out = 0, in = 0;        // пакетов от абонента / к абоненту
+    struct UConn : UdpTunnelStat {        // out/in, espOut/espIn, время — в базе
         long long outBytes = 0, inBytes = 0;
         std::set<int> ports;
         bool vpn = false; std::string vpnName; int vpnPort = 0;
+        int ipsecPort = 0;                // 500/4500, не опознанный как IPsec-VPN
+        IpsecClass ipsecCls = IPSEC_NONE; //   VoWiFi точно или не ясно
         long long rttSum = 0, rttCnt = 0, rttMin = -1, rttMax = -1;
         long long lastOutTime = -1;
-        // IPsec по стадиям (Packet::ipsec): IKE_SA_INIT, IKE дальше, ESP-данные
-        long long ikeInit = 0, ikeMore = 0, espOut = 0, espIn = 0;
+        // IPsec по стадиям (Packet::ipsec): IKE_SA_INIT, IKE дальше (ESP — в базе)
+        long long ikeInit = 0, ikeMore = 0;
     };
     std::map<std::string, UConn> conns;
     long long matched = 0;
@@ -626,34 +695,23 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
         int lport = sLoc ? p.srcPort : p.dstPort;
         UConn& c = conns[remote];
         c.ports.insert(rport);
-        // VPN-листенер может быть и на удалённой стороне (rport), и на нашей
-        // (lport) — если абонент сам держит WG/AmneziaWG-сервер (фикс. порт).
-        if (!c.vpn) {
-            if (p.wgType != 0) {  // сигнатура WireGuard в payload — самый надёжный признак
-                c.vpn = true; c.vpnName = "WireGuard"; c.vpnPort = rport;
-            }
-            else if (p.l7 == L7_OPENVPN) { c.vpn = true; c.vpnName = "OpenVPN"; c.vpnPort = rport; }
-            else if (const char* v = vpnPortName(rport, "UDP")) {
-                // IPsec-разбор (ESP/IKE) нужен и для VoWiFi, но называть его VPN
-                // без проверки хостинга нельзя: чаще это звонки по Wi-Fi
-                c.vpn = true; c.vpnPort = rport;
-                c.vpnName = likelyVoWifi(rport, "UDP", nullptr)
-                    ? std::string(v) + " — VPN или звонки по Wi-Fi (VoWiFi)" : std::string(v);
-            }
-            else if ((lport==51820||lport==51821||lport==55555)) {
-                const char* v = vpnPortName(lport, "UDP");
-                c.vpn = true; c.vpnName = v ? v : "WireGuard"; c.vpnPort = lport;
-            }
+        const long long t = absT[i];
+        // опознание туннеля и счёт пакетов — общие с таблицей и обзором
+        const IpInfo* ii = ipInfoOf(ipCache, remote);
+        c.add(p, sLoc, t, rport, lport, ii);
+        // IPsec-разбор (ESP/IKE) нужен и для VoWiFi, но VPN его называем только
+        // точно (ipsecClass): VoWiFi — «звонки по Wi-Fi», не ясно — с оговоркой
+        if (!c.kind && !c.ipsecPort && vpnPortName(rport, "UDP")) {
+            c.ipsecPort = rport;
+            c.ipsecCls = ipsecClass(p, rport, ii);
         }
         if (p.ipsec == 1) c.ikeInit++;
         else if (p.ipsec == 2) c.ikeMore++;
-        else if (p.ipsec == 3) (sLoc ? c.espOut : c.espIn)++;
-        const long long t = absT[i];
         if (sLoc) {
-            c.out++; c.outBytes += p.length;
+            c.outBytes += p.length;
             c.lastOutTime = t;
         } else {
-            c.in++; c.inBytes += p.length;
+            c.inBytes += p.length;
             // грубый RTT: ответ после нашего последнего исходящего
             if (c.lastOutTime >= 0 && t > c.lastOutTime) {
                 long long rtt = t - c.lastOutTime;
@@ -667,6 +725,16 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
     }
 
     if (conns.empty()) return; // нет UDP — ничего не печатаем
+    for (auto& kv : conns) {
+        UConn& c = kv.second;
+        if (c.kind) { c.vpn = true; c.vpnName = c.kind; c.vpnPort = c.kindPort; }
+        else if (c.ipsecPort) {
+            c.vpn = true; c.vpnPort = c.ipsecPort;
+            c.vpnName = c.ipsecCls == IPSEC_VOWIFI
+                ? std::string("VoWiFi (звонки по Wi-Fi)")
+                : std::string(vpnPortName(c.ipsecPort, "UDP")) + " — IPsec-VPN или VoWiFi";
+        }
+    }
 
     printf("\n=================== UDP-СОЕДИНЕНИЯ ===================\n");
     if (!targetIp.empty()) printf("Фильтр: только %s\n", targetIp.c_str());
@@ -707,7 +775,7 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
             if (oneWay) note = anyInboundUdp ? "нет ответа (порт закрыт/фильтр?)"
                                              : "нет ответа (дамп в одну сторону?)";
             else if (c.vpn) {
-                note = "VPN: " + c.vpnName;
+                note = (c.kind ? "VPN: " : "") + c.vpnName;   // VoWiFi / не ясно — не «VPN:»
                 if (c.espOut > 0 && c.espIn > 0)            note += " (ESP в обе стороны)";
                 else if (c.espOut + c.espIn > 0)            note += " (ESP в одну сторону)";
                 else if (c.ikeMore > 0)                     note += " (IKE без ESP)";
@@ -735,58 +803,85 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
             // Шлём, а в ответ почти ничего. Пассивно НЕ отличить блокировку от
             // неверного ключа/конфига (WireGuard молча игнорирует чужой handshake)
             // и от лежащего сервера — поэтому не «ЗАБЛОКИРОВАН», а перечень причин.
-            bool starved = udpTunnelStarved(c.out, c.in);
+            // То же правило, что в таблице и обзоре, — иначе отчёты разойдутся.
+            const bool starved = anyInboundUdp && udpTunnelStarved(c);
             // IPsec: судим по ESP-данным, IKE — лишь уточнение. Туннель, поднятый до
             // начала съёма, в дампе виден одним ESP, без IKE, — это норма.
             const bool espSeen = c.espOut + c.espIn > 0;
             const bool ikeSeen = c.ikeInit + c.ikeMore > 0;
+            // ответа нет, но попыток мало или они шли меньше 10 с — для «НЕ работает» мало
+            const bool weakOneWay = anyInboundUdp &&
+                (espSeen ? (c.espOut >= 3 && c.espIn == 0) : (c.out >= 3 && c.in == 0));
+            const double span = c.t0 >= 0 ? (c.t1 - c.t0) / 1e6 : 0.0;
+            // как назвать IPsec в итоге: VoWiFi точно — только VoWiFi, не ясно — оба
+            const char* ipsecTag = c.ipsecCls == IPSEC_VOWIFI ? "VoWiFi"
+                                 : c.ipsecCls == IPSEC_UNSURE ? "IPsec/VoWiFi" : "IPsec";
             if (c.espOut > 0 && c.espIn > 0) {
                 lvl = V_OK;
                 snprintf(b, sizeof(b),
-                    "IPsec (%s): ESP-данные идут в обе стороны (%lld↑/%lld↓) — туннель РАБОТАЕТ.%s",
-                    kv.first.c_str(), c.espOut, c.espIn,
+                    "%s (%s): ESP-данные идут в обе стороны (%lld↑/%lld↓) — туннель РАБОТАЕТ.%s",
+                    ipsecTag, kv.first.c_str(), c.espOut, c.espIn,
                     ikeSeen ? "" : " IKE в дампе нет — туннель подняли до начала съёма, это нормально.");
-            } else if (anyInboundUdp && c.espOut >= 3 && c.espIn == 0) {
+            } else if (starved && espSeen) {
                 lvl = V_BAD;
                 snprintf(b, sizeof(b),
-                    "IPsec (%s): ESP уходит (%lld пак.), в ответ ESP нет — туннель НЕ работает: "
-                    "сервер не отвечает, ESP режут по пути или сессия на сервере уже закрыта.",
-                    kv.first.c_str(), c.espOut);
+                    "%s (%s): ESP уходит (%lld пак. за %.0f с), в ответ ESP нет — туннель НЕ "
+                    "работает: сервер не отвечает, ESP режут по пути или сессия на сервере уже закрыта.",
+                    ipsecTag, kv.first.c_str(), c.espOut, span);
+            } else if (weakOneWay && espSeen) {
+                snprintf(b, sizeof(b),
+                    "%s (%s): ESP уходит (%lld пак. за %.0f с), в ответ ESP нет, но попытки "
+                    "шли меньше 10 с — вывод ненадёжен, снимите дамп подольше.",
+                    ipsecTag, kv.first.c_str(), c.espOut, span);
             } else if (c.ikeInit > 0 && c.ikeMore == 0 && !espSeen && c.in > 0) {
                 // клиент, получив нормальный ответ, сразу идёт в IKE_AUTH; повтор
                 // SA_INIT раз за разом — рукопожатие дальше первого шага не идёт
                 if (c.ikeInit >= 6) {
                     lvl = V_BAD;
                     snprintf(b, sizeof(b),
-                        "IPsec/IKE (%s): только IKE_SA_INIT (%lld↑/%lld↓), до IKE_AUTH и ESP "
+                        "%s, IKE (%s): только IKE_SA_INIT (%lld↑/%lld↓), до IKE_AUTH и ESP "
                         "не дошло — подключение НЕ устанавливается. Сервер отвечает, адрес "
                         "доступен; причина — отказ сервера (шифры, cookie), настройки клиента "
                         "или искажение ответа по пути.",
-                        kv.first.c_str(), c.out, c.in);
+                        ipsecTag, kv.first.c_str(), c.out, c.in);
                 } else {
                     snprintf(b, sizeof(b),
-                        "IPsec/IKE (%s): в дампе только начало рукопожатия (IKE_SA_INIT, "
+                        "%s, IKE (%s): в дампе только начало рукопожатия (IKE_SA_INIT, "
                         "%lld↑/%lld↓) — съём мог закончиться раньше, вывод невозможен.",
-                        kv.first.c_str(), c.out, c.in);
+                        ipsecTag, kv.first.c_str(), c.out, c.in);
                 }
             } else if (c.ikeMore > 0 && !espSeen) {
                 snprintf(b, sizeof(b),
-                    "IPsec/IKE (%s): рукопожатие дошло дальше IKE_SA_INIT (%lld↑/%lld↓), но "
+                    "%s, IKE (%s): рукопожатие дошло дальше IKE_SA_INIT (%lld↑/%lld↓), но "
                     "ESP-данных в UDP нет — аутентификация не прошла, в туннеле не было "
                     "трафика или ESP идёт без NAT-T (IP-протокол 50 программа не разбирает).",
-                    kv.first.c_str(), c.out, c.in);
+                    ipsecTag, kv.first.c_str(), c.out, c.in);
             } else if (!anyInboundUdp && c.in == 0) {
                 snprintf(b, sizeof(b),
                     "%s (порт %d, %s): %lld пакетов ушло, ответов нет, но входящего UDP "
                     "в дампе нет вовсе — похоже, дамп снят в одну сторону; вывод невозможен.",
                     c.vpnName.c_str(), c.vpnPort, kv.first.c_str(), c.out);
-            } else if (starved || (c.out >= 3 && c.in == 0)) {
+            } else if (starved) {
                 lvl = V_BAD;
                 snprintf(b, sizeof(b),
-                    "%s (порт %d, %s): %lld пакетов ушло, %lld в ответ — нет ответа: "
+                    "%s (порт %d, %s): %lld пакетов ушло за %.0f с, %lld в ответ — нет ответа: "
                     "блокировка, неверный ключ или сервер недоступен. Блокировку "
                     "подтвердит проверка того же сервера с другой сети (режим 8 — UDP-проба).",
-                    c.vpnName.c_str(), c.vpnPort, kv.first.c_str(), c.out, c.in);
+                    c.vpnName.c_str(), c.vpnPort, kv.first.c_str(), c.out, span, c.in);
+            } else if (weakOneWay) {
+                snprintf(b, sizeof(b),
+                    "%s (порт %d, %s): %lld пакетов ушло за %.0f с, ответа нет, но для вывода "
+                    "мало (нужно ≥10 пакетов за ≥10 с) — снимите дамп подольше.",
+                    c.vpnName.c_str(), c.vpnPort, kv.first.c_str(), c.out, span);
+            } else if (!espSeen && c.out >= 10 && c.in <= 2) {
+                // пара ответов на много исходящих, но без долгой тишины в конце или
+                // за короткое время — так выглядит и keepalive рабочего WG-туннеля,
+                // по которому только отдаём (см. udpTunnelStarved)
+                snprintf(b, sizeof(b),
+                    "%s (порт %d, %s): %lld↑/%lld↓ за %.0f с — ответы редкие. Так бывает и при "
+                    "обрыве после рукопожатия, и у рабочего туннеля, по которому только отдают "
+                    "данные (keepalive раз в 10 с); однозначный вывод невозможен.",
+                    c.vpnName.c_str(), c.vpnPort, kv.first.c_str(), c.out, c.in, span);
             } else if (c.out > 0 && c.in > 0) {
                 lvl = V_OK;
                 snprintf(b, sizeof(b),
@@ -1580,9 +1675,16 @@ std::vector<BlockReason> collectBlockReasons(
                 put(name, c.ip, "TLS_RST", b);
             }
         } else if (connSilentDrop(tt, c)) {
-            put(name, c.ip, "TLS_DROP", c.ech && isEchPublicName(c.sni)
-                ? "SYN-ACK был, ClientHello (с ECH) ушёл, ответа нет — ни данных, ни RST"
-                : "SYN-ACK был, ClientHello ушёл, ответа нет — ни данных, ни RST");
+            if (c.sni.empty()) {
+                // текстовый дамп: ClientHello не виден
+                put(name, c.ip, "TLS_DROP",
+                    "SYN-ACK был, первый сегмент данных на :443 ушёл, ответа нет — ни данных, "
+                    "ни RST (SNI в дампе не виден)");
+            } else {
+                put(name, c.ip, "TLS_DROP", c.ech && isEchPublicName(c.sni)
+                    ? "SYN-ACK был, ClientHello (с ECH) ушёл, ответа нет — ни данных, ни RST"
+                    : "SYN-ACK был, ClientHello ушёл, ответа нет — ни данных, ни RST");
+            }
         } else if (forged) {
             std::vector<std::string> why; connForgedRst(c, &why);
             std::string d = "посреди соединения (принято " + std::to_string(c.serverBytes / 1024) + " КБ)";
@@ -1623,27 +1725,27 @@ std::vector<BlockReason> collectBlockReasons(
     }
 
     // UDP: QUIC без единого ответа или VPN-туннель, где ответов почти нет
-    struct U { long long out = 0, in = 0, t0 = -1, t1 = -1; bool quic = false; const char* vpn = nullptr;
-               std::string sni; };
+    // (туннель — то же правило, что в журнале и таблице: udpTunnelStarved)
+    struct U : UdpTunnelStat { bool quic = false; std::string sni; };
     std::map<std::string, U> uc;
     bool anyInboundUdp = false;
     std::vector<long long> absT = absTimes(packets);
     for (size_t i = 0; i < packets.size(); i++) {
         const Packet& p = packets[i];
-        if (p.proto != "UDP" || p.srcPort == 53 || p.dstPort == 53) continue;
+        if (p.proto != "UDP") continue;
         bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
         if (sLoc == dLoc) continue;
         std::string ip = sLoc ? p.dstIp : p.srcIp;
         if (!onlyIp.empty() && ip != onlyIp) continue;
+        // ответ DNS тоже доказывает, что входящее направление в дампе есть
+        if (!sLoc) anyInboundUdp = true;
+        if (p.srcPort == 53 || p.dstPort == 53) continue;
         int rport = sLoc ? p.dstPort : p.srcPort;
+        int lport = sLoc ? p.srcPort : p.dstPort;
         U& u = uc[ip];
-        if (!sLoc) { u.in++; anyInboundUdp = true; continue; }
-        u.out++;
-        if (absT[i] >= 0) { if (u.t0 < 0) u.t0 = absT[i]; u.t1 = absT[i]; }
+        u.add(p, sLoc, absT[i], rport, lport, ipInfoOf(ipCache, ip));
+        if (!sLoc) continue;
         if (p.quic || rport == 443) u.quic = true;
-        if (p.wgType != 0) u.vpn = "WireGuard";
-        else if (!u.vpn && !likelyVoWifi(rport, "UDP", ipInfoOf(ipCache, ip)))
-            u.vpn = vpnPortName(rport, "UDP");
         if (u.sni.empty() && !p.sni.empty()) u.sni = p.sni;
     }
     if (anyInboundUdp) {
@@ -1651,11 +1753,15 @@ std::vector<BlockReason> collectBlockReasons(
             const U& u = kv.second;
             if (u.t0 < 0) continue;
             std::string name = !u.sni.empty() ? u.sni : ipName(kv.first);
-            if (u.vpn && udpTunnelStarved(u.out, u.in) && u.t1 - u.t0 >= 10000000LL) {
-                snprintf(b, sizeof(b), "%s: %lld пакетов за %.0f с, ответов %lld",
-                         u.vpn, u.out, (u.t1 - u.t0) / 1e6, u.in);
+            if (u.kind && udpTunnelStarved(u)) {
+                if (u.espOut + u.espIn > 0)
+                    snprintf(b, sizeof(b), "%s: ESP уходит (%lld пак. за %.0f с), ESP в ответ нет",
+                             u.kind, u.espOut, (u.t1 - u.t0) / 1e6);
+                else
+                    snprintf(b, sizeof(b), "%s: %lld пакетов за %.0f с, ответов %lld",
+                             u.kind, u.out, (u.t1 - u.t0) / 1e6, u.in);
                 put(name, kv.first, "UDP_DROP", b);
-            } else if (u.in == 0 && u.quic && !u.vpn && u.out >= 3 && tt.tEnd - u.t0 >= cfg().tailUs &&
+            } else if (u.in == 0 && u.quic && !u.kind && u.out >= 3 && tt.tEnd - u.t0 >= cfg().tailUs &&
                        !worked.count(name)) {
                 snprintf(b, sizeof(b), "QUIC: %lld датаграмм, ответов 0 (по TCP не открылось)", u.out);
                 put(name, kv.first, "UDP_DROP", b);

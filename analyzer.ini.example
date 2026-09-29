@@ -81,3 +81,19 @@
 # считает. Подстроки названия организации и номера AS, через запятую.
 # own_isp_org = maryno
 # own_isp_asn = 39709
+
+[vpn_whitelist]
+# Белый список VPN: крупные сервисы. Их адреса не дают баллов VPN (порты,
+# флаги баз, доля трафика, гео, MSS) и не называются VPN; проблемы соединения
+# (ТСПУ, 16 КБ, потери) по ним проверяются как обычно.
+# Адрес в списке, если его AS есть в vpn_whitelist_asn ИЛИ DNS в этом же дампе
+# разрезолвил в него имя из vpn_whitelist_domains (суффикс: youtube.com
+# покрывает и www.youtube.com). Один SNI не в счёт: Reality ставит в SNI как раз
+# vk.com / gosuslugi.ru, а ведёт на VPS.
+# Сигнатуры (WireGuard, OpenVPN, прокси по содержимому) срабатывают и здесь.
+# Облака (Google Cloud AS396982, Yandex Cloud AS200350, VK Cloud) не добавляйте:
+# там стоят обычные VPS, в том числе с VPN.
+# Значение заменяет список целиком; с «+» в начале — дописывает к стандартному:
+# vpn_whitelist_domains = +example.ru, example.com
+# vpn_whitelist_domains = google.com, google.ru, youtube.com, youtu.be, googlevideo.com, ytimg.com, ggpht.com, gstatic.com, googleapis.com, gvt1.com, wikipedia.org, wikimedia.org, wikidata.org, wiktionary.org, vk.com, vk.ru, vk.me, userapi.com, vkuser.net, vkuseraudio.net, vkuservideo.net, vk-cdn.net, mycdn.me, ok.ru, mail.ru, imgsmail.ru, max.ru, oneme.ru, gosuslugi.ru, gov.ru, mos.ru, yandex.ru, yandex.net, yandex.com, ya.ru, yastatic.net, dzen.ru, rutube.ru, ozon.ru, wildberries.ru, wb.ru, avito.ru, sberbank.ru, sber.ru, tbank.ru, tinkoff.ru, vtb.ru
+# vpn_whitelist_asn = 15169, 36040, 43515, 14907, 47541, 47764, 13238

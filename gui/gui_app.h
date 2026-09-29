@@ -201,6 +201,16 @@ void rknCheck(const std::string& target);
 
 HWND mainHwnd();                 // на macOS — nullptr
 void guiRequestClose();          // закрыть окно (как крестик)
+// Окно без системного заголовка (Windows): «свернуть / развернуть / закрыть»
+// рисует панель меню, а её пустая часть — заголовок (перетаскивание, двойной
+// щелчок, Snap). На macOS заголовок системный — guiCustomTitleBar() == false.
+bool guiCustomTitleBar();
+void guiMinimize();
+void guiToggleMaximize();
+bool guiIsMaximized();
+// пустая часть панели меню, за которую тянут окно (x от left до right, y до
+// height; координаты ImGui = клиентские пиксели окна). Каждый кадр.
+void guiSetCaptionArea(float left, float right, float height);
 void guiInit();                 // стиль, состояние
 void guiFrame();                 // один кадр интерфейса
 void guiRequestLogTab();         // переключиться на вкладку «Журнал»
