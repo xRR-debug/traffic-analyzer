@@ -1792,7 +1792,9 @@ void drawWfPicker(const View& v) {
     }
     const FlowRow* cur = (s_wfIdx >= 0 && (size_t)s_wfIdx < ds.flows.size()) ? &ds.flows[(size_t)s_wfIdx] : nullptr;
     int curIp = -1;
-    if (cur)
+    // в s_wfIps только TCP: выбранный во «Соединениях» UDP-поток к тому же адресу
+    // не должен подставлять в список чужое TCP-соединение
+    if (cur && cur->proto == "TCP")
         for (size_t i = 0; i < s_wfIps.size(); i++)
             if (s_wfIps[i].ip == cur->remoteIp) { curIp = (int)i; break; }
 
@@ -2371,7 +2373,24 @@ void drawSettings() {
     ImGui::TextColored(kDim, "Своя сеть (организация):"); ImGui::SameLine();
     ImGui::TextUnformatted(joinList(c.ownIspOrgKeywords).c_str());
     ImGui::TextColored(kDim, "Своя сеть (AS):"); ImGui::SameLine();
-    ImGui::TextUnformatted(joinList(c.ownIspAsns).c_str());
+    if (c.ownIspAsnFromIni) {
+        ImGui::TextUnformatted((joinList(c.ownIspAsns) + "  (analyzer.ini)").c_str());
+    } else {
+        const OwnIspAuto oi = ownIspAuto();
+        const std::string shown = oi.asn ? (oi.name.empty() ? "AS" + std::to_string(oi.asn) : oi.name)
+                                         : std::string("не определена");
+        ImGui::TextUnformatted(shown.c_str());
+        ImGui::SameLine();
+        ImGui::BeginDisabled(jobBusy());
+        if (ImGui::Button("Определить")) startOwnIspDetect();
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Узнать AS провайдера, через которого программа сейчас выходит в "
+                              "интернет (запрос к ip-api.com по своему адресу), и запомнить. "
+                              "Адреса этой сети не считаются хостингом. Нажимайте из сети "
+                              "оператора и без VPN. Задать вручную — own_isp_asn в analyzer.ini.");
+        if (oi.asn) ImGui::TextColored(kDim, "  %s", oi.status.c_str());
+        else ImGui::TextColored(kWarn, "  нажмите «Определить», находясь в сети оператора без VPN");
+    }
     ImGui::TextColored(kDim, "Белый список VPN (AS):"); ImGui::SameLine();
     ImGui::TextUnformatted(joinList(c.vpnWhitelistAsns).c_str());
     ImGui::TextColored(kDim, "Белый список VPN (домены по DNS):"); ImGui::SameLine();

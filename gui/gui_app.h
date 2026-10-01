@@ -168,6 +168,7 @@ void startIpOwner(const std::string& target);   // режим 13 (кому пр�
 // сравнение: A — текущий набор (если pathsA пуст) или указанные файлы
 void startCompare(std::vector<std::string> pathsA, std::vector<std::string> pathsB);
 void startReloadConfig();
+void startOwnIspDetect();   // своя сеть: AS по своему адресу, запомнить, пересчитать обзор
 // true, если перед выходом нужно убить процесс (задача ещё работает)
 bool jobMustAbortOnExit();
 

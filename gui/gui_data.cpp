@@ -602,6 +602,29 @@ void startReloadConfig() {
     for (const auto& w : c.warnings) logLine(C::YEL, "  " + w);
 }
 
+// Кнопка «Определить» (своя сеть) — фоновой задачей, чтобы номер не сменился
+// посреди анализа. Обзор открытого дампа сразу пересчитываем с новым номером.
+void startOwnIspDetect() {
+    startJob("Определение своей сети (AS)", [] {
+        std::string msg;
+        if (!ownIspDetect(msg)) { jobFail("Своя сеть не определена: " + msg); return; }
+        logLine(C::GRN, "Своя сеть: " + msg);
+        auto ds = currentDs();
+        std::shared_ptr<const IpCache> cache;
+        { std::lock_guard<std::mutex> lk(g_mx); cache = g_ipCache; }
+        if (!ds || !cache) return;
+        selectLocal(*ds);   // после сравнения g_localIp мог остаться от другого набора
+        auto sum = std::make_shared<const DumpSummary>(
+            summarizeDump(ds->packets, ds->name, cache.get()));
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            if (g_ds == ds) { g_summary = sum; ++g_gen; }
+        }
+        logLine(C::GRY, "Обзор пересчитан. «VPN/прокси» и «Блокировки» запустите заново — "
+                        "прежние отчёты сделаны со старой своей сетью.");
+    });
+}
+
 // ------------------------------------------------------------------
 // Интерактивные инструменты — отдельный процесс «exe --tool N» в своей консоли
 // ------------------------------------------------------------------

@@ -8,6 +8,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#pragma comment(lib, "advapi32.lib")   // реестр: запомненная своя сеть
 typedef std::wstring NativePath;   // пути Windows — UTF-16
 #define NP(s) L##s
 #else
@@ -21,12 +22,19 @@ typedef std::string NativePath;    // macOS — UTF-8
 
 #include "config.h"
 
+#include <atomic>
 #include <cctype>
 #include <climits>
 #include <cstdlib>
+#include <cwchar>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <utility>
+#ifndef _WIN32
+#include <sys/stat.h>              // mkdir
+#endif
 
 namespace {
 
@@ -66,9 +74,8 @@ void setDefaults(AppConfig& c) {
         2408,3128,3389,3724,4244,4500,5060,5938,6379,8000,8080,8388,8443,8800,
         9000,10000,18080,19132,27015,27036,28015,30000,30120,36712,44405,
         500,1637,51820,51821,55555,1080,3306,5432,5900,8089};
-    // MARYNONET (AS39709) — сеть оператора
-    c.ownIspOrgKeywords = {"EXTREME LTD"};
-    c.ownIspAsns        = {"39709"};
+    // Своя сеть оператора не зашита: AS определяется кнопкой «Определить» в
+    // настройках и запоминается (ownIspDetect, network.cpp); own_isp_* в ini — вручную.
     // Белый список VPN. Облака (Google Cloud AS396982, Yandex Cloud AS200350,
     // VK Cloud) сюда намеренно не входят: там стоят обычные VPS, в том числе с VPN.
     c.vpnWhitelistDomains = {
@@ -239,6 +246,7 @@ void applyKey(AppConfig& c, const std::string& key, const std::string& val,
     else if (key == "own_isp_asn") {
         c.ownIspAsns.clear();
         for (const auto& s : splitList(val)) c.ownIspAsns.push_back(lower(s));
+        c.ownIspAsnFromIni = !c.ownIspAsns.empty();   // пустое значение — снова автоматически
     }
     // Белый список VPN: значение заменяет встроенный список; «+» в начале —
     // дополняет его («vpn_whitelist_domains = + example.ru, example.com»).
@@ -372,4 +380,132 @@ void loadConfig() {
     }
 
     store() = std::move(c);
+
+    // Запомненная своя сеть (кнопка «Определить» в настройках) — без сети.
+    OwnIspAuto s;
+    // strtoull: unsigned long на Windows 32-битный, переполнение там не отличить
+    const unsigned long long n = strtoull(rememberedGet("OwnIspAsn").c_str(), nullptr, 10);
+    if (n > 0 && n <= 0xFFFFFFFFull) {
+        s.asn = (unsigned)n;
+        s.name = rememberedGet("OwnIspName");
+        s.status = "запомнена";
+    }
+    ownIspAutoSet(s);
+}
+
+// ------------------------------------------------------------------
+// Запомненные значения между запусками
+// ------------------------------------------------------------------
+// Windows — строковые значения в том же ключе реестра, что и настройки GUI.
+// macOS — отдельный state.ini: gui.ini GUI переписывает целиком из памяти и
+// затёр бы чужие строки.
+namespace {
+std::mutex& rememberedMutex() { static std::mutex* m = new std::mutex; return *m; }   // см. ниже
+
+#ifdef _WIN32
+const wchar_t kStateRegKey[] = L"Software\\MARYNONET\\TrafficAnalyzer";
+
+std::wstring widen(const std::string& s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w(n > 0 ? n : 0, L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+#else
+std::string statePath() {
+    const char* home = getenv("HOME");
+    if (!home || !*home) return "";
+    return std::string(home) + "/Library/Application Support/TrafficAnalyzer/state.ini";
+}
+
+std::map<std::string, std::string> readState() {
+    std::map<std::string, std::string> m;
+    std::ifstream in(statePath());
+    std::string line;
+    while (std::getline(in, line)) {
+        const size_t eq = line.find('=');
+        if (eq != std::string::npos && eq > 0) m[line.substr(0, eq)] = line.substr(eq + 1);
+    }
+    return m;
+}
+#endif
+} // namespace
+
+std::string rememberedGet(const char* name) {
+    std::lock_guard<std::mutex> lk(rememberedMutex());
+#ifdef _WIN32
+    const std::wstring wn = widen(name);
+    DWORD sz = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kStateRegKey, wn.c_str(), RRF_RT_REG_SZ, nullptr, nullptr,
+                     &sz) != ERROR_SUCCESS || sz < sizeof(wchar_t) || sz > 64 * 1024)
+        return {};
+    std::wstring s(sz / sizeof(wchar_t), L'\0');
+    if (RegGetValueW(HKEY_CURRENT_USER, kStateRegKey, wn.c_str(), RRF_RT_REG_SZ, nullptr, &s[0],
+                     &sz) != ERROR_SUCCESS)
+        return {};
+    s.resize(wcsnlen(s.c_str(), s.size()));
+    return narrow(s);
+#else
+    const auto m = readState();
+    const auto it = m.find(name);
+    return it == m.end() ? std::string() : it->second;
+#endif
+}
+
+bool rememberedSet(const char* name, const std::string& v) {
+    std::lock_guard<std::mutex> lk(rememberedMutex());
+#ifdef _WIN32
+    HKEY k = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kStateRegKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k,
+                        nullptr) != ERROR_SUCCESS)
+        return false;
+    const std::wstring wn = widen(name), wv = widen(v);
+    LSTATUS rc;
+    if (wv.empty()) {
+        rc = RegDeleteValueW(k, wn.c_str());
+        if (rc == ERROR_FILE_NOT_FOUND) rc = ERROR_SUCCESS;   // и так нет
+    } else {
+        rc = RegSetValueExW(k, wn.c_str(), 0, REG_SZ, (const BYTE*)wv.c_str(),
+                            (DWORD)((wv.size() + 1) * sizeof(wchar_t)));
+    }
+    RegCloseKey(k);
+    return rc == ERROR_SUCCESS;
+#else
+    const std::string path = statePath();
+    if (path.empty()) return false;
+    auto m = readState();
+    std::string clean = v;                      // значение — одна строка
+    for (auto& ch : clean) if (ch == '\n' || ch == '\r') ch = ' ';
+    if (clean.empty()) m.erase(name); else m[name] = clean;
+    mkdir(path.substr(0, path.rfind('/')).c_str(), 0755);
+    std::ofstream out(path, std::ios::trunc);
+    for (const auto& kv : m) out << kv.first << '=' << kv.second << '\n';
+    out.close();
+    return !out.fail();
+#endif
+}
+
+// ------------------------------------------------------------------
+// Своя сеть, определённая автоматически
+// ------------------------------------------------------------------
+// Не разрушаются при выходе: фоновая задача «Определить» может
+// закончиться, когда программа уже закрывается.
+namespace {
+std::mutex& ownIspMutex() { static std::mutex* m = new std::mutex; return *m; }
+OwnIspAuto& ownIspState() { static OwnIspAuto* s = new OwnIspAuto; return *s; }
+std::atomic<unsigned> g_ownIspAsn{0};
+} // namespace
+
+OwnIspAuto ownIspAuto() {
+    std::lock_guard<std::mutex> lk(ownIspMutex());
+    return ownIspState();
+}
+
+unsigned ownIspAutoAsn() { return g_ownIspAsn.load(std::memory_order_relaxed); }
+
+void ownIspAutoSet(const OwnIspAuto& v) {
+    std::lock_guard<std::mutex> lk(ownIspMutex());
+    ownIspState() = v;
+    g_ownIspAsn.store(v.asn, std::memory_order_relaxed);
 }

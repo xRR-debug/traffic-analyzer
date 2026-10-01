@@ -1215,8 +1215,12 @@ void analyzeConnectivityFailure(const std::vector<Packet>& packets,
         if (p.srcPort == 123 || p.dstPort == 123) { ntpPkts++; continue; }
 
         // ==== остальной трафик — потенциальные полезные соединения ====
-        // Смотрим на peer со стороны абонента (наружу)
-        std::string peer = isLocal(p.srcIp) ? p.dstIp : p.srcIp;
+        // Смотрим на peer со стороны абонента (наружу). Ровно одна сторона
+        // должна быть своей: транзит и чужие хосты в записи иначе выглядели бы
+        // как «ответ абоненту» от их отправителя.
+        const bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
+        if (sLoc == dLoc) continue;
+        std::string peer = sLoc ? p.dstIp : p.srcIp;
         if (isPrivateIp(peer)) continue;
 
         if (p.proto == "TCP") {

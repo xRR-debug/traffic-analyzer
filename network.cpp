@@ -281,6 +281,20 @@ static CURL* curlNew(long idleSec = 8) {
     return c;
 }
 
+// Редиректы — как у WinHTTP по умолчанию: с https на http не переходим
+// (иначе подменённый ответ по открытому каналу выдал бы себя за ответ сервиса).
+static void curlRedirNoDowngrade(CURL* c, const std::string& url) {
+    std::string scheme = url.substr(0, 8);
+    for (auto& ch : scheme) ch = (char)tolower((unsigned char)ch);
+    const bool tls = scheme == "https://";
+#if LIBCURL_VERSION_NUM >= 0x075500   // 7.85: строковый вариант, битовая маска устарела
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, tls ? "https" : "http,https");
+#else
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS,
+                     tls ? (long)CURLPROTO_HTTPS : (long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
+}
+
 // headers — "Name: value", несколько через \r\n. body == nullptr — GET.
 static CurlResp curlDo(CURL* c, const std::string& url, const std::string* body,
                        const std::string& headers = std::string()) {
@@ -295,6 +309,7 @@ static CurlResp curlDo(CURL* c, const std::string& url, const std::string* body,
         p = e + 2;
     }
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    curlRedirNoDowngrade(c, url);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlWrite);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &r);
     curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, curlHeader);
@@ -650,6 +665,47 @@ static bool jsonTrue(const std::string& obj, const std::string& key) {
     size_t b = obj.find('}', p);
     size_t lim = std::min(c, b);
     return t != std::string::npos && t < lim;
+}
+
+// ------------------------------------------------------------------
+// Своя сеть: AS провайдера по собственному внешнему адресу
+// ------------------------------------------------------------------
+// Только по кнопке «Определить» в настройках — сама программа в сеть за этим
+// не ходит. Уходит лишь свой адрес (ip-api видит его и так), адреса из дампа — нет.
+bool ownIspDetect(std::string& msg) {
+    const std::string r = httpRequest(L"GET", L"ip-api.com",
+        L"/json/?fields=status,message,query,as,hosting,proxy", std::string());
+    if (r.empty()) { msg = "нет ответа ip-api.com (нет интернета?)"; return false; }
+    if (jsonStr(r, "status") != "success") {
+        msg = "ip-api.com: " + jsonText(r, "message");
+        return false;
+    }
+    const std::string as = jsonText(r, "as");          // «AS39709 Extreme Ltd»
+    // strtoull: unsigned long на Windows 32-битный, переполнение там не отличить
+    unsigned long long n = 0;
+    if (as.size() > 2 && (as[0] == 'A' || as[0] == 'a') && (as[1] == 'S' || as[1] == 's'))
+        n = strtoull(as.c_str() + 2, nullptr, 10);
+    if (n == 0 || n > 0xFFFFFFFFull) { msg = "ip-api.com не назвал AS"; return false; }
+    const std::string ip = jsonStr(r, "query");
+
+    OwnIspAuto s;
+    s.asn = (unsigned)n;
+    s.name = as;
+    const bool saved = rememberedSet("OwnIspAsn", std::to_string(n)) &&
+                       rememberedSet("OwnIspName", as);
+    s.status = "определена по адресу " + ip +
+               (saved ? " и запомнена"
+                      : ", но не сохранилась (нет записи в реестр / файл настроек) — "
+                        "после перезапуска её придётся определить снова");
+    // Кнопку нажали сами — запоминаем и хостинг: у оператора бывают сети,
+    // которые geo-API считают датацентром. Но через VPN «своей» станет сеть
+    // VPN-сервиса, и её адреса в дампах перестанут считаться хостингом.
+    if (jsonTrue(r, "hosting") || jsonTrue(r, "proxy"))
+        s.status += ". Внимание: ip-api считает эту сеть хостингом/VPN — если программа "
+                    "сейчас выходит в интернет через VPN, отключите его и определите заново";
+    ownIspAutoSet(s);
+    msg = as + " — " + s.status;
+    return true;
 }
 
 // резолвим набор публичных IP батчами по 100 (лимит ip-api batch)
@@ -2534,14 +2590,6 @@ void runUdpProbeMode() {
 // Общие мелочи для режимов 11/12
 // ==================================================================
 
-// Дополняет UTF-8 строку пробелами до w символов (printf %-Ns считает байты,
-// и кириллица «съезжает»).
-static std::string padU8(const std::string& s, size_t w) {
-    size_t cp = 0;
-    for (unsigned char c : s) if ((c & 0xC0) != 0x80) cp++;
-    return cp >= w ? s : s + std::string(w - cp, ' ');
-}
-
 static std::vector<std::string> splitInput(const std::string& s) {
     std::vector<std::string> out;
     std::string cur;
@@ -3039,7 +3087,7 @@ void runDnsHonestyMode() {
                d.control ? "[контрольный]" : "");
         std::string refTxt = !d.refOk ? "DoH недоступен — эталона нет"
                            : d.refNx ? "NXDOMAIN" : joinIps(d.ref);
-        printf("    %s: %s%s%s\n", padU8("эталон DoH", 22).c_str(), C::CYN, refTxt.c_str(), C::RST);
+        printf("    %s: %s%s%s\n", u8pad("эталон DoH", 22).c_str(), C::CYN, refTxt.c_str(), C::RST);
         for (auto& r : d.rs) {
             std::string val;
             if (r.viaUdp) {
@@ -3057,7 +3105,7 @@ void runDnsHonestyMode() {
                 std::string o = ownerOf(r.ips[0]);
                 if (!o.empty()) owner = " [" + o + "]";
             }
-            printf("    %s: %s  %s%s%s%s\n", padU8(r.label, 22).c_str(), val.c_str(),
+            printf("    %s: %s  %s%s%s%s\n", u8pad(r.label, 22).c_str(), val.c_str(),
                    vc, r.verdict.c_str(), owner.c_str(), C::RST);
         }
         printf("\n");
@@ -3090,7 +3138,7 @@ void runDnsHonestyMode() {
             }
         }
         std::string ownTxt = own.empty() ? "" : "  [" + own + "]";
-        printf("  %s -> %s%s  %s%s%s\n", padU8(e.label, 26).c_str(),
+        printf("  %s -> %s%s  %s%s%s\n", u8pad(e.label, 26).c_str(),
                e.ip.empty() ? "—" : e.ip.c_str(), ownTxt.c_str(),
                col, verdict.c_str(), C::RST);
     }
@@ -3217,6 +3265,7 @@ static T16Result fetch16(const std::string& url) {
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, hl);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5L);
+    curlRedirNoDowngrade(c, url);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
     // замороженный поток не шлёт ничего — через 6 с считаем, что встал
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1L);
@@ -3383,8 +3432,8 @@ void runTcp16Mode() {
     }
 
     int frozen = 0, okHost = 0, ctlOk = 0, ctlBad = 0, testedHost = 0;
-    printf("  %s %s %s %s  %s\n", padU8("Сервер", 24).c_str(), padU8("IP", 16).c_str(),
-           padU8("Получено", 10).c_str(), padU8("Время", 8).c_str(), "Итог");
+    printf("  %s %s %s %s  %s\n", u8pad("Сервер", 24).c_str(), u8pad("IP", 16).c_str(),
+           u8pad("Получено", 10).c_str(), u8pad("Время", 8).c_str(), "Итог");
     for (size_t i = 0; i < tg.size(); i++) {
         const T16Result& r = res[i];
         std::string text;
@@ -3401,9 +3450,9 @@ void runTcp16Mode() {
         int shownMs = (!r.completed && r.lastDataMs >= 0) ? r.lastDataMs : r.totalMs;
         snprintf(tm, sizeof(tm), "%.1f с", shownMs / 1000.0);
         printf("  %s %s %s %s  %s%s%s\n",
-               padU8(std::string(tg[i].control ? "[к] " : "") + tg[i].name, 24).c_str(),
-               padU8(r.ip.empty() ? "—" : r.ip, 16).c_str(),
-               padU8(got, 10).c_str(), padU8(tm, 8).c_str(),
+               u8pad(std::string(tg[i].control ? "[к] " : "") + tg[i].name, 24).c_str(),
+               u8pad(r.ip.empty() ? "—" : r.ip, 16).c_str(),
+               u8pad(got, 10).c_str(), u8pad(tm, 8).c_str(),
                col, text.c_str(), C::RST);
     }
     printf("  %s[к] — контрольный российский сервер; «Время» у зависших — момент последних данных.%s\n",
@@ -3784,6 +3833,7 @@ void runIpOwnerFor(const std::string& input) {
         std::vector<std::wstring> paths;
         for (auto& r : res) paths.push_back(L"/" + std::wstring(r.ip.begin(), r.ip.end()) + L"?lang=ru");
         std::vector<std::string> answers = httpsGetMany(L"ipwho.is", paths, 4);
+        std::vector<size_t> needPtr;               // PTR ipwho.is не отдаёт — спросим сами
         for (size_t i = 0; i < res.size(); i++) {
             OwnerRes& r = res[i];
             const std::string& a = answers[i];
@@ -3800,9 +3850,17 @@ void runIpOwnerFor(const std::string& input) {
             r.isp = jsonText(sb, "isp");
             r.org = jsonText(sb, "org");
             if (!asn.empty()) r.as = "AS" + asn;
-            // PTR ipwho.is не отдаёт — спрашиваем сами (только IPv4)
-            if (isValidIpv4Str(r.ip)) r.ptr = reverseDns(r.ip);
+            if (isValidIpv4Str(r.ip)) needPtr.push_back(i);   // только IPv4
         }
+        // до kMaxIps запросов по нескольку секунд каждый — не по очереди
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> th;
+        for (size_t w = 0; w < std::min<size_t>(8, needPtr.size()); w++)
+            th.emplace_back([&]() {
+                for (size_t k; (k = next.fetch_add(1)) < needPtr.size(); )
+                    res[needPtr[k]].ptr = reverseDns(res[needPtr[k]].ip);
+            });
+        for (auto& t : th) t.join();
     }
     rdapTh.join();
 
@@ -3861,8 +3919,8 @@ void runIpOwnerFor(const std::string& input) {
         for (auto& ip : ref) { std::string n = asnOfRes(ip); if (!n.empty()) refAsn.insert(n); }
 
         printf("\n============ %s: ЧТО ОТВЕЧАЮТ РЕЗОЛВЕРЫ ============\n", d.name.c_str());
-        printf("  %s %s %s %s\n", padU8("Резолвер", 30).c_str(), padU8("Время", 7).c_str(),
-               padU8("Адреса (A)", 34).c_str(), "Итог");
+        printf("  %s %s %s %s\n", u8pad("Резолвер", 30).c_str(), u8pad("Время", 7).c_str(),
+               u8pad("Адреса (A)", 34).c_str(), "Итог");
         for (auto& a : d.rs) {
             std::string verdict;
             const char* col = "";
@@ -3907,8 +3965,8 @@ void runIpOwnerFor(const std::string& input) {
             }
             std::string tm = (a.ok && a.ms >= 0) ? std::to_string(a.ms) + " мс" : "—";
             std::string ips = a.ips.empty() ? "—" : joinIps(a.ips, 2);
-            printf("  %s %s %s %s%s%s\n", padU8(a.label, 30).c_str(), padU8(tm, 7).c_str(),
-                   padU8(ips, 34).c_str(), col, verdict.c_str(), *col ? C::RST : "");
+            printf("  %s %s %s %s%s%s\n", u8pad(a.label, 30).c_str(), u8pad(tm, 7).c_str(),
+                   u8pad(ips, 34).c_str(), col, verdict.c_str(), *col ? C::RST : "");
         }
     }
     if (!domains.empty()) {
@@ -3923,7 +3981,7 @@ void runIpOwnerFor(const std::string& input) {
 
     // --- вывод: владельцы адресов ---
     auto row = [](const char* label, const std::string& val, const char* color = "") {
-        printf("  %s: %s%s%s\n", padU8(label, 12).c_str(), color,
+        printf("  %s: %s%s%s\n", u8pad(label, 12).c_str(), color,
                val.empty() ? "—" : val.c_str(), *color ? C::RST : "");
     };
     bool anyCdn = false;

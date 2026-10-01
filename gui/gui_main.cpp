@@ -424,7 +424,7 @@ int RunGuiMain(const std::vector<std::string>& files) {
     std::streambuf* oldOut = std::cout.rdbuf(&coutBuf);
     std::streambuf* oldErr = std::cerr.rdbuf(&coutBuf);
 
-    logLine(C::BCYN, "TrafficAnalyzer — анализ дампов трафика абонента (MARYNONET, AS39709)");
+    logLine(C::BCYN, "TrafficAnalyzer — анализ дампов трафика абонента (MARYNONET)");
     logLine(C::GRY, "Откройте дамп (Ctrl+O) или перетащите .pcap/.pcapng/.txt на окно. "
                     "Два файла «..._in» и «..._out» загружаются как один набор.");
     if (!cfg().warnings.empty()) {

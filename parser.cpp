@@ -25,14 +25,23 @@ static void splitIpPort(const std::string& token, std::string& ip, int& port) {
 }
 
 // извлечь "ключ: число" после метки (ack/win/length)
+// Ключ ищется как отдельное слово: раньше "ack" находился внутри "sackOK",
+// а "win" — внутри "wscale"/"win10"-подобных токенов, и число бралось не то.
 static long long grabNum(const std::string& s, const std::string& key) {
-    size_t p = s.find(key);
-    if (p == std::string::npos) return -1;
-    p += key.size();
-    while (p < s.size() && (s[p] == ' ' || s[p] == ':')) p++;
-    long long v = 0; bool any = false;
-    while (p < s.size() && isdigit((unsigned char)s[p])) { v = v * 10 + (s[p] - '0'); p++; any = true; }
-    return any ? v : -1;
+    auto wordCh = [](char c) {
+        return isalnum((unsigned char)c) || c == '_' || c == '.' || c == '-';
+    };
+    for (size_t k = s.find(key); k != std::string::npos; k = s.find(key, k + 1)) {
+        if (k > 0 && wordCh(s[k - 1])) continue;
+        size_t p = k + key.size();
+        // за ключом без пробела в конце должен идти разделитель, а не продолжение слова
+        if (key.back() != ' ' && (p >= s.size() || (s[p] != ' ' && s[p] != ':'))) continue;
+        while (p < s.size() && (s[p] == ' ' || s[p] == ':')) p++;
+        long long v = 0; bool any = false;
+        while (p < s.size() && isdigit((unsigned char)s[p])) { v = v * 10 + (s[p] - '0'); p++; any = true; }
+        if (any) return v;
+    }
+    return -1;
 }
 
 // seq бывает "A:B" (диапазон) или "A"; возвращаем конец диапазона (B или A)

@@ -1027,11 +1027,8 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             // («Autonomous Nonprofit Organisation») ломают выравнивание REGION/APP.
             // Ширина — в символах: printf «%-Ns» считает байты, и кириллица
             // (2 байта на букву) сдвигала бы колонки.
-            auto padU8 = [](std::string s, size_t w) {
-                if (u8len(s) > w) s = u8prefix(s, w - 1) + "~";
-                size_t n = u8len(s);
-                if (n < w) s.append(w - n, ' ');
-                return s;
+            auto padU8 = [](const std::string& s, size_t w) {
+                return u8len(s) > w ? u8prefix(s, w - 1) + "~" : u8pad(s, w);
             };
             std::string orgCol = padU8(asnStr, 32);
             regionStr = padU8(regionStr, 14);
@@ -1831,12 +1828,6 @@ DumpSummary summarizeDump(const std::vector<Packet>& packets, const std::string&
 
 void printDumpCompare(const DumpSummary& a, const DumpSummary& b,
                       const std::unordered_map<std::string, IpInfo>& ipCache) {
-    // видимая ширина UTF-8 (printf «%-Ns» считает байты, кириллица поехала бы)
-    auto padTo = [](const std::string& s, int w) {
-        int vis = 0;
-        for (unsigned char ch : s) if ((ch & 0xC0) != 0x80) vis++;
-        return vis >= w ? s : s + std::string(w - vis, ' ');
-    };
     auto pct = [](long long x, long long n) { return n > 0 ? 100.0 * x / n : 0.0; };
     auto median = [](std::vector<long long> v) -> long long {
         if (v.empty()) return -1;
@@ -1864,8 +1855,8 @@ void printDumpCompare(const DumpSummary& a, const DumpSummary& b,
             col = bad ? C::RED : C::GRN;
             mark = (nb > na) ? " ▲" : " ▼";     // стрелка — направление, цвет — хорошо/плохо
         }
-        printf("  %s%s  %s%s%s%s\n", padTo(what, 34).c_str(), padTo(va, 16).c_str(),
-               col, padTo(vb, 16).c_str(), mark, C::RST);
+        printf("  %s%s  %s%s%s%s\n", u8pad(what, 34).c_str(), u8pad(va, 16).c_str(),
+               col, u8pad(vb, 16).c_str(), mark, C::RST);
     };
     auto num = [](long long v) { return std::to_string(v); };
     auto pstr = [](double v) { char t[32]; snprintf(t, sizeof(t), "%.1f%%", v); return std::string(t); };
@@ -1878,8 +1869,8 @@ void printDumpCompare(const DumpSummary& a, const DumpSummary& b,
     if (!a.localIp.empty() && !b.localIp.empty() && a.localIp != b.localIp)
         printf("  %s[i] MainIP в дампах разные — это нормально при смене роутера/сети,\n"
                "      но убедитесь, что дампы сняты у одного и того же абонента.%s\n", C::GRY, C::RST);
-    printf("\n  %s%s  %s  %s%s\n", C::GRY, padTo("показатель", 34).c_str(),
-           padTo("A", 16).c_str(), padTo("B", 16).c_str(), C::RST);
+    printf("\n  %s%s  %s  %s%s\n", C::GRY, u8pad("показатель", 34).c_str(),
+           u8pad("A", 16).c_str(), u8pad("B", 16).c_str(), C::RST);
 
     char t[64];
     snprintf(t, sizeof(t), "%.0f с", a.durSec); std::string da = t;
@@ -1970,7 +1961,7 @@ void printDumpCompare(const DumpSummary& a, const DumpSummary& b,
         std::sort(v.rbegin(), v.rend());
         printf("\n  %s%s:%s\n", C::BWHT, title, C::RST);
         for (size_t i = 0; i < v.size() && i < 10; i++)
-            printf("    %s %s\n", padTo(fmtBytes(v[i].first), 10).c_str(), who(v[i].second).c_str());
+            printf("    %s %s\n", u8pad(fmtBytes(v[i].first), 10).c_str(), who(v[i].second).c_str());
         if (v.size() > 10) printf("    ... и ещё %zu\n", v.size() - 10);
     };
     bigNew("Крупные адреса только в B (≥100 КБ)", a, b);

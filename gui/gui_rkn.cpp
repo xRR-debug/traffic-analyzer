@@ -411,6 +411,12 @@ int httpsGetStream(const std::string& path, const char* accept, int idleMs,
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 180L);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5L);
+    // редирект только на https — как WinHTTP, который не уходит с https на http
+#if LIBCURL_VERSION_NUM >= 0x075500
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+#else
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS, (long)CURLPROTO_HTTPS);
+#endif
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, hl);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlSink);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &ctx);
@@ -599,6 +605,10 @@ void worker(std::shared_ptr<RknState> st) {
 
     // 2. сканеры: поток событий SSE, блоки разделены пустой строкой
     std::string buf, head, perr;
+    // buf[bufPos..] — ещё не разобранное; "\n\n" ищем с scanFrom, а не с начала,
+    // и сдвигаем буфер, только когда разобранное заняло больше половины, —
+    // иначе длинное событие по кускам разбиралось бы за квадратичное время
+    size_t bufPos = 0, scanFrom = 0;
     bool done = false;
     auto handle = [&](const std::string& block) -> bool {      // false — пришёл итог
         std::string name, data;
@@ -640,14 +650,21 @@ void worker(std::shared_ptr<RknState> st) {
         st->abort, [&](const char* d, size_t n) {
             if (head.size() < 400) head.append(d, std::min(n, 400 - head.size()));
             for (size_t i = 0; i < n; i++) if (d[i] != '\r') buf += d[i];
-            for (size_t e; (e = buf.find("\n\n")) != std::string::npos; ) {
-                const std::string block = buf.substr(0, e);
-                buf.erase(0, e + 2);
+            for (size_t e; (e = buf.find("\n\n", scanFrom)) != std::string::npos; ) {
+                const std::string block = buf.substr(bufPos, e - bufPos);
+                bufPos = scanFrom = e + 2;
                 if (!handle(block)) { done = true; return false; }
             }
-            return buf.size() < kMaxBody;
+            // "\n\n" может разрезаться между кусками — последний '\n' смотрим ещё раз
+            scanFrom = std::max(bufPos, buf.empty() ? size_t(0) : buf.size() - 1);
+            if (bufPos > 0 && bufPos * 2 >= buf.size()) {
+                buf.erase(0, bufPos);
+                scanFrom -= bufPos;
+                bufPos = 0;
+            }
+            return buf.size() - bufPos < kMaxBody;
         }, perr);
-    if (!done && !buf.empty() && !st->abort) done = !handle(buf);   // хвост без пустой строки
+    if (!done && bufPos < buf.size() && !st->abort) done = !handle(buf.substr(bufPos));   // хвост без пустой строки
 
     std::lock_guard<std::mutex> lk(st->mx);
     st->probeStatus = pcode;
