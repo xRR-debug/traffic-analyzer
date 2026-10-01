@@ -49,8 +49,11 @@ struct AppConfig {
     std::vector<int> scanTopPorts, scanServicePorts, scanVpnPorts;   // наборы режима 7
 
     // --- своя сеть оператора: не помечать «хостингом» ---
+    // По умолчанию списки пусты: AS своей сети определяется кнопкой
+    // «Определить» в настройках и запоминается. own_isp_asn в ini важнее.
     std::vector<std::string> ownIspOrgKeywords;   // подстроки названия организации (нижний регистр)
     std::vector<std::string> ownIspAsns;          // номера AS (подстрока поля asn)
+    bool ownIspAsnFromIni = false;                // own_isp_asn задан в ini — запомненный AS не нужен
 
     // --- белый список VPN: крупные сервисы, баллов VPN не дают ---
     // Адрес в списке, если его AS есть в vpnWhitelistAsns или DNS в этом же
@@ -67,9 +70,29 @@ struct AppConfig {
 // Текущие настройки (после loadConfig — с учётом ini).
 const AppConfig& cfg();
 
-// Читает analyzer.ini. Вызывать один раз при старте,
-// до любого анализа: cfg() отдаёт ссылки на строки, которые потом не меняются.
+// Читает analyzer.ini и запомненную свою сеть. Вызывается при старте и по
+// кнопке «Перечитать analyzer.ini» (startReloadConfig). Повторный вызов
+// заменяет весь AppConfig: ссылки из cfg() становятся недействительными,
+// поэтому звать только когда анализ не идёт (в GUI — без фоновой задачи).
 void loadConfig();
 
 // Каталог исполняемого файла в UTF-8, с разделителем на конце ("" — не удалось).
 std::string exeDirUtf8();
+
+// --- своя сеть, определённая по кнопке ---
+// AS провайдера, через которого программа выходит в интернет: кнопка
+// «Определить» в настройках (ownIspDetect, network.cpp) спрашивает ip-api.com
+// и запоминает ответ — Windows: реестр HKCU\Software\MARYNONET\TrafficAnalyzer,
+// macOS: ~/Library/Application Support/TrafficAnalyzer/state.ini.
+// loadConfig читает запомненное, в сеть не ходит.
+struct OwnIspAuto {
+    unsigned    asn = 0;      // номер AS; 0 — не определён
+    std::string name;         // «AS39709 Extreme Ltd» — для показа
+    std::string status;       // откуда взят номер
+};
+OwnIspAuto ownIspAuto();                  // снимок (потокобезопасно)
+unsigned   ownIspAutoAsn();               // только номер, без блокировки (для анализа)
+void       ownIspAutoSet(const OwnIspAuto& v);
+// Запомненное значение между запусками ("" — нет).
+std::string rememberedGet(const char* name);
+bool        rememberedSet(const char* name, const std::string& v);   // "" — удалить; false — не записалось

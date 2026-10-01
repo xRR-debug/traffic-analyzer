@@ -833,18 +833,19 @@ static int consoleMain(std::vector<std::string> files, int tool) {
     }
     addSiblingDump(paths);
 
-    // --- файл-отчёт рядом с дампом (если запись лога включена) ---
-    if (g_logEnabled) openReport(paths[0], "report");
-    else std::cout << "(запись отчёта выключена — Delete в меню включает)\n";
-
     // --- загрузка, слияние половин, определение локального адреса ---
     std::vector<Packet> packets;
     std::vector<int> origin;          // из какого файла пришёл каждый пакет
     if (!loadDumpSet(paths, packets, origin)) {
-        closeReport();
         waitEnter("Нажмите Enter для возврата в меню...");
         continue;
     }
+
+    // --- файл-отчёт рядом с дампом (если запись лога включена) ---
+    // Открываем после загрузки: иначе при нечитаемом дампе рядом оставался
+    // пустой отчёт (loadDumpSet пишет только в консоль, в отчёт ничего не теряется).
+    if (g_logEnabled) openReport(paths[0], "report");
+    else std::cout << "(запись отчёта выключена — Delete в меню включает)\n";
 
     if (mode == 2) runConnAnalysis(packets, paths);   // блокировки / проблемы соединения
     else           runVpnAnalysis(packets, paths);    // VPN / прокси
@@ -940,7 +941,10 @@ int main(int argc, char** argv) {
         else if (a == "--log") g_logEnabled = true;
         else if (a.rfind("-psn_", 0) == 0) {}            // macOS Finder: номер процесса
         else if (a == "--tool" && i + 1 < args.size()) {
-            tool = atoi(args[++i].c_str());
+            const std::string& t = args[++i];
+            const bool digits = !t.empty() && t.size() <= 2 &&
+                                t.find_first_not_of("0123456789") == std::string::npos;
+            tool = digits ? atoi(t.c_str()) : -1;        // не число — в меню
             if (tool == 0) tool = 10;                    // «0» — сравнение, как в меню
             if (tool < 3 || tool > 13) tool = 0;
             consoleMode = true;

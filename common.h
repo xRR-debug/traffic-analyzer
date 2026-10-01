@@ -168,6 +168,12 @@ inline std::string u8prefix(const std::string& s, size_t maxChars) {
         if (((unsigned char)s[i] & 0xC0) != 0x80 && n++ == maxChars) break;
     return s.substr(0, i);
 }
+// Дополняет UTF-8 строку пробелами до w символов (printf «%-Ns» считает байты,
+// и кириллица сдвигала бы колонки). Длиннее w — не режет.
+inline std::string u8pad(const std::string& s, size_t w) {
+    const size_t n = u8len(s);
+    return n >= w ? s : s + std::string(w - n, ' ');
+}
 
 // GUI-режим: весь вывод rprintf (и std::cout — через перехват потока в gui)
 // дополнительно отдаётся в этот приёмник (журнал в окне). Вызывается под
@@ -420,6 +426,10 @@ const char* blockReasonTitle(const std::string& code);   // «Молчаливы
 const char* blockReasonAdvice(const std::string& code);  // подсказка для техподдержки
 
 // ---- network.cpp ----
+// AS своей сети по своему внешнему адресу (ip-api.com): запоминает его
+// (config.h, OwnIspAuto). Кнопка «Определить» в настройках GUI; блокирует
+// до ответа. msg — что определено или почему не вышло.
+bool ownIspDetect(std::string& msg);
 void resolveIps(const std::vector<std::string>& ips,
                 std::unordered_map<std::string, IpInfo>& cache);
 void resolveHostingSecondary(std::unordered_map<std::string, IpInfo>& cache,

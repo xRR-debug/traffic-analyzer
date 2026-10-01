@@ -79,6 +79,13 @@
 [isp]
 # Своя сеть оператора — не помечается «хостингом», даже если geo-API так
 # считает. Подстроки названия организации и номера AS, через запятую.
+# Без own_isp_asn AS своей сети задаётся кнопкой «Определить» во вкладке
+# «Настройки»: программа спрашивает ip-api.com, чья сеть у её собственного
+# адреса, и запоминает ответ (Windows — реестр
+# HKCU\Software\MARYNONET\TrafficAnalyzer, macOS —
+# ~/Library/Application Support/TrafficAnalyzer/state.ini). Нажимать из сети
+# оператора без VPN. Консоль и --batch берут запомненное значение.
+# own_isp_asn важнее запомненного; own_isp_org дополняет его.
 # own_isp_org = maryno
 # own_isp_asn = 39709
 

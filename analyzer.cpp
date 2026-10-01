@@ -220,26 +220,42 @@ const char* proxyPortName(int port) {
 // услуги, но для диагностики абонентского трафика это его собственная сеть).
 // Номер AS из списка (с «as» или без) в поле asn — целым числом: подстрокой
 // «39709» совпадал и с AS397091. Возвращает номер без «as» или "" — не найден.
+// Номер n (цифры, len байт) есть в asn целым числом. Без копий строк —
+// isOwnIspOrg зовётся на каждый пакет.
+static bool asnHasNumber(const std::string& asn, const char* n, size_t len) {
+    if (len == 0) return false;
+    for (size_t pos = asn.find(n, 0, len); pos != std::string::npos; pos = asn.find(n, pos + 1, len)) {
+        const bool l = pos == 0 || !::isdigit((unsigned char)asn[pos - 1]);
+        const bool r = pos + len >= asn.size() || !::isdigit((unsigned char)asn[pos + len]);
+        if (l && r) return true;
+    }
+    return false;
+}
+
 static std::string asnInList(const std::string& asn, const std::vector<std::string>& list) {
-    std::string a = asn; for (auto& c : a) c = (char)::tolower((unsigned char)c);
-    for (const auto& n0 : list) {
-        const std::string n = n0.compare(0, 2, "as") == 0 ? n0.substr(2) : n0;
-        if (n.empty()) continue;
-        for (size_t pos = a.find(n); pos != std::string::npos; pos = a.find(n, pos + 1)) {
-            const bool l = pos == 0 || !::isdigit((unsigned char)a[pos - 1]);
-            const bool r = pos + n.size() >= a.size() || !::isdigit((unsigned char)a[pos + n.size()]);
-            if (l && r) return n;
-        }
+    for (const auto& n : list) {
+        const size_t skip = n.compare(0, 2, "as") == 0 ? 2 : 0;
+        if (asnHasNumber(asn, n.c_str() + skip, n.size() - skip)) return n.substr(skip);
     }
     return {};
 }
 
 bool isOwnIspOrg(const std::string& org, const std::string& asn) {
-    std::string o = org; for (auto& c : o) c = (char)::tolower((unsigned char)c);
-    // по умолчанию MARYNONET (AS39709); список — own_isp_org / own_isp_asn в конфиге
-    for (const auto& kw : cfg().ownIspOrgKeywords)
-        if (!kw.empty() && o.find(kw) != std::string::npos) return true;
-    return !asnInList(asn, cfg().ownIspAsns).empty();
+    // own_isp_org / own_isp_asn из конфига; без own_isp_asn — AS, запомненный
+    // кнопкой «Определить» в настройках (ownIspDetect)
+    const auto& kws = cfg().ownIspOrgKeywords;
+    if (!kws.empty()) {
+        std::string o = org; for (auto& c : o) c = (char)::tolower((unsigned char)c);
+        for (const auto& kw : kws)
+            if (!kw.empty() && o.find(kw) != std::string::npos) return true;
+    }
+    if (!asnInList(asn, cfg().ownIspAsns).empty()) return true;
+    if (cfg().ownIspAsnFromIni) return false;
+    const unsigned autoAsn = ownIspAutoAsn();
+    if (!autoAsn) return false;
+    char buf[16];
+    const int len = snprintf(buf, sizeof buf, "%u", autoAsn);
+    return len > 0 && asnHasNumber(asn, buf, (size_t)len);
 }
 
 bool looksHostingOrg(const std::string& org, const std::string& /*asn*/) {

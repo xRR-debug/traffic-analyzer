@@ -178,6 +178,9 @@ bool wallpaperLoad(const std::wstring& path, std::string& err) {
         err = "видеокарта не приняла текстуру " + std::to_string(w) + "×" + std::to_string(h);
         return false;
     }
+    // сбросить ошибки, оставшиеся от прошлых вызовов (ImGui, кадр): иначе
+    // проверка ниже примет чужую ошибку за отказ в текстуре
+    for (int n = 0; n < 16 && glGetError() != GL_NO_ERROR; n++) {}
     GLuint tex = 0;
     glGenTextures(1, &tex);
     if (!tex) { err = "не удалось создать текстуру"; return false; }
@@ -266,7 +269,7 @@ int RunGuiMain(const std::vector<std::string>& files) {
     std::streambuf* oldOut = std::cout.rdbuf(&coutBuf);
     std::streambuf* oldErr = std::cerr.rdbuf(&coutBuf);
 
-    logLine(C::BCYN, "TrafficAnalyzer — анализ дампов трафика абонента (MARYNONET, AS39709)");
+    logLine(C::BCYN, "TrafficAnalyzer — анализ дампов трафика абонента (MARYNONET)");
     logLine(C::GRY, "Откройте дамп (Cmd+O) или перетащите .pcap/.pcapng/.txt на окно. "
                     "Два файла «..._in» и «..._out» загружаются как один набор.");
     if (!cfg().warnings.empty()) {

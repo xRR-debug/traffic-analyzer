@@ -7,7 +7,9 @@
 адреса.
 
 Изначально сделан для helpdesk провайдера MARYNONET (AS39709), но собственная
-сеть задаётся в настройках — подходит любому провайдеру.
+сеть не зашита: её AS определяется кнопкой «Определить» в настройках (по своему
+внешнему адресу) и запоминается, либо задаётся в `analyzer.ini` — подходит
+любому провайдеру.
 
 - **Windows** — окно (Dear ImGui + DirectX 11) и консольное меню, один `.exe`.
 - **macOS** (Apple Silicon и Intel) — окно (GLFW + OpenGL 3) и консоль, сборка через CMake.
@@ -165,7 +167,7 @@ API cheburcheck.ru не документирован официально и м�
 | `[general]` | `auto_resolve` — автоматический резолв гео/ASN; `ip2proxy_db` — путь к `.BIN` базе IP2Proxy LITE |
 | `[thresholds]` | `tail_ms`, `freeze_min_kb`, `freeze_max_kb`, `freeze_silence_ms`, `freeze_later_pkts`, `tspu_min_syn`, `split_min_conns`, `shape_cap`, `flow_score_cap`, `long_flow_*` |
 | `[ports]` | `vpn_udp_ports`, `vpn_tcp_ports`, `proxy_ports`, `scan_*_ports` |
-| `[isp]` | `own_isp_org`, `own_isp_asn` — своя сеть: её адреса не считаются подозрительными |
+| `[isp]` | `own_isp_org`, `own_isp_asn` — своя сеть: её адреса не считаются подозрительными. Без `own_isp_asn` берётся AS, запомненный кнопкой «Определить» во вкладке «Настройки» (ip-api.com по своему адресу; нажимать из сети оператора без VPN — на хостинг/VPN будет предупреждение). Консоль и `--batch` используют запомненное значение |
 | `[vpn_whitelist]` | `vpn_whitelist_domains`, `vpn_whitelist_asn` — белый список VPN (Google/YouTube, Википедия, VK/MAX, Госуслуги, Яндекс, банки…): адрес в списке по AS или по DNS из дампа (одного SNI мало) не даёт баллов VPN, проблемы соединения по нему проверяются; сигнатуры WireGuard/OpenVPN срабатывают. `+` в начале значения — дописать к стандартному списку |
 
 Каждый ключ описан в комментариях `analyzer.ini.example`.
