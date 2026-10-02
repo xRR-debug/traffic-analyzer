@@ -94,6 +94,13 @@ struct WfBuild {
     // эталон TTL сервера — как в buildTcpConnTable / connTtlInjection
     int synAckTtl = -1, dataTtl = -1;
     long long serverBytes = 0;
+    int lastInId = -1, lastInTtl = -1;   // IP ID и TTL последнего входящего не-RST до первого RST
+    int rstEv = -1;                      // событие последнего входящего RST
+    long long rstUs = -1;
+    int rstId = -1;
+    long long rstLastUs = -1;            // последний входящий RST (любой): время и IP ID
+    int rstLastId = -1;
+    bool inRst = false;                  // входящий RST уже был
 };
 
 // a не дальше b по seq (с переполнением 32 бит)
@@ -138,6 +145,12 @@ void wfAdd(FlowRow& r, WfBuild& b, const Packet& p, bool out, long long rel) {
                wfExtend(r, b.lastPoint, rel, p.length, gap);
     };
 
+    // как в buildTcpConnTable: эталон счётчика — пакеты сервера ДО первого RST
+    if (!out && !R && !b.inRst) { b.lastInId = p.ipId; b.lastInTtl = p.ttl; }
+    // ответ сервера после RST (не SYN, не пакет, отправленный раньше RST)
+    if (!out && !R && !S && b.rstEv >= 0 && rel - b.rstUs <= 2000000 &&
+        !ipIdBefore(p.ipId, b.rstId))
+        r.wf[(size_t)b.rstEv].afterRst++;
     if (S) {
         const uint8_t k = A ? FE_SYNACK : FE_SYN;
         if (!out && A && p.ttl >= 0 && b.synAckTtl < 0) b.synAckTtl = p.ttl;
@@ -145,7 +158,24 @@ void wfAdd(FlowRow& r, WfBuild& b, const Packet& p, bool out, long long rel) {
         return;
     }
     if (R) {
-        if (!repeatOfLast(FE_RST, kWfRstBurstUs)) point(FE_RST);
+        if (out) {
+            if (!repeatOfLast(FE_RST, kWfRstBurstUs)) point(FE_RST);
+            return;
+        }
+        b.inRst = true;
+        // одинаковые RST от инжектора — пачка; копия захвата — нет
+        const bool copy = ipIdCaptureCopy(p.ipId, b.rstLastId, rel - b.rstLastUs);
+        b.rstLastUs = rel; b.rstLastId = p.ipId;
+        if (repeatOfLast(FE_RST, kWfRstBurstUs)) {
+            if (b.rstEv == b.lastPoint && !copy) r.wf[(size_t)b.rstEv].burst++;
+            return;
+        }
+        // как rstServerId в buildTcpConnTable
+        e.serverId = ipIdNext(b.lastInId, p.ipId) && p.ttl == b.lastInTtl;
+        e.burst = 1;
+        const size_t n0 = r.wf.size();
+        point(FE_RST);
+        if (r.wf.size() > n0) { b.rstEv = (int)n0; b.rstUs = rel; b.rstId = p.ipId; }
         return;
     }
     if (p.length > 0) {
@@ -205,6 +235,8 @@ void buildFlows(Dataset& ds) {
     rows.clear();
     ds.totalBytes = 0;
     std::vector<WfBuild> wb;                    // параллельно rows (до сортировки)
+    std::vector<UdpSessStat> us;                // тоже: оборвавшаяся UDP-сессия, как UDP_SESSION
+    long long lastInAny = -1;                   // последний входящий из интернета (rel)
 
     for (size_t i = 0; i < pk.size(); i++) {
         const Packet& p = pk[i];
@@ -255,6 +287,7 @@ void buildFlows(Dataset& ds) {
             r.localPort = lport; r.remotePort = rport;
             rows.push_back(std::move(r));
             wb.emplace_back();
+            us.emplace_back();
         }
         FlowRow& r = rows[ins.first->second];
 
@@ -288,6 +321,10 @@ void buildFlows(Dataset& ds) {
             r.ja4 = p.ja4; r.tlsClient = p.tlsClient; r.ja4Kind = p.ja4Kind;
         }
         const long long rel = (ts[i] >= 0 && t0 >= 0) ? ts[i] - t0 : -1;
+        if (srcLocal != dstLocal) {
+            if (!out && rel > lastInAny) lastInAny = rel;
+            if (p.proto == "UDP") us[ins.first->second].add(out, rel);
+        }
         if (out && !p.httpHost.empty() && r.httpHost.empty()) {
             r.httpHost = p.httpHost;
             r.httpReqUs = rel;
@@ -319,7 +356,8 @@ void buildFlows(Dataset& ds) {
 
     const long long durUs = (t0 >= 0 && t1 > t0) ? t1 - t0 : 0;
     const long long tail = cfg().tailUs;
-    for (FlowRow& r : rows) {
+    for (size_t ri = 0; ri < rows.size(); ri++) {
+        FlowRow& r = rows[ri];
         auto nm = ds.ipName.find(r.remoteIp);
         if (nm != ds.ipName.end()) r.dnsName = nm->second;
         auto cn = ds.ipCname.find(r.remoteIp);
@@ -350,6 +388,11 @@ void buildFlows(Dataset& ds) {
         if (r.proto != "TCP") {
             r.state = FS_UDP;
             r.problem = r.pktsOut >= 3 && r.pktsIn == 0 && !inTail;
+            // сервер отвечал, потом замолчал, абонент шлёт дальше (игра, голос);
+            // DNS и QUIC не берём — как в collectBlockReasons
+            if (!r.problem && !r.dns && !r.quic && r.remotePort != 53 && r.remotePort != 443 &&
+                r.localPort != 53 && us[ri].died(lastInAny))
+                r.problem = true;
         } else if (r.synIn > 0 && r.synOut == 0) {
             // Входящее соединение к абоненту — обычно сканер из интернета. Порт
             // закрыт (RST) или файрвол молчит — это норма, а не проблема связи.

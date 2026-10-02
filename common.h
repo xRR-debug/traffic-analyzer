@@ -229,6 +229,11 @@ struct Packet {
     bool        ech = false;     // в ClientHello есть encrypted_client_hello (0xfe0d)
     int         quic = 0;       // QUIC long header в датаграмме: 1 = есть Initial, 2 = Handshake/0-RTT
     int         ttl = -1;        // IP TTL (только pcap; -1 = неизвестно)
+    int         ipId = -1;       // IPv4 Identification (только pcap; -1 — нет/IPv6)
+    // отпечаток датаграммы (только pcap, 0 — нет): IP-заголовок без TTL, DSCP и
+    // контрольной суммы + неизменяемая часть L4. Совпадает у копий одного пакета,
+    // снятых в двух точках, — по нему loadDumpSet склеивает дубли из двух файлов
+    uint32_t    wireHash = 0;
     int         wgType = 0;      // WireGuard по сигнатуре payload: 1=init(148B), 2=response(92B), 0=нет
     // IPsec (UDP 500/4500): 1 = IKE_SA_INIT / открытая фаза 1 IKEv1, 2 = IKE дальше
     // (IKE_AUTH, CHILD_SA, INFORMATIONAL, шифрованный IKEv1), 3 = ESP-данные в UDP; 0 = нет/не видно
@@ -267,6 +272,50 @@ struct Packet {
     // направление кадра по заголовку SLL/SLL2: -1 неизвестно, 0 входящий, 1 исходящий
     int         dir = -1;
     bool        valid = false;
+};
+
+// IP ID отправителя — счётчик (Linux, Windows): у каждого следующего пакета на
+// 1 больше. 0 — счётчика нет (DF без счётчика: PS5, часть стеков), -1 — неизвестно.
+// id продолжает счётчик после prev (с запасом на пару пакетов, не попавших в захват)
+inline bool ipIdNext(int prev, int id) {
+    if (prev <= 0 || id <= 0) return false;
+    const int d = (id - prev) & 0xFFFF;
+    return d >= 1 && d <= 4;
+}
+// id отправлен РАНЬШЕ ref (тот же счётчик, отставание до 64 пакетов)
+inline bool ipIdBefore(int id, int ref) {
+    if (id <= 0 || ref <= 0) return false;
+    const int d = (ref - id) & 0xFFFF;
+    return d >= 1 && d <= 64;
+}
+
+// Пакет с тем же IP ID, что и предыдущий, через dtUs — копия захвата: один
+// пакет снят дважды в одном файле (единицы мкс; копии из двух файлов loadDumpSet
+// уже убрал). Позже — настоящий повтор: инжектор шлёт одинаковые RST пачкой
+inline bool ipIdCaptureCopy(int id, int prevId, long long dtUs) {
+    return id > 0 && id == prevId && dtUs >= 0 && dtUs < 20;
+}
+
+// UDP-сессия (один 4-tuple), где сервер отвечал, а потом замолчал насовсем,
+// хотя абонент шлёт дальше и переподключается (игры, голос). Одно правило для
+// причины UDP_SESSION (collectBlockReasons) и таблицы соединений GUI. DNS и QUIC
+// отсекают вызывающие: браузер с QUIC сам уйдёт на новое соединение.
+struct UdpSessStat {
+    long long in = 0, lastIn = -1;      // ответов сервера / время последнего, мкс
+    long long outAfter = 0;             // пакетов абонента после последнего ответа
+    long long lastOut = -1;             // время последнего из них
+    void add(bool out, long long t) {
+        if (t < 0) return;
+        if (!out) { in++; lastIn = t; outAfter = 0; }
+        else if (in > 0) { outAfter++; lastOut = t; }
+    }
+    long long silenceUs() const { return lastOut - lastIn; }
+    // ≥3 ответов, затем ≥5 с тишины и ≥10 пакетов абонента. lastInAny —
+    // последний входящий пакет дампа (любой протокол, та же шкала времени):
+    // входящий захват шёл и после конца сессии, иначе это просто конец записи
+    bool died(long long lastInAny) const {
+        return in >= 3 && outAfter >= 10 && silenceUs() >= 5000000LL && lastInAny >= lastOut;
+    }
 };
 
 // ------------------------------------------------------------------
@@ -313,7 +362,8 @@ enum { JA4K_UNKNOWN = 0, JA4K_BROWSER = 1, JA4K_LIBRARY = 2, JA4K_FAKE = 3 };
 // выводятся показатели рядом и то, что появилось/пропало между A и B.
 // ------------------------------------------------------------------
 // Причина недоступности одного ресурса — итог по всем его соединениям в дампе.
-// code: HTTP_STUB, TLS_RST_FORGED, TLS_RST, TLS_DROP, TCP16, SYN_DROP, UDP_DROP.
+// code: HTTP_STUB, TLS_RST_FORGED, TLS_RST, TLS_DROP, TCP16, SYN_DROP, UDP_DROP;
+// UDP_SESSION (оборвавшаяся UDP-сессия игры/голоса) — не блокировка, см. blockReasonIsBlock.
 struct BlockReason {
     std::string target;     // домен (SNI / Host / DNS) или IP
     std::string ip;         // удалённый адрес (первый, если их несколько)
@@ -424,6 +474,9 @@ void runVpnAnalysis(std::vector<Packet>& packets, const std::vector<std::string>
 // ---- detector_dpi.cpp ----
 const char* blockReasonTitle(const std::string& code);   // «Молчаливый дроп после ClientHello»
 const char* blockReasonAdvice(const std::string& code);  // подсказка для техподдержки
+// false — проблема связи, а не признак блокировки (UDP_SESSION): показывать
+// отдельно от «Признаков блокировок»
+bool blockReasonIsBlock(const std::string& code);
 
 // ---- network.cpp ----
 // AS своей сети по своему внешнему адресу (ip-api.com): запоминает его

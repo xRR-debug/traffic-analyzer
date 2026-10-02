@@ -370,6 +370,10 @@ int connTtlInjection(const TcpConnState& c, int& ref, const char*& refWhat) {
 //      тогда выглядит «слишком быстрым» — нужен ещё хотя бы один признак;
 //   +2 после RST сервер продолжал слать пакеты — он RST не посылал и о нём не знает;
 //   +1 пачка RST в пределах 200 мс (DPI часто шлёт несколько с разными seq).
+//   −2 IP ID у RST продолжает счётчик сервера при том же TTL — скорее всего,
+//      RST послал сам сервер (инъекция по пути счётчика не знает). Только −2,
+//      а не «не подделка»: совпасть может и случайно (общий счётчик у сервера,
+//      инжектор, копирующий ID), и сильные признаки выше это перевесят.
 // why (необязательно) — человекочитаемые причины.
 static int connForgedRst(const TcpConnState& c, std::vector<std::string>* why = nullptr) {
     if (!c.inRst) return 0;
@@ -400,7 +404,12 @@ static int connForgedRst(const TcpConnState& c, std::vector<std::string>* why = 
                " пакет(ов) — сам он соединение не сбрасывал");
     if (c.rstBurst >= 2)
         add(1, std::to_string(c.rstBurst) + " RST подряд за 200 мс");
-    return score;
+    // IP ID продолжает счётчик сервера, TTL тот же — инъекция по пути счётчика
+    // не знает, так что это почти наверняка RST самого сервера. Не обнуляем:
+    // RST быстрее RTT или данные после RST всё равно перевесят
+    if (c.rstServerId && score > 0)
+        add(-2, "но IP ID продолжает счётчик сервера и TTL тот же — похоже на RST самого сервера");
+    return std::max(score, 0);
 }
 bool connIsForgedRst(const TcpConnState& c) { return connForgedRst(c) >= 2; }
 
@@ -1558,7 +1567,8 @@ void analyzeFreeze16k(const TcpConnTable& tt,
 // сводим все его соединения к ОДНОМУ коду — самому конкретному из найденных,
 // и к нему — готовая подсказка для техподдержки.
 // ------------------------------------------------------------------
-struct ReasonDef { const char* code; int prio; const char* title; const char* advice; };
+// block = false — не признак блокировки, выводится отдельно (blockReasonIsBlock)
+struct ReasonDef { const char* code; int prio; const char* title; const char* advice; bool block = true; };
 static const ReasonDef kReasonDefs[] = {
     { "HTTP_STUB", 0, "HTTP-заглушка о блокировке",
       "Вместо сайта пришла страница-заглушка (реестр РКН). Сеть исправна, ресурс ограничен "
@@ -1582,6 +1592,11 @@ static const ReasonDef kReasonDefs[] = {
     { "UDP_DROP", 6, "UDP без ответа (QUIC / VPN)",
       "UDP уходит, ответов нет. Для QUIC браузер сам откатится на TCP; для VPN "
       "(WireGuard, AmneziaWG и т.п.) — протокол, скорее всего, режется ТСПУ." },
+    { "UDP_SESSION", 7, "UDP-сессия оборвалась (игра / голос)",
+      "Сервер сначала отвечал, потом замолчал, а абонент шлёт дальше и переподключается — "
+      "игра в это время выдаёт ошибку подключения. Это не блокировка по реестру: ответы "
+      "теряются дальше по пути (CGNAT, транзит) или сервер сбросил сессию. Проверить с "
+      "другим внешним адресом / без CGNAT.", false },
 };
 static const ReasonDef* reasonDef(const std::string& code) {
     for (const auto& d : kReasonDefs) if (code == d.code) return &d;
@@ -1594,6 +1609,10 @@ const char* blockReasonTitle(const std::string& code) {
 const char* blockReasonAdvice(const std::string& code) {
     const ReasonDef* d = reasonDef(code);
     return d ? d->advice : "";
+}
+bool blockReasonIsBlock(const std::string& code) {
+    const ReasonDef* d = reasonDef(code);
+    return !d || d->block;
 }
 
 // onlyIp — ограничиться одним удалённым адресом (режим 2 с целью).
@@ -1732,13 +1751,19 @@ std::vector<BlockReason> collectBlockReasons(
     // (туннель — то же правило, что в журнале и таблице: udpTunnelStarved)
     struct U : UdpTunnelStat { bool quic = false; std::string sni; };
     std::map<std::string, U> uc;
+    // UDP-сессия по 4-tuple, оборвавшаяся со стороны сервера (UdpSessStat).
+    // Туннели — правило выше
+    struct Sess : UdpSessStat { int rport = 0; bool quic = false; };
+    std::map<std::string, Sess> sess;       // "ip|rport|lport"
+    long long lastInAny = -1;               // последний входящий пакет любого протокола
     bool anyInboundUdp = false;
     std::vector<long long> absT = absTimes(packets);
     for (size_t i = 0; i < packets.size(); i++) {
         const Packet& p = packets[i];
-        if (p.proto != "UDP") continue;
         bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
         if (sLoc == dLoc) continue;
+        if (!sLoc && absT[i] > lastInAny) lastInAny = absT[i];
+        if (p.proto != "UDP") continue;
         std::string ip = sLoc ? p.dstIp : p.srcIp;
         if (!onlyIp.empty() && ip != onlyIp) continue;
         // ответ DNS тоже доказывает, что входящее направление в дампе есть
@@ -1748,6 +1773,12 @@ std::vector<BlockReason> collectBlockReasons(
         int lport = sLoc ? p.srcPort : p.dstPort;
         U& u = uc[ip];
         u.add(p, sLoc, absT[i], rport, lport, ipInfoOf(ipCache, ip));
+        if (absT[i] >= 0) {
+            Sess& s = sess[ip + "|" + std::to_string(rport) + "|" + std::to_string(lport)];
+            s.rport = rport;
+            s.add(sLoc, absT[i]);
+            if (sLoc && (p.quic || rport == 443)) s.quic = true;
+        }
         if (!sLoc) continue;
         if (p.quic || rport == 443) u.quic = true;
         if (u.sni.empty() && !p.sni.empty()) u.sni = p.sni;
@@ -1771,6 +1802,19 @@ std::vector<BlockReason> collectBlockReasons(
                 put(name, kv.first, "UDP_DROP", b);
             }
         }
+        // Оборвавшаяся UDP-сессия (UdpSessStat::died)
+        for (const auto& kv : sess) {
+            const Sess& s = kv.second;
+            if (s.quic || !s.died(lastInAny)) continue;
+            const long long silence = s.silenceUs();
+            const std::string ip = kv.first.substr(0, kv.first.find('|'));
+            auto ut = uc.find(ip);
+            if (ut != uc.end() && ut->second.kind) continue;   // туннель — правило выше
+            snprintf(b, sizeof(b), "UDP-сессия: сервер ответил %lld раз, затем замолчал; абонент "
+                     "ещё %.0f с слал на порт %d (%lld пак.) — ответов нет",
+                     s.in, silence / 1e6, s.rport, s.outAfter);
+            put(ipName(ip), ip, "UDP_SESSION", b);
+        }
     }
 
     std::vector<BlockReason> out;
@@ -1780,9 +1824,11 @@ std::vector<BlockReason> collectBlockReasons(
         // (кроме заглушки и «16 КБ»: там мелкие ответы как раз проходят).
         // Рабочий IP гасит только причины уровня адреса: на общем IP CDN
         // соседний домен открывается, а заблокированный по SNI — нет
+        // Оборвавшаяся UDP-сессия — тоже: TCP к тому же серверу (вход в игру)
+        // работает, а игровой UDP глохнет
         const bool ipLevel = a.code == "SYN_DROP" || a.code == "UDP_DROP";
         if ((worked.count(kv.first) || (ipLevel && workedIp.count(a.ip))) &&
-            a.code != "HTTP_STUB" && a.code != "TCP16")
+            a.code != "HTTP_STUB" && a.code != "TCP16" && a.code != "UDP_SESSION")
             continue;
         BlockReason r; r.target = kv.first; r.ip = a.ip; r.code = a.code; r.detail = a.detail; r.conns = a.n;
         out.push_back(r);
