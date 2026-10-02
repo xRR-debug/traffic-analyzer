@@ -61,6 +61,12 @@ struct TcpConnState {
     long long synTime = -1, synAckTime = -1;   // первый исходящий SYN / первый входящий SYN-ACK
     int rstBurst = 0;                 // входящих RST в пределах 200 мс от первого
     int inAfterRst = 0;               // входящих НЕ-RST пакетов после первого RST
+    int lastInIpId = -1, lastInTtl = -1;   // IP ID и TTL последнего входящего до RST
+    int rstIpId = -1;                 // IP ID первого входящего RST
+    long long lastRstTime = -1;       // последний входящий RST: время и IP ID
+    int lastRstIpId = -1;             //   (копию захвата не считать пачкой)
+    // IP ID у RST продолжает счётчик сервера, TTL тот же — RST послал сам сервер
+    bool rstServerId = false;
     // нешифрованный HTTP
     std::string httpHost;             // Host: первого запроса
     int httpStatus = 0;               // код первого ответа

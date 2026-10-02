@@ -244,26 +244,32 @@ void analyzeThroughput(const std::vector<Packet>& packets,
 }
 
 void printBlockReasons(const std::vector<BlockReason>& rs) {
-    if (rs.empty()) return;
-    printf("\n%s=== ПРИЧИНЫ БЛОКИРОВОК ===%s\n", C::BOLD, C::RST);
-    size_t i = 0;
-    while (i < rs.size()) {
-        size_t j = i;
-        while (j < rs.size() && rs[j].code == rs[i].code) j++;
-        const bool hard = rs[i].code != "TLS_RST" && rs[i].code != "UDP_DROP";
-        printf("  %s[%s] %s%s — ресурсов: %d\n", hard ? C::RED : C::YEL, rs[i].code.c_str(),
-               blockReasonTitle(rs[i].code), C::RST, (int)(j - i));
-        for (size_t k = i; k < j; k++) {
-            if (k - i >= 12) { printf("      ... ещё %d\n", (int)(j - k)); break; }
-            const BlockReason& r = rs[k];
-            std::string ipPart = r.target != r.ip ? "  " + r.ip : std::string();
-            printf("    %s%s%s%s  (соед.: %d)\n      %s%s%s\n",
-                   C::BWHT, r.target.c_str(), C::RST, ipPart.c_str(),
-                   r.conns, C::GRY, r.detail.c_str(), C::RST);
+    // сначала признаки блокировок, затем отдельно — проблемы связи (UDP_SESSION)
+    auto printGroup = [&](bool block, const char* header) {
+        bool shown = false;
+        size_t i = 0;
+        while (i < rs.size()) {
+            size_t j = i;
+            while (j < rs.size() && rs[j].code == rs[i].code) j++;
+            if (blockReasonIsBlock(rs[i].code) != block) { i = j; continue; }
+            if (!shown) { printf("\n%s=== %s ===%s\n", C::BOLD, header, C::RST); shown = true; }
+            const bool hard = block && rs[i].code != "TLS_RST" && rs[i].code != "UDP_DROP";
+            printf("  %s[%s] %s%s — ресурсов: %d\n", hard ? C::RED : C::YEL, rs[i].code.c_str(),
+                   blockReasonTitle(rs[i].code), C::RST, (int)(j - i));
+            for (size_t k = i; k < j; k++) {
+                if (k - i >= 12) { printf("      ... ещё %d\n", (int)(j - k)); break; }
+                const BlockReason& r = rs[k];
+                std::string ipPart = r.target != r.ip ? "  " + r.ip : std::string();
+                printf("    %s%s%s%s  (соед.: %d)\n      %s%s%s\n",
+                       C::BWHT, r.target.c_str(), C::RST, ipPart.c_str(),
+                       r.conns, C::GRY, r.detail.c_str(), C::RST);
+            }
+            printf("    %sЧто сказать/сделать:%s %s\n", C::CYN, C::RST, blockReasonAdvice(rs[i].code));
+            i = j;
         }
-        printf("    %sЧто сказать/сделать:%s %s\n", C::CYN, C::RST, blockReasonAdvice(rs[i].code));
-        i = j;
-    }
+    };
+    printGroup(true, "ПРИЧИНЫ БЛОКИРОВОК");
+    printGroup(false, "ДРУГИЕ ПРОБЛЕМЫ СВЯЗИ (не блокировка)");
 }
 
 // Список доменов, заблокированных по SNI (tspu-docs гл.17.5.3: HTTPS режется
@@ -796,6 +802,9 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             if (r.code == "UDP_DROP" && !tspuIps.count(r.ip)) v.push_back(&r);
         return v;
     };
+    // оборвавшиеся UDP-сессии (игры, голос) — не блокировка, свой абзац
+    std::vector<const BlockReason*> udpSess;
+    for (const auto& r : blockReasons) if (r.code == "UDP_SESSION") udpSess.push_back(&r);
     auto listOf = [](const std::vector<const BlockReason*>& v) {
         std::string s; std::set<std::string> seen; int col = 0;
         for (const BlockReason* r : v) {
@@ -819,8 +828,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
     };
     auto printUdpOther = [&](const std::vector<const BlockReason*>& udp, bool also) {
         bool quic = false, other = false;
-        for (const BlockReason* r : udp)
-            (r->detail.rfind("QUIC:", 0) == 0 ? quic : other) = true;
+        for (const BlockReason* r : udp) (r->detail.rfind("QUIC:", 0) == 0 ? quic : other) = true;
         printf("%s%sUDP БЕЗ ОТВЕТА: %s\n", C::YEL, also ? "Также: " : "", listOf(udp).c_str());
         if (quic)
             printf("QUIC (UDP/443) уходит, в ответ ничего. Браузер сам перейдёт на TCP,\n"
@@ -830,6 +838,15 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             printf("UDP-туннель: пакеты уходят, ответов нет — протокол режется по пути\n"
                    "или сервер недоступен.\n");
         printf("%s", C::RST);
+    };
+    auto printUdpSess = [&](bool also) {
+        printf("%s%sОБРЫВ UDP-СЕССИИ (игра / голос): %s\n"
+               "Сервер отвечал, потом замолчал, а абонент продолжает слать и\n"
+               "переподключаться — игра в это время выдаёт ошибку подключения.\n"
+               "Это не блокировка по реестру: ответы теряются дальше по пути\n"
+               "(CGNAT, транзит) или сервер сбросил сессию. Проверьте с другим\n"
+               "внешним адресом / без CGNAT.%s\n",
+               C::YEL, also ? "Также: " : "", listOf(udpSess).c_str(), C::RST);
     };
 
     if (rows.empty()) {
@@ -847,7 +864,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             const auto udpOther = udpOtherOf(tspuBlocked);
             const bool anyBlock = !tspuBlocked.empty() || !blockedSnisAll.empty() || !dpiFindings.empty();
             // таблицы проблем нет, но блокировка найдена — ВЫВОД всё равно печатаем
-            if (anyBlock || !frz16.empty() || !udpOther.empty())
+            if (anyBlock || !frz16.empty() || !udpOther.empty() || !udpSess.empty())
                 printf("\n=================== ВЫВОД ===================");
             if (!tspuBlocked.empty()) {
                 std::set<std::string> tcpIps;
@@ -883,11 +900,15 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             } else if (!udpOther.empty()) {
                 printf("\n");
                 printUdpOther(udpOther, false);
+            } else if (!udpSess.empty()) {
+                printf("\n");
+                printUdpSess(false);
             } else {
                 printf("\n%sЯвных проблем соединения не обнаружено.%s\n", C::GRN, C::RST);
             }
             if (anyBlock && !frz16.empty()) printFreeze(true);
             if ((anyBlock || !frz16.empty()) && !udpOther.empty()) printUdpOther(udpOther, true);
+            if ((anyBlock || !frz16.empty() || !udpOther.empty()) && !udpSess.empty()) printUdpSess(true);
         }
     } else {
         printf("\n%s=== ПРОБЛЕМНЫЕ АДРЕСА (единая таблица) ===%s\n", C::BOLD, C::RST);
@@ -1599,9 +1620,10 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
                        heavyLoss ? "много потерь пакетов" : "",
                        slowRoute ? (heavyLoss ? " и высокий RTT" : "очень высокий RTT (медленный ответ)") : "",
                        C::RST);
-            } else if (!udpOther.empty()) {
+            } else if (!udpOther.empty() || !udpSess.empty()) {
                 // TCP в порядке (или умеренные потери), но UDP без ответа — не «норма»
-                printUdpOther(udpOther, false);
+                if (!udpOther.empty()) printUdpOther(udpOther, false);
+                if (!udpSess.empty()) printUdpSess(!udpOther.empty());
                 if (someLoss || elevated)
                     printf("%sTCP-соединения в целом рабочие, есть умеренные потери или "
                            "повышенный RTT.%s\n", C::YEL, C::RST);
@@ -1618,6 +1640,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             if (anyBlock && !frz16.empty()) printFreeze(true);
             const bool udpShown = !anyBlock && frz16.empty() && !(hardBlock || heavyLoss || slowRoute);
             if (!udpOther.empty() && !udpShown) printUdpOther(udpOther, true);
+            if (!udpSess.empty() && !udpShown) printUdpSess(true);
             // оговорка одной строкой, без отдельного блока «Важно»
             printf("(по дампу нельзя на 100%% отличить блокировку провайдером от\n"
                    " недоступности сервера — это признаки для проверки.)\n");

@@ -684,6 +684,7 @@ static bool parseFrame(const unsigned char* d, size_t len, int linkType,
         if ((be16(ip + 6) & 0x1FFF) != 0) return false;
         proto = ip[9];
         pk.ttl = ip[8];                   // IP TTL — ключ для детекта RST-инъекции DPI
+        pk.ipId = be16(ip + 4);           // счётчик отправителя — отличает RST сервера от подделки
         pk.srcIp = ipToStr(ip + 12);
         pk.dstIp = ipToStr(ip + 16);
         uint16_t totalLen = be16(ip + 2);
@@ -870,6 +871,24 @@ static bool parseFrame(const unsigned char* d, size_t len, int linkType,
         pk.flags = "[-]";
     } else {
         return false;
+    }
+    // Отпечаток датаграммы для склейки копий из двух файлов (loadDumpSet). Без
+    // полей, которые меняет маршрутизатор между точками захвата: TTL/hop limit,
+    // DSCP/traffic class, контрольная сумма IP; у TCP — без контрольной суммы и
+    // опций (BRAS правит MSS в SYN): порты, seq, ack, флаги и окно и так
+    // однозначно задают сегмент. У UDP/ICMP — заголовок и начало данных.
+    {
+        uint32_t h = 2166136261u;                  // FNV-1a
+        auto mix = [&](const unsigned char* b, size_t n) {
+            for (size_t k = 0; k < n; k++) { h ^= b[k]; h *= 16777619u; }
+        };
+        const unsigned char* ip = d + off;
+        if (ethertype == 0x0800) { mix(ip + 2, 6); mix(ip + 9, 1); mix(ip + 12, 8); }
+        else                     { mix(ip + 4, 3); mix(ip + 8, 32); }
+        const size_t cap = len - l4off;            // l4off <= len проверено выше
+        if (proto == 6) mix(l4, 16);
+        else            mix(l4, std::min<size_t>(64, std::min(l4len, cap)));
+        pk.wireHash = h ? h : 1;                   // 0 — «отпечатка нет»
     }
     pk.valid = !pk.srcIp.empty() && !pk.dstIp.empty();
     return pk.valid;
@@ -2319,9 +2338,11 @@ bool loadDumpSet(const std::vector<std::string>& paths,
 
         std::vector<Packet> merged;  merged.reserve(packets.size());
         std::vector<int>    morig;   morig.reserve(origin.size());
+        std::vector<long long> mt;   mt.reserve(ord.size());   // время в мкс, параллельно merged
         for (auto& kv : ord) {
             merged.push_back(std::move(packets[kv.second]));
             if (kv.second < origin.size()) morig.push_back(origin[kv.second]);
+            mt.push_back(kv.first);
         }
         packets.swap(merged);
         origin.swap(morig);
@@ -2348,23 +2369,41 @@ bool loadDumpSet(const std::vector<std::string>& paths,
             }
         }
 
-        // Оба файла пишутся одновременно с одного интерфейса, поэтому стоит
-        // фильтрам захвата хоть немного перекрыться — и один и тот же пакет
-        // попадёт в оба файла. Для анализа это яд: каждая копия выглядит как
-        // ретрансмиссия и раздувает счётчик потерь. Настоящая ретрансмиссия
-        // ВСЕГДА приходит позже оригинала, поэтому безопасно убрать только
-        // полные совпадения с ТЕМ ЖЕ штампом времени — и только пришедшие из
-        // РАЗНЫХ файлов. Совпадения внутри одного файла не трогаем: там это
-        // особенность захвата, а не наше дублирование.
+        // Один и тот же пакет может попасть в оба файла: перекрылись фильтры
+        // захвата или (BRAS) файлы «_in»/«_out» — это входящий и исходящий
+        // трафик ИНТЕРФЕЙСОВ, и каждый пакет снят дважды: на входе со стороны
+        // абонента и на выходе в аплинк. Для анализа это яд: каждая копия
+        // выглядит как ретрансмиссия, сбросы и FIN удваиваются, а копия RST из
+        // одного файла встаёт перед копиями предыдущих пакетов из другого — и
+        // RST сервера выглядит «поддельным». Убираем только копии из РАЗНЫХ
+        // файлов: совпадения внутри одного файла — особенность захвата.
         {
+            std::vector<char> drop(packets.size(), 0);   // 1 — убрать, 2 — уже нашёл свою копию
+            long long dupCross = 0;
+            // pcap: копия — та же датаграмма (wireHash) из другого файла не дальше
+            // 1 мс; между интерфейсами одного BRAS — единицы мкс. Настоящий повтор
+            // приходит через RTO/RTT (≥ десятков мс) и с другим IP ID у счётчика.
+            // Пара — один к одному: пакет, уже нашедший копию, второй не берёт.
+            const long long kDupWinUs = 1000;
+            for (size_t a = 0; a < packets.size(); a++) {
+                const uint32_t h = packets[a].wireHash;
+                if (!h) continue;
+                // при грубых штампах в окно попадёт много пакетов — смотрим не дальше 512 назад
+                for (size_t b = a, n = 0; b-- > 0 && n < 512 && mt[a] - mt[b] <= kDupWinUs; n++) {
+                    if (drop[b] || packets[b].wireHash != h || origin[b] == origin[a]) continue;
+                    drop[b] = 2; drop[a] = 1; dupCross++;
+                    break;
+                }
+            }
+            // текстовый tcpdump (отпечатка нет): только полные совпадения с ТЕМ
+            // ЖЕ штампом времени — без содержимого пакета копию от быстрого
+            // повтора по одним заголовкам в окне не отличить
             auto wireKey = [](const Packet& p) {
                 char n[192];
                 snprintf(n, sizeof(n), "|%d|%d|%lld|%lld|%lld|%lld|",
                          p.srcPort, p.dstPort, p.seqStart, p.seq, p.ack, p.length);
                 return p.srcIp + ">" + p.dstIp + n + p.proto + p.flags;
             };
-            std::vector<char> drop(packets.size(), 0);
-            long long dupCross = 0;
             size_t i = 0;
             while (i < packets.size()) {
                 size_t j = i + 1;                       // группа пакетов с одним штампом
@@ -2374,6 +2413,7 @@ bool loadDumpSet(const std::vector<std::string>& paths,
                     // может оказаться большой, и O(n^2) встал бы колом
                     std::map<std::string,int> seen;
                     for (size_t a = i; a < j; a++) {
+                        if (packets[a].wireHash) continue;
                         std::string k = wireKey(packets[a]);
                         auto it = seen.find(k);
                         if (it == seen.end())            seen[k] = origin[a];
@@ -2383,19 +2423,24 @@ bool loadDumpSet(const std::vector<std::string>& paths,
                 i = j;
             }
             if (dupCross > 0) {
-                std::vector<Packet> uniq;  uniq.reserve(packets.size() - (size_t)dupCross);
+                const size_t total = packets.size();
+                std::vector<Packet> uniq;  uniq.reserve(total - (size_t)dupCross);
                 std::vector<int>    uorig; uorig.reserve(uniq.capacity());
-                for (size_t a = 0; a < packets.size(); a++) {
-                    if (drop[a]) continue;
+                for (size_t a = 0; a < total; a++) {
+                    if (drop[a] == 1) continue;
                     uniq.push_back(std::move(packets[a]));
                     uorig.push_back(origin[a]);
                 }
                 packets.swap(uniq);
                 origin.swap(uorig);
                 std::cout << C::GRY << "Убрано " << dupCross
-                          << " пакет(ов), попавших сразу в оба файла (фильтры захвата "
-                             "перекрылись) — иначе они считались бы ретрансмиссиями"
-                          << C::RST << "\n";
+                          << " пакет(ов), попавших сразу в оба файла — иначе они считались "
+                             "бы ретрансмиссиями";
+                // больше трети — не перекрытие фильтров, а один трафик в двух точках
+                if ((size_t)dupCross * 3 >= total)
+                    std::cout << ". Файлы содержат почти один и тот же трафик (сняты на двух "
+                                 "интерфейсах) — для анализа хватило бы одного";
+                std::cout << C::RST << "\n";
             }
         }
 

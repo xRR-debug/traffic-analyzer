@@ -612,13 +612,24 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
                 if (!c.inRst) {
                     c.inRst = true; c.rstTime = t;
                     if (p.ttl >= 0) c.rstTtl = p.ttl;
+                    c.rstIpId = p.ipId;
+                    // инъекция по пути счётчика IP ID сервера не знает
+                    c.rstServerId = ipIdNext(c.lastInIpId, p.ipId) && p.ttl == c.lastInTtl;
+                    if (t >= 0 && c.rstTime >= 0) c.rstBurst++;
+                } else if (t >= 0 && c.rstTime >= 0 && t - c.rstTime <= 200000LL &&
+                           !ipIdCaptureCopy(p.ipId, c.lastRstIpId, t - c.lastRstTime)) {
+                    // одинаковые RST от инжектора — пачка; копия захвата — нет
+                    c.rstBurst++;
                 }
-                if (t >= 0 && c.rstTime >= 0 && t - c.rstTime <= 200000LL) c.rstBurst++;
-            } else if (c.inRst && !S && t >= 0 && c.rstTime >= 0 && t - c.rstTime <= 2000000LL) {
+                if (t >= 0) { c.lastRstTime = t; c.lastRstIpId = p.ipId; }
+            } else if (c.inRst && !S && t >= 0 && c.rstTime >= 0 && t - c.rstTime <= 2000000LL &&
+                       !ipIdBefore(p.ipId, c.rstIpId)) {
                 // сервер «не заметил» RST: ответ пришёл уже после него (в пределах 2 с,
-                // чтобы не спутать с новым соединением на том же порту)
+                // чтобы не спутать с новым соединением на том же порту). Пакет с IP ID
+                // РАНЬШЕ RST сервер отправил до него — это перестановка в пути, не ответ
                 c.inAfterRst++;
             }
+            if (!R && !c.inRst) { c.lastInIpId = p.ipId; c.lastInTtl = p.ttl; }
             if (p.httpStatus > 0 && c.httpStatus == 0) {
                 c.httpStatus = p.httpStatus;
                 c.httpLocation = p.httpLocation;

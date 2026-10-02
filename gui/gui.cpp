@@ -1108,8 +1108,45 @@ void drawOverview(const View& v) {
     // --- блокировки ---
     if (s) {
         ImGui::Spacing();
+        // причины-не-блокировки (UDP_SESSION) — отдельным блоком ниже
+        bool anyReasonBlock = false, anyReasonOther = false;
+        for (const auto& r : s->blockReasons)
+            (blockReasonIsBlock(r.code) ? anyReasonBlock : anyReasonOther) = true;
+        // таблица причин: block — признаки блокировок, иначе прочие проблемы связи
+        auto drawReasons = [&](const char* id, bool block) {
+            if (!ImGui::BeginTable(id, 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                                          ImGuiTableFlags_SizingStretchProp))
+                return;
+            ImGui::TableSetupColumn("Причина", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("Ресурс", ImGuiTableColumnFlags_WidthStretch, 1.1f);
+            ImGui::TableSetupColumn("Соед.", ImGuiTableColumnFlags_WidthFixed);
+            ImGui::TableSetupColumn("Что видно в дампе", ImGuiTableColumnFlags_WidthStretch, 2.4f);
+            ImGui::TableHeadersRow();
+            for (const auto& r : s->blockReasons) {
+                if (blockReasonIsBlock(r.code) != block) continue;
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                const bool soft = !block || r.code == "TLS_RST" || r.code == "UDP_DROP";
+                ImGui::TextColored(soft ? kWarn : kBad, "%s", r.code.c_str());
+                if (ImGui::BeginItemTooltip()) {
+                    ImGui::TextUnformatted(blockReasonTitle(r.code));
+                    ImGui::Separator();
+                    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 32.0f);
+                    ImGui::TextUnformatted(blockReasonAdvice(r.code));
+                    ImGui::PopTextWrapPos();
+                    ImGui::EndTooltip();
+                }
+                ImGui::TableNextColumn();
+                if (r.target != r.ip) ImGui::Text("%s  (%s)", r.target.c_str(), r.ip.c_str());
+                else ImGui::TextUnformatted(r.target.c_str());
+                ImGui::TableNextColumn(); ImGui::Text("%d", r.conns);
+                ImGui::TableNextColumn(); ImGui::TextWrapped("%s", r.detail.c_str());
+            }
+            ImGui::EndTable();
+            ImGui::TextColored(kDim, "Наведите на код причины — подсказка, что сказать абоненту.");
+        };
         const bool anyBlock = !s->blockedIps.empty() || !s->blockedSnis.empty() ||
-                              !s->blockReasons.empty() || s->silentDrops || s->sniRsts ||
+                              anyReasonBlock || s->silentDrops || s->sniRsts ||
                               s->ttlInj || s->forgedRsts || s->httpStubs;
         {
             // заголовок красный; первые секунды после загрузки — плавно пульсирует
@@ -1128,36 +1165,7 @@ void drawOverview(const View& v) {
             ImGui::Text("Тихий обрыв после ClientHello: %lld   RST на SNI: %lld   "
                         "Поддельных RST: %lld (по TTL: %lld)   HTTP-заглушек: %lld",
                         s->silentDrops, s->sniRsts, s->forgedRsts, s->ttlInj, s->httpStubs);
-            if (!s->blockReasons.empty() &&
-                ImGui::BeginTable("##reasons", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
-                                                  ImGuiTableFlags_SizingStretchProp)) {
-                ImGui::TableSetupColumn("Причина", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-                ImGui::TableSetupColumn("Ресурс", ImGuiTableColumnFlags_WidthStretch, 1.1f);
-                ImGui::TableSetupColumn("Соед.", ImGuiTableColumnFlags_WidthFixed);
-                ImGui::TableSetupColumn("Что видно в дампе", ImGuiTableColumnFlags_WidthStretch, 2.4f);
-                ImGui::TableHeadersRow();
-                for (const auto& r : s->blockReasons) {
-                    ImGui::TableNextRow();
-                    ImGui::TableNextColumn();
-                    const bool soft = r.code == "TLS_RST" || r.code == "UDP_DROP";
-                    ImGui::TextColored(soft ? kWarn : kBad, "%s", r.code.c_str());
-                    if (ImGui::BeginItemTooltip()) {
-                        ImGui::TextUnformatted(blockReasonTitle(r.code));
-                        ImGui::Separator();
-                        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 32.0f);
-                        ImGui::TextUnformatted(blockReasonAdvice(r.code));
-                        ImGui::PopTextWrapPos();
-                        ImGui::EndTooltip();
-                    }
-                    ImGui::TableNextColumn();
-                    if (r.target != r.ip) ImGui::Text("%s  (%s)", r.target.c_str(), r.ip.c_str());
-                    else ImGui::TextUnformatted(r.target.c_str());
-                    ImGui::TableNextColumn(); ImGui::Text("%d", r.conns);
-                    ImGui::TableNextColumn(); ImGui::TextWrapped("%s", r.detail.c_str());
-                }
-                ImGui::EndTable();
-                ImGui::TextColored(kDim, "Наведите на код причины — подсказка, что сказать абоненту.");
-            }
+            if (anyReasonBlock) drawReasons("##reasons", true);
             if (!s->blockedSnis.empty() &&
                 ImGui::BeginTable("##bsni", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
                                                ImGuiTableFlags_SizingStretchProp)) {
@@ -1193,6 +1201,15 @@ void drawOverview(const View& v) {
                 ImGui::EndTable();
             }
             ImGui::TextColored(kDim, "Подробности и методика — «Блокировки» (режим 2), вывод в журнале.");
+        }
+        // оборвавшиеся UDP-сессии (игры, голос): проблема связи, но не блокировка
+        if (anyReasonOther) {
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Text, kWarn);
+            ImGui::PushStyleColor(ImGuiCol_Separator, withA(kWarn, kWarn.w * 0.45f));
+            ImGui::SeparatorText("Другие проблемы связи (не блокировка)");
+            ImGui::PopStyleColor(2);
+            drawReasons("##reasonsOther", false);
         }
 
         // --- топ адресов по объёму ---
@@ -1627,14 +1644,14 @@ int wfRstForged(const FlowRow& r, size_t i, const WfInfo& w, std::vector<std::st
     if (w.rtt >= 3000 && w.helloUs >= 0 && e.us >= w.helloUs && (e.us - w.helloUs) * 2 < w.rtt)
         add(1, "через " + fmtUs(e.us - w.helloUs) + " после " + w.helloWhat + " при RTT " +
                fmtUs(w.rtt) + " — быстрее, чем мог ответить сервер");
-    int after = 0;
-    for (size_t j = i + 1; j < r.wf.size() && r.wf[j].us <= e.endUs + 2000000; j++)
-        if (!r.wf[j].out && r.wf[j].kind != FE_RST && r.wf[j].kind != FE_SYNACK) after += r.wf[j].count;
-    if (after >= 2)
-        add(2, "после RST сервер прислал ещё " + std::to_string(after) +
-               " пакет(ов) с данными — сам он соединение не сбрасывал");
-    if (e.count >= 2) add(1, std::to_string(e.count) + " RST подряд за 200 мс");
-    return score;
+    // счётчики — из wfAdd, по тем же правилам, что inAfterRst / rstBurst
+    if (e.afterRst >= 2)
+        add(2, "после RST сервер прислал ещё " + std::to_string(e.afterRst) +
+               " пакет(ов) — сам он соединение не сбрасывал");
+    if (e.burst >= 2) add(1, std::to_string(e.burst) + " RST подряд за 200 мс");
+    if (e.serverId && score > 0)
+        add(-2, "но IP ID продолжает счётчик сервера и TTL тот же — похоже на RST самого сервера");
+    return std::max(score, 0);
 }
 
 // Подробности события — строки для таблицы и подсказки.
