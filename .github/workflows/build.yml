@@ -54,6 +54,20 @@ jobs:
         shell: pwsh
         run: msbuild TrafficAnalyzer.vcxproj /m /nologo /p:Configuration=Release /p:Platform=x64 /p:SolutionDir=$env:GITHUB_WORKSPACE\
 
+      # exe должен запускаться на чистой Windows: без VC++ Redistributable (CRT
+      # статический, /MT) и без Npcap (wpcap.dll/Packet.dll — отложенная загрузка)
+      - name: Проверка exe
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $deps = & $dumpbin.FullName /nologo /dependents x64/Release/TrafficAnalyzer.exe
+          $deps
+          $bad = $deps | Select-String -Pattern 'VCRUNTIME|MSVCP|CONCRT'
+          if ($bad) { throw "exe зависит от VC++ runtime ($($bad -join ', ')) — нужен статический CRT (/MT)" }
+          $direct = ($deps -join "`n") -split 'Image has the following delay load dependencies' | Select-Object -First 1
+          if ($direct -match 'wpcap|Packet\.dll') { throw "wpcap.dll/Packet.dll в обычных зависимостях — без Npcap exe не запустится" }
+
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -82,6 +96,7 @@ jobs:
           New-Item -ItemType Directory -Force $d | Out-Null
           Copy-Item x64/Release/TrafficAnalyzer.exe, analyzer.ini.example -Destination $d
           Copy-Item packaging/README-windows.txt -Destination "$d/README.txt"
+          Copy-Item gui/imgui/LICENSE.txt -Destination "$d/LICENSE-imgui.txt"
           Compress-Archive -Path $d -DestinationPath dist/TrafficAnalyzer-windows-x64.zip
 
       - uses: actions/upload-artifact@v4
@@ -145,6 +160,8 @@ jobs:
           mkdir -p "$d"
           cp build/TrafficAnalyzer build/anime_bg.jpg build/analyzer.ini.example "$d/"
           cp packaging/README-macos.txt "$d/README.txt"
+          cp gui/imgui/LICENSE.txt "$d/LICENSE-imgui.txt"
+          cp build/_deps/glfw-src/LICENSE.md "$d/LICENSE-glfw.txt"
           ditto -c -k --keepParent "$d" dist/TrafficAnalyzer-macos-universal.zip
 
       - uses: actions/upload-artifact@v4
@@ -200,6 +217,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0           # вся история и теги: описание — коммиты с прошлого релиза
+          persist-credentials: false   # токен с правом записи нужен только gh в «Публикации»
 
       - uses: actions/download-artifact@v4
         with:
@@ -212,6 +230,13 @@ jobs:
         run: |
           tag=$(python3 tools/release_notes.py version)
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # перезапуск старой сборки main: коммит уже вошёл в более новый релиз —
+          # выпускать его заново (да ещё как Latest) нельзя
+          released=$(python3 tools/release_notes.py released)
+          if [ -n "$released" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Коммит уже вошёл в релиз $released — новый релиз не нужен." >> "$GITHUB_STEP_SUMMARY"
+          fi
           python3 tools/release_notes.py notes --tag "$tag" --out notes.md
           cd dist
           for f in TrafficAnalyzer-*.zip; do mv "$f" "TrafficAnalyzer-$tag-${f#TrafficAnalyzer-}"; done
@@ -220,11 +245,21 @@ jobs:
           { echo "## Предпросмотр релиза $tag"; echo; cat ../notes.md; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Публикация
-        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        if: >-
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          steps.rel.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ steps.rel.outputs.tag }}
         run: |
+          # gh сначала создаёт черновик, грузит файлы и только потом публикует.
+          # Черновик от прерванного запуска — удалить и выпустить заново
+          if [ "$(gh release view "$TAG" --json isDraft -q .isDraft 2>/dev/null)" = "true" ]; then
+            echo "Остался черновик $TAG от прерванного запуска — удаляю"
+            gh release delete "$TAG" --yes
+          fi
           # перезапуск сборки того же коммита: тег уже стоит, релиз уже есть
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Релиз $TAG уже есть — пропускаю"

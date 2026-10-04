@@ -5,10 +5,14 @@
 #                                                  (дата по Москве, N — номер за день).
 #                                                  Если на HEAD уже есть такой тег
 #                                                  (перезапуск сборки) — он же.
+#   python release_notes.py released            — самый ранний релиз, в который HEAD
+#                                                  уже вошёл (пусто — ещё не вошёл).
+#                                                  Перезапуск старой сборки main не
+#                                                  должен выпускать старый код заново.
 #   python release_notes.py notes --tag TAG --out FILE
 #                                               — описание релиза на русском: темы
-#                                                  коммитов с прошлого релиза, файлы,
-#                                                  установка.
+#                                                  коммитов, ещё не вошедших в релизы,
+#                                                  файлы, установка.
 #
 # Описание собирается из тем коммитов (без merge-коммитов) — поэтому темы коммитов
 # в репозитории пишутся по-русски.
@@ -19,7 +23,7 @@ import re
 import subprocess
 import sys
 
-TAG_GLOB = "v[0-9]*"
+TAG_GLOB = "v[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9].*"
 TAG_RE = re.compile(r"^v\d{4}\.\d{2}\.\d{2}\.\d+$")
 MSK = datetime.timezone(datetime.timedelta(hours=3))   # Москва, без перехода на летнее
 MAX_ITEMS = 60
@@ -32,9 +36,25 @@ def git(*args, check=True):
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def tag_key(t):
+    return tuple(int(x) for x in t[1:].split("."))
+
+
+def release_tags(*args):
+    return sorted((t for t in git("tag", "--list", TAG_GLOB, *args).splitlines() if TAG_RE.match(t)),
+                  key=tag_key)
+
+
 def head_tag():
-    tags = [t for t in git("tag", "--points-at", "HEAD", "--list", TAG_GLOB).splitlines() if TAG_RE.match(t)]
-    return sorted(tags)[-1] if tags else ""
+    tags = release_tags("--points-at", "HEAD")
+    return tags[-1] if tags else ""
+
+
+def cmd_released():
+    # без тега самого HEAD: перезапуск выпущенного коммита решает version (тот же тег)
+    t = head_tag()
+    tags = [x for x in release_tags("--contains", "HEAD") if x != t]
+    return tags[0] if tags else ""
 
 
 def cmd_version():
@@ -42,22 +62,19 @@ def cmd_version():
     if t:
         return t
     day = datetime.datetime.now(MSK).strftime("%Y.%m.%d")
-    nums = [int(t.rsplit(".", 1)[1]) for t in git("tag", "--list", "v%s.*" % day).splitlines() if TAG_RE.match(t)]
+    nums = [tag_key(t)[3] for t in release_tags() if t.startswith("v%s." % day)]
     return "v%s.%d" % (day, max(nums, default=0) + 1)
 
 
-def prev_tag():
-    # с первого родителя: на HEAD тега ещё нет, а при перезапуске он уже есть —
-    # тогда describe с HEAD вернул бы его самого и список изменений вышел бы пустым
-    if not git("rev-parse", "-q", "--verify", "HEAD^", check=False):
-        return ""
-    return git("describe", "--tags", "--abbrev=0", "--match", TAG_GLOB, "HEAD^", check=False)
-
-
 def cmd_notes(tag, out):
-    prev = prev_tag()
-    rng = "%s..HEAD" % prev if prev else "HEAD"
-    log = git("log", "--no-merges", "--format=%h\t%s", rng).splitlines()
+    # Тег самого HEAD (перезапуск) не считаем: описание то же, что в первый раз.
+    # Изменения — коммиты, не вошедшие ни в один другой релиз: так они не
+    # повторяются при любой топологии merge (не только «первый родитель — main»).
+    own = head_tag()
+    others = [t for t in release_tags() if t != own]
+    exclude = ["--exclude", own] if own else []
+    prev = git("describe", "--tags", "--abbrev=0", "--match", TAG_GLOB, *exclude, "HEAD", check=False)
+    log = git("log", "--no-merges", "--format=%h\t%s", "HEAD", *(["--not"] + others if others else [])).splitlines()
     sha = git("rev-parse", "--short", "HEAD")
 
     lines = ["Сборка из `main`, коммит `%s`." % sha, "", "## Что изменилось", ""]
@@ -82,17 +99,23 @@ def cmd_notes(tag, out):
         "",
         "## Установка",
         "",
-        "**Windows.** Распакуйте архив и запустите `TrafficAnalyzer.exe`. Установщик Npcap "
-        "в релиз не входит — его лицензия не разрешает распространение. Для захвата трафика "
-        "(режим 5) установите Npcap с [npcap.com](https://npcap.com/#download) — программа "
-        "сама предложит открыть страницу загрузки. Остальные режимы работают без Npcap.",
+        "**Windows.** Распакуйте архив и запустите `TrafficAnalyzer.exe` — ничего "
+        "дополнительно ставить не нужно. Программа не подписана, поэтому при первом запуске "
+        "Windows может показать «Система Windows защитила ваш компьютер»: нажмите "
+        "«Подробнее» → «Выполнить в любом случае».",
+        "",
+        "Установщик Npcap в релиз не входит — его лицензия не разрешает распространение. "
+        "Для захвата трафика (режим 5) установите Npcap с [npcap.com](https://npcap.com/#download), "
+        "программа сама предложит открыть страницу загрузки. Бесплатная лицензия Npcap "
+        "ограничивает число установок — условия на npcap.com. Остальные режимы работают без Npcap.",
         "",
         "**macOS.** Распакуйте архив. Программа не подписана сертификатом Apple, поэтому "
-        "перед первым запуском снимите с неё карантин:",
+        "перед первым запуском снимите карантин с самой программы. В Терминале перейдите "
+        "в её папку: наберите `cd ` (с пробелом), перетащите папку TrafficAnalyzer из Finder "
+        "в окно Терминала и нажмите Enter. Затем:",
         "",
         "```",
-        "cd TrafficAnalyzer",
-        "xattr -dr com.apple.quarantine .",
+        "xattr -d com.apple.quarantine TrafficAnalyzer",
         "./TrafficAnalyzer",
         "```",
         "",
@@ -107,12 +130,15 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("version")
+    sub.add_parser("released")
     n = sub.add_parser("notes")
     n.add_argument("--tag", required=True)
     n.add_argument("--out", required=True)
     a = ap.parse_args()
     if a.cmd == "version":
         print(cmd_version())
+    elif a.cmd == "released":
+        print(cmd_released())
     else:
         cmd_notes(a.tag, a.out)
 

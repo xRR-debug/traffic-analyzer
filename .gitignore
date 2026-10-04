@@ -28,3 +28,6 @@ analyzer.ini
 
 # macOS
 .DS_Store
+
+# Python
+__pycache__/

@@ -286,13 +286,7 @@ static CURL* curlNew(long idleSec = 8) {
 static void curlRedirNoDowngrade(CURL* c, const std::string& url) {
     std::string scheme = url.substr(0, 8);
     for (auto& ch : scheme) ch = (char)tolower((unsigned char)ch);
-    const bool tls = scheme == "https://";
-#if LIBCURL_VERSION_NUM >= 0x075500   // 7.85: строковый вариант, битовая маска устарела
-    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, tls ? "https" : "http,https");
-#else
-    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS,
-                     tls ? (long)CURLPROTO_HTTPS : (long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
-#endif
+    curlRedirProtocols(c, scheme == "https://");
 }
 
 // headers — "Name: value", несколько через \r\n. body == nullptr — GET.
