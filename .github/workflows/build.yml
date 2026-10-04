@@ -1,5 +1,10 @@
-# Сборка под Windows и macOS + дымовой прогон синтетических дампов
-# (tools/gen_test_dumps.py → tools/ci_smoke.py: анализ доходит до конца без сбоев).
+# Сборка под Windows и macOS, дымовой прогон синтетических дампов
+# (tools/gen_test_dumps.py → tools/ci_smoke.py) и релиз.
+#
+# Каждый push в main (то есть merge PR) после зелёной сборки выпускает релиз
+# vГГГГ.ММ.ДД.N с архивами для Windows и macOS и описанием на русском — темами
+# коммитов с прошлого релиза (tools/release_notes.py). В PR тот же шаг строит
+# только предпросмотр описания (Summary запуска), а архивы лежат в артефактах.
 name: build
 
 on:
@@ -13,7 +18,8 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # в PR новая сборка отменяет старую; в main — нет: прерванный релиз хуже очереди
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   PYTHONUTF8: "1"   # кириллица в выводе скриптов на Windows
@@ -30,7 +36,9 @@ jobs:
       - uses: actions/checkout@v5
 
       # Файлов Npcap в репозитории нет (лицензия не разрешает распространять).
-      # SDK скачиваем с npcap.com и сверяем хеш.
+      # SDK нужен только для сборки — скачиваем с npcap.com и сверяем хеш.
+      # Установщик Npcap не вшивается: redist\npcap-installer.exe нет, и
+      # vcxproj собирает exe без него (программа отправит на npcap.com).
       - name: Npcap SDK
         shell: pwsh
         run: |
@@ -39,14 +47,6 @@ jobs:
           if ($h -ne $env:NPCAP_SDK_SHA256) { throw "npcap-sdk.zip: SHA256 $h, ожидался $env:NPCAP_SDK_SHA256" }
           Expand-Archive npcap-sdk.zip -DestinationPath npcap-sdk
           if (-not (Test-Path npcap-sdk/Lib/x64/wpcap.lib)) { throw "в архиве нет Lib/x64/wpcap.lib" }
-
-      # Установщик Npcap вшивается в exe через npcap.rc. Для проверки сборки
-      # хватает заглушки — поэтому собранный exe из CI не публикуется.
-      - name: Заглушка установщика Npcap
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force redist | Out-Null
-          Set-Content -Path redist/npcap-installer.exe -Value "CI placeholder" -NoNewline
 
       - uses: microsoft/setup-msbuild@v2
 
@@ -75,54 +75,160 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      - name: Архив
+        shell: pwsh
+        run: |
+          $d = "dist/TrafficAnalyzer"
+          New-Item -ItemType Directory -Force $d | Out-Null
+          Copy-Item x64/Release/TrafficAnalyzer.exe, analyzer.ini.example -Destination $d
+          Copy-Item packaging/README-windows.txt -Destination "$d/README.txt"
+          Compress-Archive -Path $d -DestinationPath dist/TrafficAnalyzer-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: dist/TrafficAnalyzer-windows-x64.zip
+          retention-days: 7
+          if-no-files-found: error
+
+  # Релизная сборка macOS: один универсальный бинарник arm64 + x86_64 для
+  # macOS 11+, GLFW вшит статически (TA_BUNDLED_GLFW) — Homebrew у
+  # пользователя не нужен. Прогон дампов — на arm64.
   macos:
-    name: macOS ${{ matrix.arch }}
-    runs-on: ${{ matrix.os }}
+    name: macOS universal
+    runs-on: macos-15
     timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-15
-            arch: arm64
-            smoke: true
-          - os: macos-15-intel
-            arch: x86_64
-            smoke: false           # анализ тот же, что на arm64; лишние запросы к ip-api ни к чему
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Сборка
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DTA_BUNDLED_GLFW=ON \
+                "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+          cmake --build build -j
+
+      - name: Проверка бинарника
+        run: |
+          b=build/TrafficAnalyzer
+          lipo "$b" -verify_arch arm64 x86_64
+          otool -L "$b"
+          if otool -L "$b" | grep -E '/opt/homebrew|/usr/local'; then
+            echo "::error::бинарник зависит от библиотек Homebrew — у пользователя их нет"
+            exit 1
+          fi
+          otool -l "$b" | grep -A4 LC_BUILD_VERSION | grep -E 'minos|platform' || true
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Синтетические дампы
+        run: |
+          pip install cryptography
+          python tools/gen_test_dumps.py testdumps
+
+      - name: Дымовой прогон
+        run: python tools/ci_smoke.py testdumps build/TrafficAnalyzer
+
+      - name: Отчёты прогона
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-macos
+          path: testdumps/reports/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Архив
+        run: |
+          d=dist/TrafficAnalyzer
+          mkdir -p "$d"
+          cp build/TrafficAnalyzer build/anime_bg.jpg build/analyzer.ini.example "$d/"
+          cp packaging/README-macos.txt "$d/README.txt"
+          ditto -c -k --keepParent "$d" dist/TrafficAnalyzer-macos-universal.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos
+          path: dist/TrafficAnalyzer-macos-universal.zip
+          retention-days: 7
+          if-no-files-found: error
+
+  # Intel: сборка так, как в README (GLFW из Homebrew), и запуск x86_64-половины
+  # релизного бинарника на настоящем Intel.
+  macos-intel:
+    name: macOS Intel
+    needs: macos
+    runs-on: macos-15-intel
+    timeout-minutes: 40
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
     steps:
       - uses: actions/checkout@v5
 
-      - name: Зависимости
-        run: brew install glfw     # cmake на раннере уже есть; libcurl и libpcap — из системы
-
-      - name: Сборка
+      - name: Сборка как в README (GLFW из Homebrew)
         run: |
+          brew install glfw        # cmake на раннере уже есть; libcurl и libpcap — из системы
           cmake -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-macos
+          path: dist
+
       - uses: actions/setup-python@v6
-        if: matrix.smoke
         with:
           python-version: "3.12"
 
-      - name: Синтетические дампы
-        if: matrix.smoke
+      - name: Релизный бинарник на x86_64
         run: |
+          ditto -x -k dist/TrafficAnalyzer-macos-universal.zip dist
           pip install cryptography
           python tools/gen_test_dumps.py testdumps
+          python tools/ci_smoke.py --quick testdumps dist/TrafficAnalyzer/TrafficAnalyzer
 
-      - name: Дымовой прогон
-        if: matrix.smoke
-        run: python tools/ci_smoke.py testdumps build/TrafficAnalyzer
-
-      - name: Отчёты прогона
-        if: always() && matrix.smoke
-        uses: actions/upload-artifact@v4
+  release:
+    name: Релиз
+    needs: [windows, macos, macos-intel]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
         with:
-          name: reports-macos-${{ matrix.arch }}
-          path: testdumps/reports/
-          retention-days: 7
-          if-no-files-found: ignore
+          fetch-depth: 0           # вся история и теги: описание — коммиты с прошлого релиза
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Версия, описание, контрольные суммы
+        id: rel
+        run: |
+          tag=$(python3 tools/release_notes.py version)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          python3 tools/release_notes.py notes --tag "$tag" --out notes.md
+          cd dist
+          for f in TrafficAnalyzer-*.zip; do mv "$f" "TrafficAnalyzer-$tag-${f#TrafficAnalyzer-}"; done
+          sha256sum TrafficAnalyzer-*.zip > SHA256SUMS.txt
+          ls -l
+          { echo "## Предпросмотр релиза $tag"; echo; cat ../notes.md; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Публикация
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          # перезапуск сборки того же коммита: тег уже стоит, релиз уже есть
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Релиз $TAG уже есть — пропускаю"
+            exit 0
+          fi
+          gh release create "$TAG" dist/* --target "$GITHUB_SHA" \
+            --title "TrafficAnalyzer $TAG" --notes-file notes.md

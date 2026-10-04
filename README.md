@@ -14,6 +14,9 @@
 - **Windows** — окно (Dear ImGui + DirectX 11) и консольное меню, один `.exe`.
 - **macOS** (Apple Silicon и Intel) — окно (GLFW + OpenGL 3) и консоль, сборка через CMake.
 
+Готовые сборки для обеих систем — во вкладке **Releases**: выпускаются
+автоматически на каждый merge в `main`, см. [CI и релизы](#ci-и-релизы).
+
 ---
 
 ## Содержание
@@ -189,11 +192,14 @@ API cheburcheck.ru не документирован официально и м�
 Файлов Npcap в репозитории нет (их лицензия не разрешает распространение),
 перед первой сборкой положите их сами:
 
-- **Npcap SDK** — скачайте с [npcap.com](https://npcap.com/#download)
+- **Npcap SDK** (обязательно) — скачайте с [npcap.com](https://npcap.com/#download)
   («Npcap SDK») и распакуйте в `npcap-sdk/`, чтобы получилось
   `npcap-sdk/Include/pcap.h` и `npcap-sdk/Lib/x64/wpcap.lib`;
-- **установщик Npcap** — скачайте с того же сайта и сохраните как
-  `redist/npcap-installer.exe`; он встраивается в `.exe` через `npcap.rc`.
+- **установщик Npcap** (по желанию) — скачайте с того же сайта и сохраните как
+  `redist/npcap-installer.exe`: тогда он вшивается в `.exe` через `npcap.rc`, и
+  в режиме захвата программа сама предложит установить Npcap. Без него `.exe`
+  собирается тоже, а программа предложит открыть страницу загрузки npcap.com —
+  так собираются релизы.
 
 Затем:
 
@@ -225,17 +231,50 @@ cmake --build build -j
 - Для захвата (режим 5) нужен доступ к `/dev/bpf*`: запуск через `sudo` или
   ChmodBPF (ставится вместе с Wireshark).
 
-### CI
+Релизная сборка для macOS — универсальный бинарник (Apple Silicon и Intel)
+для macOS 11+, которому не нужен Homebrew: GLFW собирается из исходников и
+вшивается статически.
+
+```bash
+cmake -B build -DTA_BUNDLED_GLFW=ON "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+```
+
+```bash
+cmake --build build -j
+```
+
+### CI и релизы
 
 GitHub Actions (`.github/workflows/build.yml`) на каждый PR и push в `main`:
 
-- собирает Windows x64 (Release) и macOS arm64 и Intel. Npcap SDK скачивается
-  с npcap.com со сверкой хеша, установщик Npcap заменён заглушкой — поэтому
-  `.exe` из CI не публикуется;
-- на Windows и macOS arm64 прогоняет синтетические дампы
-  (`tools/gen_test_dumps.py`) в пакетном режиме `--batch` через
-  `tools/ci_smoke.py`: анализ должен дойти до конца без сбоев. Отчёты прогона
-  лежат в артефактах сборки.
+- собирает Windows x64 (Release, без вшитого установщика Npcap; Npcap SDK
+  скачивается с npcap.com со сверкой хеша) и универсальный бинарник macOS;
+  на Intel-раннере дополнительно — сборка по инструкции выше (GLFW из Homebrew);
+- прогоняет синтетические дампы (`tools/gen_test_dumps.py`) в пакетном режиме
+  `--batch` через `tools/ci_smoke.py`: анализ должен дойти до конца без сбоев.
+  На Windows и macOS arm64 — все дампы, на Intel — `.pcap`, чтобы проверить
+  x86_64-половину универсального бинарника;
+- кладёт в артефакты сборки архивы программы и отчёты прогона.
+
+**Релиз выпускается сам на каждый push в `main`** (то есть на каждый merge PR),
+если сборка зелёная: вкладка Releases, тег `vГГГГ.ММ.ДД.N` (дата по Москве,
+N — номер релиза за день). В релизе:
+
+- `TrafficAnalyzer-<версия>-windows-x64.zip` — `TrafficAnalyzer.exe`,
+  `analyzer.ini.example`, `README.txt`;
+- `TrafficAnalyzer-<версия>-macos-universal.zip` — программа, `anime_bg.jpg`,
+  `analyzer.ini.example`, `README.txt`;
+- `SHA256SUMS.txt` — контрольные суммы.
+
+Описание релиза собирает `tools/release_notes.py`: темы коммитов (без
+merge-коммитов) с прошлого релиза и инструкция по установке. **Поэтому темы
+коммитов пишем по-русски** — они и есть список изменений. В PR тот же шаг
+показывает предпросмотр описания в Summary запуска, а публикует релиз только
+сборка `main`. Перезапуск сборки уже выпущенного коммита второй релиз не создаёт.
+
+Программа для macOS не подписана сертификатом Apple: перед первым запуском
+нужно снять карантин (`xattr -dr com.apple.quarantine .` в папке программы) —
+это написано в описании релиза и в `README.txt` архива.
 
 ---
 
@@ -300,9 +339,14 @@ gui/assets/           встроенная картинка фона
 analyzer.ini.example  пример настроек
 TrafficAnalyzer.vcxproj  сборка Windows
 CMakeLists.txt        сборка macOS
-npcap.rc              ресурсы: установщик Npcap, картинка фона
+npcap.rc              ресурсы: установщик Npcap (если есть), картинка фона
 npcap-sdk/            Npcap SDK (не в репозитории, см. «Сборка»)
-redist/               установщик Npcap (не в репозитории, см. «Сборка»)
+redist/               установщик Npcap (не в репозитории, по желанию, см. «Сборка»)
+packaging/            README.txt для архивов релиза (Windows, macOS)
+.github/workflows/    CI и релизы (build.yml)
+tools/                тестовые дампы (gen_test_dumps.py), их прогон
+                      (run_test_dumps.py, ci_smoke.py), описание релиза
+                      (release_notes.py)
 ```
 
 ---
@@ -319,8 +363,8 @@ redist/               установщик Npcap (не в репозитории
   не используется.
 - **[Npcap](https://npcap.com)** и Npcap SDK — собственная лицензия Npcap.
   Бесплатная лицензия не разрешает распространять установщик вместе со своей
-  программой без OEM-лицензии. Прежде чем публиковать сборки с вшитым
-  `npcap-installer.exe`, проверьте условия.
+  программой без OEM-лицензии, поэтому в релизы он не вшивается. Прежде чем
+  распространять свою сборку с вшитым `npcap-installer.exe`, проверьте условия.
 - **[GLFW](https://www.glfw.org)** (macOS) — zlib/libpng.
 - **libcurl** (macOS) — curl license.
 - **cheburcheck.ru, ip-api.com, ipwho.is, ipapi.is, Globalping** — внешние

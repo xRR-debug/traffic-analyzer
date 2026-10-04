@@ -41,6 +41,20 @@ void runCaptureMode() {
     if (!hWpcap) {
         printf("%sNpcap не установлен (wpcap.dll не найдена).%s\n\n", C::RED, C::RST);
         printf("Захват трафика требует драйвер Npcap.\n");
+        // Установщик (ресурс NPCAP_INSTALLER) вшит, только если при сборке лежал в
+        // redist\ (npcap.rc). В релизах из CI его нет: лицензия Npcap не разрешает
+        // распространять установщик — тогда отправляем на npcap.com.
+        // RT_RCDATA в Unicode-сборке — wchar_t*, поэтому для ...A берём MAKEINTRESOURCEA(10).
+        HRSRC hRes = FindResourceA(nullptr, "NPCAP_INSTALLER", MAKEINTRESOURCEA(10));
+        if (!hRes) {
+            printf("Скачайте установщик с https://npcap.com/#download («Npcap ... installer»),\n"
+                   "установите его, затем снова выберите режим 5.\n\n");
+            printf("Открыть страницу загрузки? (y/n): ");
+            std::string ans; std::getline(std::cin, ans);
+            if (isYesAnswer(ans))
+                ShellExecuteA(nullptr, "open", "https://npcap.com/#download", nullptr, nullptr, SW_SHOWNORMAL);
+            return;
+        }
         printf("Установщик Npcap встроен в эту программу.\n\n");
         printf("Установить сейчас? (y/n): ");
         std::string ans; std::getline(std::cin, ans);
@@ -48,10 +62,7 @@ void runCaptureMode() {
             printf("Отменено. Можно установить Npcap вручную с https://npcap.com\n");
             return;
         }
-        // извлекаем встроенный установщик (ресурс NPCAP_INSTALLER) во временный файл.
-        // RT_RCDATA в Unicode-сборке — wchar_t*, поэтому для ...A берём MAKEINTRESOURCEA(10).
-        HRSRC hRes = FindResourceA(nullptr, "NPCAP_INSTALLER", MAKEINTRESOURCEA(10));
-        if (!hRes) { printf("%sРесурс установщика не найден в exe.%s\n", C::RED, C::RST); return; }
+        // извлекаем встроенный установщик во временный файл
         HGLOBAL hData = LoadResource(nullptr, hRes);
         DWORD sz = SizeofResource(nullptr, hRes);
         void* p = LockResource(hData);

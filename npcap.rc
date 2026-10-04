@@ -1,7 +1,12 @@
 // Ресурс: установщик Npcap, вшитый в exe.
-// При сборке npcap-installer.exe из папки redist встраивается в бинарник.
+// Вшивается, только если при сборке есть redist\npcap-installer.exe:
+// TrafficAnalyzer.vcxproj тогда определяет NPCAP_EMBED. Без него (релизы из
+// CI — лицензия Npcap не разрешает распространять установщик) программа
+// в режиме захвата отправляет на npcap.com.
 // В коде извлекается по имени "NPCAP_INSTALLER" типа RCDATA.
+#ifdef NPCAP_EMBED
 NPCAP_INSTALLER RCDATA "redist\\npcap-installer.exe"
+#endif
 
 // Картинка на фон окна для темы «Аниме» (gui_main.cpp, по имени "ANIME_BG").
 // JPEG, а не WebP: кодека WebP нет в LTSC/Server-сборках Windows.

@@ -77,6 +77,12 @@
       <DelayLoadDLLs>wpcap.dll;Packet.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
     </Link>
   </ItemDefinitionGroup>
+  <!-- установщик Npcap вшивается, только если он лежит в redist\ (см. npcap.rc) -->
+  <ItemDefinitionGroup Condition="Exists('$(MSBuildProjectDirectory)\redist\npcap-installer.exe')">
+    <ResourceCompile>
+      <PreprocessorDefinitions>NPCAP_EMBED;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ResourceCompile>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="analyzer.cpp" />
     <ClCompile Include="detector_dpi.cpp" />
