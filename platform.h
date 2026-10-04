@@ -128,4 +128,21 @@ inline int gmtime_s(struct tm* out, const time_t* t) { return gmtime_r(t, out) ?
 #define _stricmp  strcasecmp
 #define _strnicmp strncasecmp
 
+// --- libcurl ---
+// На какие протоколы разрешён редирект. По версии curl.h не судим: релиз
+// собирается с новым SDK (curl 8), а системный libcurl на macOS 11–12 старше
+// 7.85 и опцию _STR не знает (CURLE_UNKNOWN_OPTION) — тогда битовая маска.
+// Иначе ограничение молча не действовало бы.
+inline void curlRedirProtocols(CURL* c, bool httpsOnly) {
+#if LIBCURL_VERSION_NUM >= 0x075500
+    if (curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, httpsOnly ? "https" : "http,https") == CURLE_OK)
+        return;
+#endif
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS,
+                     httpsOnly ? (long)CURLPROTO_HTTPS : (long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#pragma clang diagnostic pop
+}
+
 #endif

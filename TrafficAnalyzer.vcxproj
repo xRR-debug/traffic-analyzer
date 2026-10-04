@@ -64,6 +64,9 @@
       <Optimization>MaxSpeed</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
+      <!-- статический CRT (/MT): exe запускается без VC++ Redistributable, в т.ч. там,
+           где стоит старый (std::mutex из STL v145 падает со старым msvcp140.dll) -->
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <AdditionalIncludeDirectories>$(ProjectDir)npcap-sdk\Include;$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>

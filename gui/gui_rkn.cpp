@@ -412,11 +412,7 @@ int httpsGetStream(const std::string& path, const char* accept, int idleMs,
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5L);
     // редирект только на https — как WinHTTP, который не уходит с https на http
-#if LIBCURL_VERSION_NUM >= 0x075500
-    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "https");
-#else
-    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS, (long)CURLPROTO_HTTPS);
-#endif
+    curlRedirProtocols(c, true);
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, hl);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlSink);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &ctx);
