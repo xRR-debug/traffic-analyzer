@@ -9,7 +9,10 @@
 # в минуту. Сеть для проверки не обязательна: без ответа ip-api отчёт просто
 # выходит без ASN.
 #
-# Запуск: python ci_smoke.py каталог_дампов путь_к_программе
+# --quick — только .pcap в режиме 2: проверить, что сборка вообще запускается и
+# анализирует (например, x86_64-половина универсального бинарника macOS).
+#
+# Запуск: python ci_smoke.py [--quick] каталог_дампов путь_к_программе
 
 import glob
 import os
@@ -46,20 +49,24 @@ def run(exe, dumps, path, mode, out):
 
 def main():
     sys.stdout.reconfigure(encoding="utf-8")   # консоль CI на Windows — не UTF-8
-    if len(sys.argv) != 3:
-        print("Запуск: python ci_smoke.py каталог_дампов путь_к_программе")
+    argv = sys.argv[1:]
+    quick = "--quick" in argv
+    argv = [a for a in argv if a != "--quick"]
+    if len(argv) != 2:
+        print("Запуск: python ci_smoke.py [--quick] каталог_дампов путь_к_программе")
         return 2
-    dumps, exe = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])
+    dumps, exe = os.path.abspath(argv[0]), os.path.abspath(argv[1])
     rep = os.path.join(dumps, "reports")
     os.makedirs(rep, exist_ok=True)
+    exts = (".pcap",) if quick else (".txt", ".pcap", ".pcapng")
     files = sorted(f for f in glob.glob(os.path.join(dumps, "*"))
-                   if f.endswith((".txt", ".pcap", ".pcapng")) and not f.endswith("README.txt"))
+                   if f.endswith(exts) and not f.endswith("README.txt"))
     if not files:
         print("Нет дампов в " + dumps)
         return 2
     runs, failed = 0, []
     for f in files:
-        for mode in ((1, 2) if f.endswith(".pcap") else (2,)):
+        for mode in ((1, 2) if f.endswith(".pcap") and not quick else (2,)):
             name = "%s.m%d" % (os.path.basename(f), mode)
             t0 = time.time()
             why = run(exe, dumps, f, mode, os.path.join(rep, name + ".txt"))

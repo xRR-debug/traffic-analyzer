@@ -6,6 +6,12 @@
 #   cmake --build build -j
 #   ./build/TrafficAnalyzer              # окно
 #   ./build/TrafficAnalyzer --console    # консольное меню
+#
+# Релизная сборка (как в CI): универсальный бинарник arm64 + x86_64 для
+# macOS 11+, GLFW вшит — Homebrew не нужен:
+#   cmake -B build -DTA_BUNDLED_GLFW=ON "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" \
+#         -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+#   cmake --build build -j
 cmake_minimum_required(VERSION 3.20)
 project(TrafficAnalyzer LANGUAGES C CXX)
 
@@ -44,10 +50,33 @@ endforeach()
 
 # --- зависимости ----------------------------------------------------------
 find_package(CURL REQUIRED)                 # libcurl из macOS SDK
-find_package(glfw3 3.3 QUIET)               # brew install glfw
-if(NOT glfw3_FOUND)
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(GLFW REQUIRED IMPORTED_TARGET glfw3)
+
+# GLFW: по умолчанию из Homebrew (brew install glfw) — программа тогда работает
+# только там, где он установлен. TA_BUNDLED_GLFW=ON собирает GLFW из исходников
+# статически, той же архитектуры и минимальной версии macOS, что и программа:
+# так собираются релизы (универсальный бинарник без Homebrew).
+option(TA_BUNDLED_GLFW "GLFW из исходников, статически (для релизов)" OFF)
+if(TA_BUNDLED_GLFW)
+  include(FetchContent)
+  set(GLFW_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(GLFW_INSTALL        OFF CACHE BOOL "" FORCE)
+  set(GLFW_LIBRARY_TYPE   STATIC CACHE STRING "" FORCE)
+  FetchContent_Declare(glfw
+    URL      https://github.com/glfw/glfw/releases/download/3.4/glfw-3.4.zip
+    URL_HASH SHA256=b5ec004b2712fd08e8861dc271428f048775200a2df719ccf575143ba749a3e9)
+  FetchContent_MakeAvailable(glfw)
+  set(GLFW_TARGET glfw)
+else()
+  find_package(glfw3 3.3 QUIET)             # brew install glfw
+  if(glfw3_FOUND)
+    set(GLFW_TARGET glfw)
+  else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(GLFW REQUIRED IMPORTED_TARGET glfw3)
+    set(GLFW_TARGET PkgConfig::GLFW)
+  endif()
 endif()
 
 # --- программа ------------------------------------------------------------
@@ -86,12 +115,6 @@ target_compile_definitions(TrafficAnalyzer PRIVATE
   HAVE_NPCAP                # захват (режим 5) — через системный libpcap
   GL_SILENCE_DEPRECATION    # OpenGL на macOS помечен устаревшим, но работает
 )
-
-if(glfw3_FOUND)
-  set(GLFW_TARGET glfw)
-else()
-  set(GLFW_TARGET PkgConfig::GLFW)
-endif()
 
 target_link_libraries(TrafficAnalyzer PRIVATE
   CURL::libcurl
