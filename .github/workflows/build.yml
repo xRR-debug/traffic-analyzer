@@ -1,0 +1,128 @@
+# Сборка под Windows и macOS + дымовой прогон синтетических дампов
+# (tools/gen_test_dumps.py → tools/ci_smoke.py: анализ доходит до конца без сбоев).
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: "1"   # кириллица в выводе скриптов на Windows
+
+jobs:
+  windows:
+    name: Windows x64 (Release)
+    runs-on: windows-2025          # Visual Studio 2026: toolset v145, как у Release в vcxproj
+    timeout-minutes: 40
+    env:
+      NPCAP_SDK_VERSION: "1.16"
+      NPCAP_SDK_SHA256: f0a8be7778ee3ae1b99bbbecb27a3ff0f6c111a4093f1c78c5c5a099607184db
+    steps:
+      - uses: actions/checkout@v5
+
+      # Файлов Npcap в репозитории нет (лицензия не разрешает распространять).
+      # SDK скачиваем с npcap.com и сверяем хеш.
+      - name: Npcap SDK
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://npcap.com/dist/npcap-sdk-$env:NPCAP_SDK_VERSION.zip" -OutFile npcap-sdk.zip
+          $h = (Get-FileHash npcap-sdk.zip -Algorithm SHA256).Hash
+          if ($h -ne $env:NPCAP_SDK_SHA256) { throw "npcap-sdk.zip: SHA256 $h, ожидался $env:NPCAP_SDK_SHA256" }
+          Expand-Archive npcap-sdk.zip -DestinationPath npcap-sdk
+          if (-not (Test-Path npcap-sdk/Lib/x64/wpcap.lib)) { throw "в архиве нет Lib/x64/wpcap.lib" }
+
+      # Установщик Npcap вшивается в exe через npcap.rc. Для проверки сборки
+      # хватает заглушки — поэтому собранный exe из CI не публикуется.
+      - name: Заглушка установщика Npcap
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force redist | Out-Null
+          Set-Content -Path redist/npcap-installer.exe -Value "CI placeholder" -NoNewline
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Сборка
+        shell: pwsh
+        run: msbuild TrafficAnalyzer.vcxproj /m /nologo /p:Configuration=Release /p:Platform=x64 /p:SolutionDir=$env:GITHUB_WORKSPACE\
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Синтетические дампы
+        run: |
+          pip install cryptography
+          python tools/gen_test_dumps.py testdumps
+
+      - name: Дымовой прогон
+        run: python tools/ci_smoke.py testdumps x64/Release/TrafficAnalyzer.exe
+
+      - name: Отчёты прогона
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-windows
+          path: testdumps/reports/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+            smoke: true
+          - os: macos-15-intel
+            arch: x86_64
+            smoke: false           # анализ тот же, что на arm64; лишние запросы к ip-api ни к чему
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Зависимости
+        run: brew install glfw     # cmake на раннере уже есть; libcurl и libpcap — из системы
+
+      - name: Сборка
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+
+      - uses: actions/setup-python@v6
+        if: matrix.smoke
+        with:
+          python-version: "3.12"
+
+      - name: Синтетические дампы
+        if: matrix.smoke
+        run: |
+          pip install cryptography
+          python tools/gen_test_dumps.py testdumps
+
+      - name: Дымовой прогон
+        if: matrix.smoke
+        run: python tools/ci_smoke.py testdumps build/TrafficAnalyzer
+
+      - name: Отчёты прогона
+        if: always() && matrix.smoke
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-macos-${{ matrix.arch }}
+          path: testdumps/reports/
+          retention-days: 7
+          if-no-files-found: ignore

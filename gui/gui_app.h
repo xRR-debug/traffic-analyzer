@@ -95,7 +95,7 @@ struct FlowEvent {
     bool out = false;              // от абонента
     bool serverId = false;         // RST от сервера: IP ID продолжает его счётчик, TTL тот же
     // RST от сервера, как rstBurst / inAfterRst в buildTcpConnTable: RST в пачке
-    // (без копий захвата — тот же IP ID за единицы мкс) и входящих не-RST за 2 с после
+    // (без копий захвата — тот же IP ID и seq за единицы мкс) и входящих не-RST за 2 с после
     // него (без отправленных сервером раньше RST — IP ID меньше)
     int burst = 0, afterRst = 0;
 };
