@@ -1025,7 +1025,7 @@ static bool isOperatorPrivateHop(const std::string& addr) {
     if (addr.size() < 8 || addr.size() > 15) return false;
     if (addr.compare(0, 3, "10.") != 0) return false;
     unsigned a = 0, b = 0, c = 0;
-    if (sscanf_s(addr.c_str(), "10.%u.%u.%u", &a, &b, &c) != 3) return false;
+    if (sscanf(addr.c_str(), "10.%u.%u.%u", &a, &b, &c) != 3) return false;
     return a <= 255 && b <= 255 && c <= 255;
 }
 
@@ -2106,7 +2106,7 @@ void runPortScanMode() {
         ports = cfg().scanTopPorts;
         modeLabel = "TOP (частые)";
     } else if (rng.find('-') != std::string::npos && rng.find(',') == std::string::npos) {
-        int a=0,b=0; sscanf_s(rng.c_str(), "%d-%d", &a, &b);
+        int a=0,b=0; sscanf(rng.c_str(), "%d-%d", &a, &b);
         if (a<1) a=1; if (b>65535) b=65535;
         if (a<=b) for (int p=a;p<=b;p++) ports.push_back(p);
         else { std::cout << "Пустой диапазон.\n"; return; }
@@ -2426,14 +2426,14 @@ void runDpiLocatorMode() {
     }
 
     // 3) поиск участка: CH с растущим TTL, первый RST = фильтр
-    const int MAXTTL = 30;
+    const int kMaxTtl = 30;   // не MAXTTL: это макрос из <netinet/ip.h> (macOS)
     int blockTtl = -1;          // TTL, на котором впервые пришёл RST
     std::string blockHop;       // ближайший видимый хоп на этом TTL
     bool reachedServer = false; // CH прошёл, и сервер ответил
     int noTcpStreak = 0;
 
     printf("  %-4s %-16s %-22s %s\n", "TTL", "ХОП (ICMP)", "TLS-РЕАКЦИЯ", "ВЕРДИКТ");
-    for (int ttl = 1; ttl <= MAXTTL && !g_traceAbort; ttl++) {
+    for (int ttl = 1; ttl <= kMaxTtl && !g_traceAbort; ttl++) {
         std::string hopIp = icmpHopAtTtl(ip, ttl);
         DpiProbe r = dpiTlsProbe(ip, PORT, ch, chLen, ttl, PROBE_TO);
 
