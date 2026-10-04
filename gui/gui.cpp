@@ -1649,7 +1649,8 @@ int wfRstForged(const FlowRow& r, size_t i, const WfInfo& w, std::vector<std::st
         add(2, "после RST сервер прислал ещё " + std::to_string(e.afterRst) +
                " пакет(ов) — сам он соединение не сбрасывал");
     if (e.burst >= 2) add(1, std::to_string(e.burst) + " RST подряд за 200 мс");
-    if (e.serverId && score > 0)
+    // как в connForgedRst: сервер слал и после RST — IP ID подобран, не вычитаем
+    if (e.serverId && score > 0 && e.afterRst < 2)
         add(-2, "но IP ID продолжает счётчик сервера и TTL тот же — похоже на RST самого сервера");
     return std::max(score, 0);
 }

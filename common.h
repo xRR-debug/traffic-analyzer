@@ -289,11 +289,13 @@ inline bool ipIdBefore(int id, int ref) {
     return d >= 1 && d <= 64;
 }
 
-// Пакет с тем же IP ID, что и предыдущий, через dtUs — копия захвата: один
+// Пакет с тем же IP ID и seq, что и предыдущий, через dtUs — копия захвата: один
 // пакет снят дважды в одном файле (единицы мкс; копии из двух файлов loadDumpSet
-// уже убрал). Позже — настоящий повтор: инжектор шлёт одинаковые RST пачкой
-inline bool ipIdCaptureCopy(int id, int prevId, long long dtUs) {
-    return id > 0 && id == prevId && dtUs >= 0 && dtUs < 20;
+// уже убрал). Позже — настоящий повтор: инжектор шлёт одинаковые RST пачкой.
+// seq обязателен: пачку RST с РАЗНЫМИ seq инжектор шлёт подряд, за доли мкс,
+// и IP ID у неё бывает один на всех (константа инжектора)
+inline bool ipIdCaptureCopy(int id, int prevId, long long seq, long long prevSeq, long long dtUs) {
+    return id > 0 && id == prevId && seq == prevSeq && dtUs >= 0 && dtUs < 20;
 }
 
 // UDP-сессия (один 4-tuple), где сервер отвечал, а потом замолчал насовсем,

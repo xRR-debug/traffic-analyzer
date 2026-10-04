@@ -98,8 +98,9 @@ struct WfBuild {
     int rstEv = -1;                      // событие последнего входящего RST
     long long rstUs = -1;
     int rstId = -1;
-    long long rstLastUs = -1;            // последний входящий RST (любой): время и IP ID
+    long long rstLastUs = -1;            // последний входящий RST (любой): время, IP ID и seq
     int rstLastId = -1;
+    long long rstLastSeq = -1;
     bool inRst = false;                  // входящий RST уже был
 };
 
@@ -164,8 +165,8 @@ void wfAdd(FlowRow& r, WfBuild& b, const Packet& p, bool out, long long rel) {
         }
         b.inRst = true;
         // одинаковые RST от инжектора — пачка; копия захвата — нет
-        const bool copy = ipIdCaptureCopy(p.ipId, b.rstLastId, rel - b.rstLastUs);
-        b.rstLastUs = rel; b.rstLastId = p.ipId;
+        const bool copy = ipIdCaptureCopy(p.ipId, b.rstLastId, p.seqStart, b.rstLastSeq, rel - b.rstLastUs);
+        b.rstLastUs = rel; b.rstLastId = p.ipId; b.rstLastSeq = p.seqStart;
         if (repeatOfLast(FE_RST, kWfRstBurstUs)) {
             if (b.rstEv == b.lastPoint && !copy) r.wf[(size_t)b.rstEv].burst++;
             return;

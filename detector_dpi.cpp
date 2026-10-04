@@ -373,7 +373,8 @@ int connTtlInjection(const TcpConnState& c, int& ref, const char*& refWhat) {
 //   −2 IP ID у RST продолжает счётчик сервера при том же TTL — скорее всего,
 //      RST послал сам сервер (инъекция по пути счётчика не знает). Только −2,
 //      а не «не подделка»: совпасть может и случайно (общий счётчик у сервера,
-//      инжектор, копирующий ID), и сильные признаки выше это перевесят.
+//      инжектор, копирующий ID). Не вычитается, если сервер слал и после RST:
+//      сам пославший RST сервер дальше молчит, значит, IP ID подобран.
 // why (необязательно) — человекочитаемые причины.
 static int connForgedRst(const TcpConnState& c, std::vector<std::string>* why = nullptr) {
     if (!c.inRst) return 0;
@@ -405,9 +406,10 @@ static int connForgedRst(const TcpConnState& c, std::vector<std::string>* why = 
     if (c.rstBurst >= 2)
         add(1, std::to_string(c.rstBurst) + " RST подряд за 200 мс");
     // IP ID продолжает счётчик сервера, TTL тот же — инъекция по пути счётчика
-    // не знает, так что это почти наверняка RST самого сервера. Не обнуляем:
-    // RST быстрее RTT или данные после RST всё равно перевесят
-    if (c.rstServerId && score > 0)
+    // не знает, так что это почти наверняка RST самого сервера. Но если сервер
+    // слал и после RST (пакеты, отправленные раньше RST, inAfterRst уже отсеял),
+    // RST послал не он — IP ID подобран, и −2 погасило бы самый сильный признак
+    if (c.rstServerId && score > 0 && c.inAfterRst < 2)
         add(-2, "но IP ID продолжает счётчик сервера и TTL тот же — похоже на RST самого сервера");
     return std::max(score, 0);
 }
@@ -1752,8 +1754,8 @@ std::vector<BlockReason> collectBlockReasons(
     struct U : UdpTunnelStat { bool quic = false; std::string sni; };
     std::map<std::string, U> uc;
     // UDP-сессия по 4-tuple, оборвавшаяся со стороны сервера (UdpSessStat).
-    // Туннели — правило выше
-    struct Sess : UdpSessStat { int rport = 0; bool quic = false; };
+    // Туннель без ответов — правило выше; работавший и замолчавший — здесь
+    struct Sess : UdpSessStat { int rport = 0, lport = 0; bool quic = false; };
     std::map<std::string, Sess> sess;       // "ip|rport|lport"
     long long lastInAny = -1;               // последний входящий пакет любого протокола
     bool anyInboundUdp = false;
@@ -1775,7 +1777,7 @@ std::vector<BlockReason> collectBlockReasons(
         u.add(p, sLoc, absT[i], rport, lport, ipInfoOf(ipCache, ip));
         if (absT[i] >= 0) {
             Sess& s = sess[ip + "|" + std::to_string(rport) + "|" + std::to_string(lport)];
-            s.rport = rport;
+            s.rport = rport; s.lport = lport;
             s.add(sLoc, absT[i]);
             if (sLoc && (p.quic || rport == 443)) s.quic = true;
         }
@@ -1809,9 +1811,16 @@ std::vector<BlockReason> collectBlockReasons(
             const long long silence = s.silenceUs();
             const std::string ip = kv.first.substr(0, kv.first.find('|'));
             auto ut = uc.find(ip);
-            if (ut != uc.end() && ut->second.kind) continue;   // туннель — правило выше
-            snprintf(b, sizeof(b), "UDP-сессия: сервер ответил %lld раз, затем замолчал; абонент "
+            // туннель «почти без ответов» уже выведен правилом выше (UDP_DROP). Туннель,
+            // который работал и замолчал, под него не попадает (ответов > 2) — он здесь
+            if (ut != uc.end() && ut->second.kind && udpTunnelStarved(ut->second)) continue;
+            // название туннеля — только если опознан по порту этой же сессии
+            const char* tun = (ut != uc.end() && ut->second.kind &&
+                               (ut->second.kindPort == s.rport || ut->second.kindPort == s.lport))
+                              ? ut->second.kind : nullptr;
+            snprintf(b, sizeof(b), "%s%s: сервер ответил %lld раз, затем замолчал; абонент "
                      "ещё %.0f с слал на порт %d (%lld пак.) — ответов нет",
+                     tun ? tun : "UDP-сессия", tun ? " (туннель)" : "",
                      s.in, silence / 1e6, s.rport, s.outAfter);
             put(ipName(ip), ip, "UDP_SESSION", b);
         }
