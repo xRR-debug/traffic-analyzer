@@ -225,6 +225,18 @@ cmake --build build -j
 - Для захвата (режим 5) нужен доступ к `/dev/bpf*`: запуск через `sudo` или
   ChmodBPF (ставится вместе с Wireshark).
 
+### CI
+
+GitHub Actions (`.github/workflows/build.yml`) на каждый PR и push в `main`:
+
+- собирает Windows x64 (Release) и macOS arm64 и Intel. Npcap SDK скачивается
+  с npcap.com со сверкой хеша, установщик Npcap заменён заглушкой — поэтому
+  `.exe` из CI не публикуется;
+- на Windows и macOS arm64 прогоняет синтетические дампы
+  (`tools/gen_test_dumps.py`) в пакетном режиме `--batch` через
+  `tools/ci_smoke.py`: анализ должен дойти до конца без сбоев. Отчёты прогона
+  лежат в артефактах сборки.
+
 ---
 
 ## Запуск
