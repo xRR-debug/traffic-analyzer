@@ -72,6 +72,17 @@ struct TcpConnState {
     std::string httpHost;             // Host: первого запроса
     int httpStatus = 0;               // код первого ответа
     std::string httpLocation, httpBlockMark;
+    // mTLS (открытое рукопожатие TLS 1.2, Packet::tlsHs): сервер запросил
+    // сертификат клиента — что прислал абонент и как ответил сервер
+    bool certReq = false;             // от сервера был CertificateRequest
+    int clientCert = -1;              // Certificate абонента: 0 пустой, 1 с сертификатом, -1 не было
+    bool outCcs = false, inCcs = false;   // ChangeCipherSpec абонента / сервера
+    int tlsAlertIn = -1;              // открытый Alert сервера (код), -1 — не было
+    long long reqTime = -1, reqSeqEnd = -1;   // первый запрос абонента после рукопожатия
+    long long reqAckTime = -1;        // сервер подтвердил (ACK) этот запрос
+    long long respTime = -1;          // первые данные сервера после запроса
+    long long inAppBytes = 0;         // данные сервера после его ChangeCipherSpec
+    long long finOutTime = -1, finInTime = -1;   // первый FIN абонента / сервера
 };
 struct TcpConnTable {
     std::map<std::string, TcpConnState> conns;   // ключ "rip|rport|lport"

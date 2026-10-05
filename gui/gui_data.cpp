@@ -326,6 +326,26 @@ void buildFlows(Dataset& ds) {
             if (!out && rel > lastInAny) lastInAny = rel;
             if (p.proto == "UDP") us[ins.first->second].add(out, rel);
         }
+        if (p.proto == "TCP" && (p.tlsHs || r.certReq)) {
+            // mTLS: запрос сертификата клиента и что было дальше (как в buildTcpConnTable)
+            const bool rst = p.flags.find('R') != std::string::npos;
+            if (out) {
+                if (p.tlsHs & TLSHS_CERT) r.clientCert = 1;
+                else if (p.tlsHs & TLSHS_CERT_EMPTY) r.clientCert = 0;
+                if (p.tlsHs & TLSHS_CCS) r.outCcs = true;
+                else if (r.certReq && r.outCcs && r.mtlsReqUs < 0 && rel >= 0 && p.length > 1 && !rst &&
+                         p.flags.find('S') == std::string::npos)
+                    r.mtlsReqUs = rel;
+            } else {
+                if (p.tlsHs & TLSHS_CERT_REQ) r.certReq = true;
+                if ((p.tlsHs & TLSHS_ALERT) && r.tlsAlertIn < 0) r.tlsAlertIn = p.tlsAlert;
+                if (r.inCcs && p.length > 0 && !rst) {
+                    r.inAppBytes += p.length;
+                    if (r.mtlsReqUs >= 0 && r.mtlsRespUs < 0) r.mtlsRespUs = rel;
+                }
+                if (p.tlsHs & TLSHS_CCS) r.inCcs = true;
+            }
+        }
         if (out && !p.httpHost.empty() && r.httpHost.empty()) {
             r.httpHost = p.httpHost;
             r.httpReqUs = rel;
@@ -419,11 +439,16 @@ void buildFlows(Dataset& ds) {
             r.state = FS_OK;
         }
         if (!r.httpBlockMark.empty()) r.problem = true;   // страница-заглушка о блокировке
+        // сервер требует сертификат клиента (TLS_CLIENT_CERT) — не блокировка, но
+        // приложение с ним не работает
+        r.certProblem = clientCertProblem(r.certReq, r.clientCert, r.tlsAlertIn, r.inAppBytes);
+        if (r.certProblem) r.problem = true;
 
         r.search = lowerAscii(r.proto + " " + r.localIp + ":" + std::to_string(r.localPort) +
                               " " + r.remoteIp + ":" + std::to_string(r.remotePort) + " " +
                               r.sni + " " + r.httpHost + " " + r.dnsName + " " + r.app + " " +
-                              r.tlsClient + " " + r.ja4 + " " + r.dnsCname + " " + r.msBg);
+                              r.tlsClient + " " + r.ja4 + " " + r.dnsCname + " " + r.msBg +
+                              (r.certReq ? " mtls" : ""));
     }
     std::sort(rows.begin(), rows.end(), [](const FlowRow& a, const FlowRow& b) {
         return a.bytesIn + a.bytesOut > b.bytesIn + b.bytesOut;

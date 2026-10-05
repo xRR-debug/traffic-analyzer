@@ -1599,7 +1599,28 @@ static const ReasonDef kReasonDefs[] = {
       "игра в это время выдаёт ошибку подключения. Это не блокировка по реестру: ответы "
       "теряются дальше по пути (CGNAT, транзит) или сервер сбросил сессию. Проверить с "
       "другим внешним адресом / без CGNAT.", false },
+    { "TLS_CLIENT_CERT", 8, "Сервер требует сертификат клиента (mTLS)",
+      "Это не блокировка и не проблема сети: соединение и TLS-рукопожатие проходят, но "
+      "сервер запрашивает сертификат клиента, а устройство его не предъявило (или сервер "
+      "его отверг) — поэтому сервер отвечает ошибкой или с задержкой, и приложение "
+      "закрывает соединение. Нужен сертификат от владельца сервиса (брокер, банк, "
+      "корпоративный доступ): установить его в приложение/на устройство или обратиться в "
+      "поддержку сервиса. Распознаётся только в TLS 1.2 — в TLS 1.3 запрос зашифрован.", false },
 };
+static const char* tlsAlertName(int a) {
+    switch (a) {
+    case 40: return "handshake_failure (40)";
+    case 42: return "bad_certificate (42)";
+    case 43: return "unsupported_certificate (43)";
+    case 44: return "certificate_revoked (44)";
+    case 45: return "certificate_expired (45)";
+    case 46: return "certificate_unknown (46)";
+    case 48: return "unknown_ca (48)";
+    case 49: return "access_denied (49)";
+    case 116: return "certificate_required (116)";
+    default: return "Alert";
+    }
+}
 static const ReasonDef* reasonDef(const std::string& code) {
     for (const auto& d : kReasonDefs) if (code == d.code) return &d;
     return nullptr;
@@ -1673,6 +1694,7 @@ std::vector<BlockReason> collectBlockReasons(
     std::map<std::string, SynAgg> synDrop;
     struct FrzAgg { std::vector<const TcpConnState*> c; long long silence = 0; };
     std::map<std::string, FrzAgg> frz;
+    std::map<std::string, std::vector<const TcpConnState*>> mtls;   // имя -> соединения mTLS без сертификата
 
     for (const auto& kv : tt.conns) {
         const TcpConnState& c = kv.second;
@@ -1727,6 +1749,63 @@ std::vector<BlockReason> collectBlockReasons(
         if (c.serverBytes >= 200 && fz < 0 && c.httpBlockMark.empty() && !forged) {
             worked.insert(name); workedIp.insert(c.ip);
         }
+        if (clientCertProblem(c.certReq, c.clientCert, c.tlsAlertIn, c.inAppBytes))
+            mtls[name].push_back(&c);
+    }
+    // mTLS: сервер требует сертификат клиента, устройство его не предъявило.
+    // Сеть при этом работает (рукопожатие прошло, сервер подтверждает запрос
+    // сразу), поэтому в детали — за сколько сервер подтвердил и за сколько ответил
+    for (const auto& kv : mtls) {
+        const auto& v = kv.second;
+        int empty = 0, req = 0, answered = 0, acked = 0, clientFin = 0, alert = -1;
+        double rMin = -1, rMax = -1, ackMax = -1;
+        for (const TcpConnState* c : v) {
+            if (c->clientCert == 0) empty++;
+            if (alert < 0 && tlsAlertCertReject(c->tlsAlertIn)) alert = c->tlsAlertIn;
+            if (c->reqTime >= 0) {
+                req++;
+                if (c->respTime >= c->reqTime) {
+                    answered++;
+                    const double s = (c->respTime - c->reqTime) / 1e6;
+                    if (rMin < 0 || s < rMin) rMin = s;
+                    if (s > rMax) rMax = s;
+                }
+                if (c->reqAckTime >= c->reqTime) {
+                    acked++;
+                    ackMax = std::max(ackMax, (c->reqAckTime - c->reqTime) / 1000.0);
+                }
+            }
+            if (c->finOutTime >= 0 && !c->inRst && (c->finInTime < 0 || c->finOutTime <= c->finInTime))
+                clientFin++;
+        }
+        const int n = (int)v.size();
+        std::string d = "TLS 1.2: сервер запросил сертификат клиента (CertificateRequest), ";
+        if (empty == n) snprintf(b, sizeof(b), "устройство прислало пустой — соединений: %d", n);
+        else if (empty == 0) snprintf(b, sizeof(b), "сертификат устройства сервер отверг — соединений: %d", n);
+        else snprintf(b, sizeof(b), "устройство прислало пустой (%d) или сервер его отверг (%d)", empty, n - empty);
+        d += b;
+        if (alert >= 0) d += std::string("; сервер ответил ошибкой TLS: ") + tlsAlertName(alert);
+        if (req > 0) {
+            if (answered > 0) {
+                if (rMax - rMin < 0.05) snprintf(b, sizeof(b), "; ответ на запрос через %.1f с", rMax);
+                else snprintf(b, sizeof(b), "; ответ на запрос через %.1f–%.1f с", rMin, rMax);
+                d += b;
+            }
+            if (answered < req) {
+                snprintf(b, sizeof(b), "; без ответа до конца дампа: %d", req - answered);
+                d += b;
+            }
+            if (acked > 0) {
+                snprintf(b, sizeof(b), "; запрос сервер подтверждает за ≤%.0f мс — задержка на сервере, не в сети",
+                         ackMax);
+                d += b;
+            }
+        }
+        if (clientFin > 0) {
+            snprintf(b, sizeof(b), "; соединение закрыло само устройство (FIN): %d", clientFin);
+            d += b;
+        }
+        for (size_t i = 0; i < v.size(); i++) put(kv.first, v.front()->ip, "TLS_CLIENT_CERT", d);
     }
     // «заморозка»: к зарубежному хостингу (если адреса резолвились), иначе —
     // только если к адресу встали хотя бы два соединения
@@ -1833,11 +1912,12 @@ std::vector<BlockReason> collectBlockReasons(
         // (кроме заглушки и «16 КБ»: там мелкие ответы как раз проходят).
         // Рабочий IP гасит только причины уровня адреса: на общем IP CDN
         // соседний домен открывается, а заблокированный по SNI — нет
-        // Оборвавшаяся UDP-сессия — тоже: TCP к тому же серверу (вход в игру)
-        // работает, а игровой UDP глохнет
+        // Не-блокировки (blockReasonIsBlock) — тоже: TCP к тому же серверу (вход
+        // в игру) работает, а игровой UDP глохнет; при mTLS сервер отвечает, но
+        // без сертификата клиента не обслуживает
         const bool ipLevel = a.code == "SYN_DROP" || a.code == "UDP_DROP";
         if ((worked.count(kv.first) || (ipLevel && workedIp.count(a.ip))) &&
-            a.code != "HTTP_STUB" && a.code != "TCP16" && a.code != "UDP_SESSION")
+            a.code != "HTTP_STUB" && a.code != "TCP16" && blockReasonIsBlock(a.code))
             continue;
         BlockReason r; r.target = kv.first; r.ip = a.ip; r.code = a.code; r.detail = a.detail; r.conns = a.n;
         out.push_back(r);
