@@ -805,6 +805,9 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
     // оборвавшиеся UDP-сессии (игры, голос) — не блокировка, свой абзац
     std::vector<const BlockReason*> udpSess;
     for (const auto& r : blockReasons) if (r.code == "UDP_SESSION") udpSess.push_back(&r);
+    // mTLS: сервер требует сертификат клиента — тоже не блокировка, свой абзац
+    std::vector<const BlockReason*> clientCert;
+    for (const auto& r : blockReasons) if (r.code == "TLS_CLIENT_CERT") clientCert.push_back(&r);
     auto listOf = [](const std::vector<const BlockReason*>& v) {
         std::string s; std::set<std::string> seen; int col = 0;
         for (const BlockReason* r : v) {
@@ -848,6 +851,18 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
                "внешним адресом / без CGNAT.%s\n",
                C::YEL, also ? "Также: " : "", listOf(udpSess).c_str(), C::RST);
     };
+    auto printClientCert = [&](bool also) {
+        printf("%s%sСЕРВЕР ТРЕБУЕТ СЕРТИФИКАТ КЛИЕНТА (mTLS): %s\n"
+               "Это не блокировка и не проблема сети: соединение и TLS-рукопожатие\n"
+               "проходят, но сервер запрашивает сертификат клиента, а устройство его\n"
+               "не предъявило — сервер отвечает ошибкой или с задержкой, приложение\n"
+               "закрывает соединение само. Нужен сертификат от владельца сервиса\n"
+               "(брокер, банк, корпоративный доступ) — установить в приложение или\n"
+               "обратиться в поддержку сервиса.%s\n",
+               C::YEL, also ? "Также: " : "", listOf(clientCert).c_str(), C::RST);
+        for (const BlockReason* r : clientCert)
+            printf("  %s- %s: %s%s\n", C::GRY, r->target.c_str(), r->detail.c_str(), C::RST);
+    };
 
     if (rows.empty()) {
         if (!targetIp.empty())
@@ -864,7 +879,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             const auto udpOther = udpOtherOf(tspuBlocked);
             const bool anyBlock = !tspuBlocked.empty() || !blockedSnisAll.empty() || !dpiFindings.empty();
             // таблицы проблем нет, но блокировка найдена — ВЫВОД всё равно печатаем
-            if (anyBlock || !frz16.empty() || !udpOther.empty() || !udpSess.empty())
+            if (anyBlock || !frz16.empty() || !udpOther.empty() || !udpSess.empty() || !clientCert.empty())
                 printf("\n=================== ВЫВОД ===================");
             if (!tspuBlocked.empty()) {
                 std::set<std::string> tcpIps;
@@ -903,12 +918,17 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             } else if (!udpSess.empty()) {
                 printf("\n");
                 printUdpSess(false);
+            } else if (!clientCert.empty()) {
+                printf("\n");
+                printClientCert(false);
             } else {
                 printf("\n%sЯвных проблем соединения не обнаружено.%s\n", C::GRN, C::RST);
             }
             if (anyBlock && !frz16.empty()) printFreeze(true);
             if ((anyBlock || !frz16.empty()) && !udpOther.empty()) printUdpOther(udpOther, true);
             if ((anyBlock || !frz16.empty() || !udpOther.empty()) && !udpSess.empty()) printUdpSess(true);
+            if ((anyBlock || !frz16.empty() || !udpOther.empty() || !udpSess.empty()) && !clientCert.empty())
+                printClientCert(true);
         }
     } else {
         printf("\n%s=== ПРОБЛЕМНЫЕ АДРЕСА (единая таблица) ===%s\n", C::BOLD, C::RST);
@@ -1571,6 +1591,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             bool elevated  = (avgRtt >= 300000 && avgRtt < 500000);
             const auto udpOther = udpOtherOf(tspuIps);
             const bool anyBlock = tspuBlock || !blockedSnis.empty() || dpiDetected;
+            bool certShown = false;   // абзац mTLS — основной вывод (ниже не повторять)
 
             if (tspuBlock) {
                 // список ВСЕХ адресов для вывода (с переносом строк для читаемости)
@@ -1627,6 +1648,13 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
                 if (someLoss || elevated)
                     printf("%sTCP-соединения в целом рабочие, есть умеренные потери или "
                            "повышенный RTT.%s\n", C::YEL, C::RST);
+            } else if (!clientCert.empty()) {
+                // сеть рабочая, сервис не обслуживает без сертификата
+                printClientCert(false);
+                certShown = true;
+                if (someLoss || elevated)
+                    printf("%sTCP-соединения в целом рабочие, есть умеренные потери или "
+                           "повышенный RTT.%s\n", C::YEL, C::RST);
             } else if (someLoss || elevated) {
                 printf("%sСоединения в целом рабочие, есть умеренные потери или\n"
                        "повышенный RTT. Возможны кратковременные подтормаживания,\n"
@@ -1641,6 +1669,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             const bool udpShown = !anyBlock && frz16.empty() && !(hardBlock || heavyLoss || slowRoute);
             if (!udpOther.empty() && !udpShown) printUdpOther(udpOther, true);
             if (!udpSess.empty() && !udpShown) printUdpSess(true);
+            if (!clientCert.empty() && !certShown) printClientCert(true);
             // оговорка одной строкой, без отдельного блока «Важно»
             printf("(по дампу нельзя на 100%% отличить блокировку провайдером от\n"
                    " недоступности сервера — это признаки для проверки.)\n");

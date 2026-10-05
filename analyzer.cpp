@@ -598,6 +598,15 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
             }
             if (p.ech) c.ech = true;
             if (!p.ja4.empty() && c.ja4.empty()) { c.ja4 = p.ja4; c.ja4Kind = p.ja4Kind; }
+            // mTLS: какой сертификат прислал абонент; первый запрос после рукопожатия
+            if (p.tlsHs & TLSHS_CERT) c.clientCert = 1;
+            else if (p.tlsHs & TLSHS_CERT_EMPTY) c.clientCert = 0;
+            if (p.tlsHs & TLSHS_CCS) c.outCcs = true;
+            else if (c.certReq && c.outCcs && c.reqTime < 0 && p.length > 1 && p.seq >= 0 &&
+                     !S && !flagHas(p.flags, 'R')) {
+                c.reqTime = t; c.reqSeqEnd = p.seq;
+            }
+            if (flagHas(p.flags, 'F') && c.finOutTime < 0) c.finOutTime = t;
         } else {
             tt.anyInboundTcp = true;
             if (t >= 0) c.lastInTime = t;
@@ -636,6 +645,18 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
                 c.httpLocation = p.httpLocation;
             }
             if (!p.httpBlockMark.empty() && c.httpBlockMark.empty()) c.httpBlockMark = p.httpBlockMark;
+            // mTLS: запрос сертификата, Alert, когда сервер подтвердил запрос
+            // абонента и когда ответил на него (ниже по ветке данных — continue)
+            if (p.tlsHs & TLSHS_CERT_REQ) c.certReq = true;
+            if ((p.tlsHs & TLSHS_ALERT) && c.tlsAlertIn < 0) c.tlsAlertIn = p.tlsAlert;
+            if (flagHas(p.flags, 'F') && c.finInTime < 0) c.finInTime = t;
+            if (c.reqTime >= 0 && c.reqAckTime < 0 && A && p.ack >= 0 && !seqLess(p.ack, c.reqSeqEnd))
+                c.reqAckTime = t;
+            if (c.inCcs && p.length > 0 && !R) {
+                c.inAppBytes += p.length;
+                if (c.reqTime >= 0 && c.respTime < 0) c.respTime = t;
+            }
+            if (p.tlsHs & TLSHS_CCS) c.inCcs = true;
             if (p.length > 0 && !flagHas(p.flags, 'R')) {
                 if (c.firstData < 0) c.firstData = t;
                 c.serverBytes += p.length;

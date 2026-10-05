@@ -121,6 +121,14 @@ struct FlowRow {
     int httpStatus = 0;
     long long httpReqUs = -1, httpRespUs = -1; // время запроса/ответа (от начала дампа)
     std::string msBg;                          // фоновая загрузка Windows/Microsoft (msBackgroundDownload) или пусто
+    // mTLS (открытое рукопожатие TLS 1.2), как в buildTcpConnTable
+    bool certReq = false;                      // сервер запросил сертификат клиента
+    int clientCert = -1;                       // Certificate абонента: 0 пустой, 1 с сертификатом, -1 не было
+    int tlsAlertIn = -1;                       // открытый Alert сервера (код)
+    bool outCcs = false, inCcs = false;
+    long long inAppBytes = 0;                  // данные сервера после его ChangeCipherSpec
+    long long mtlsReqUs = -1, mtlsRespUs = -1; // первый запрос после рукопожатия и ответ на него
+    bool certProblem = false;                  // clientCertProblem — сертификат не предъявлен/отвергнут
     std::vector<FlowEvent> wf;                 // временной профиль (только TCP), по времени
     int wfDropped = 0;                         // событий сверх лимита — не записаны
     int state = FS_OK;

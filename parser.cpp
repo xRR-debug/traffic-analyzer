@@ -1326,6 +1326,117 @@ public:
 };
 
 // ------------------------------------------------------------------
+// Открытая часть рукопожатия TLS (до ChangeCipherSpec): запрос сертификата
+// клиента (CertificateRequest), Certificate абонента — пустой или нет, Alert.
+// Для mTLS: сервер просит сертификат, устройство присылает пустой, сервер
+// отвечает ошибкой или долго молчит — это не блокировка и не сеть.
+// По направлению потока идём по записям TLS и сообщениям рукопожатия, не
+// копируя байты; флаги (TLSHS_*) пишутся в пакет, где встретилось сообщение.
+// Поток начинается сегментом с ClientHello/ServerHello и заканчивается на
+// ChangeCipherSpec (дальше шифровано), прикладных данных, фатальном Alert,
+// дырке в seq или мусоре вместо заголовка записи.
+// ------------------------------------------------------------------
+class TlsHsTracker {
+    struct Stream {
+        uint32_t nextSeq = 0;
+        uint8_t rh[5] = {};  int rhHave = 0;   // заголовок записи
+        uint32_t recLeft = 0;  uint8_t recType = 0;
+        uint8_t hh[4] = {};  int hhHave = 0;   // заголовок сообщения рукопожатия
+        uint32_t hsLeft = 0;                   // тело сообщения — пропускаем
+        uint8_t al[2] = {};  int alHave = 0;   // Alert: уровень и код
+        size_t total = 0;
+    };
+    std::unordered_map<std::string, Stream> st_;
+    static const size_t kMaxTotal = 256 * 1024;   // рукопожатие длиннее — не TLS
+    static const size_t kMaxStreams = 20000;
+
+    static void hsBytes(Stream& s, const uint8_t* d, size_t n, Packet& pk) {
+        while (n > 0) {
+            if (s.hsLeft > 0) {
+                const size_t k = std::min<size_t>(s.hsLeft, n);
+                s.hsLeft -= (uint32_t)k; d += k; n -= k;
+                continue;
+            }
+            s.hh[s.hhHave++] = *d++; n--;
+            if (s.hhHave < 4) continue;
+            s.hhHave = 0;
+            const uint32_t body = ((uint32_t)s.hh[1] << 16) | ((uint32_t)s.hh[2] << 8) | s.hh[3];
+            if (s.hh[0] == 13) pk.tlsHs |= TLSHS_CERT_REQ;
+            // Certificate TLS 1.2: 3 байта длины списка, пустой список — «нет сертификата»
+            else if (s.hh[0] == 11) pk.tlsHs |= body <= 3 ? TLSHS_CERT_EMPTY : TLSHS_CERT;
+            s.hsLeft = body;
+        }
+    }
+
+    // false — поток закончен (дальше не открытое рукопожатие)
+    static bool bytes(Stream& s, const uint8_t* d, size_t n, Packet& pk) {
+        while (n > 0) {
+            if (s.recLeft == 0) {
+                s.rh[s.rhHave++] = *d++; n--;
+                if (s.rhHave < 5) continue;
+                s.rhHave = 0;
+                const uint8_t type = s.rh[0];
+                const uint32_t len = ((uint32_t)s.rh[3] << 8) | s.rh[4];
+                if (type < 20 || type > 22 || s.rh[1] != 3 || len == 0 || len > 18432)
+                    return false;   // прикладные данные (23) или не TLS
+                if (type == 20) { pk.tlsHs |= TLSHS_CCS; return false; }
+                s.recType = type; s.recLeft = len; s.alHave = 0;
+                continue;
+            }
+            const size_t k = std::min<size_t>(s.recLeft, n);
+            if (s.recType == 22) {
+                hsBytes(s, d, k, pk);
+            } else {   // 21 — Alert
+                for (size_t i = 0; i < k && s.alHave < 2; i++) s.al[s.alHave++] = d[i];
+                if (s.alHave == 2 && !(pk.tlsHs & TLSHS_ALERT)) {
+                    pk.tlsHs |= TLSHS_ALERT;
+                    pk.tlsAlert = s.al[1];
+                }
+            }
+            s.recLeft -= (uint32_t)k; d += k; n -= k;
+            if (s.recType == 21 && s.recLeft == 0 && s.alHave == 2 && s.al[0] == 2)
+                return false;   // фатальный Alert — соединение закрывается
+        }
+        return true;
+    }
+
+public:
+    // вызывать сразу после out.push_back(pk) с payload этого TCP-сегмента
+    void feed(std::vector<Packet>& out, const uint8_t* pay, size_t n) {
+        if (out.empty() || !pay || n == 0) return;
+        Packet& pk = out.back();
+        if (pk.proto != "TCP" || pk.seqStart < 0) return;
+        const bool start = n >= 6 && pay[0] == 0x16 && pay[1] == 0x03 &&
+                           (pay[5] == 0x01 || pay[5] == 0x02);
+        if (st_.empty() && !start) return;
+        const uint32_t seq = (uint32_t)pk.seqStart;
+        std::string key = pk.srcIp + " " + std::to_string(pk.srcPort) + ">" +
+                          pk.dstIp + " " + std::to_string(pk.dstPort);
+
+        auto it = st_.find(key);
+        if (it != st_.end()) {
+            Stream& s = it->second;
+            const int32_t diff = (int32_t)(seq - s.nextSeq);
+            if (diff <= 0) {
+                const size_t skip = (size_t)(-(int64_t)diff);
+                if (skip >= n) return;           // повтор уже разобранного
+                s.nextSeq += (uint32_t)(n - skip);
+                s.total += n - skip;
+                if (!bytes(s, pay + skip, n - skip, pk) || s.total > kMaxTotal) st_.erase(it);
+                return;
+            }
+            st_.erase(it);                       // дырка — граница записей потеряна
+        }
+        if (!start) return;
+        if (st_.size() >= kMaxStreams) st_.clear();   // брошенные рукопожатия
+        Stream s;
+        s.nextSeq = seq + (uint32_t)n;
+        s.total = n;
+        if (bytes(s, pay, n, pk)) st_.emplace(std::move(key), s);
+    }
+};
+
+// ------------------------------------------------------------------
 // DNS поверх TCP/53 (RFC 7766): перед каждым сообщением 2 байта длины; в
 // одном сегменте бывает несколько сообщений, а одно сообщение — в нескольких
 // сегментах. Поток собирается по направлению, готовые сообщения разбирает тот
@@ -1832,6 +1943,7 @@ static std::vector<Packet> readPcapng(const std::vector<unsigned char>& buf,
     struct IfDesc { int linkType; uint64_t tsUnits; int64_t tsOffset; };
     std::vector<IfDesc> ifaces;
     HelloReassembler hello;
+    TlsHsTracker tlsHs;
     QuicHelloCollector quic;
     DnsTcpReassembler dnsTcp;
     // у SPB своего времени нет — берём время последнего EPB, чтобы пакет не
@@ -1948,6 +2060,7 @@ static std::vector<Packet> readPcapng(const std::vector<unsigned char>& buf,
                 }
                 out.push_back(std::move(pk));
                 hello.feed(out, pay, payLen);
+                tlsHs.feed(out, pay, payLen);
                 quic.feed(out, pay, payLen);
                 dnsTcp.feed(out, pay, payLen);
             }
@@ -1965,6 +2078,7 @@ static std::vector<Packet> readPcapng(const std::vector<unsigned char>& buf,
             if (parseFrame(pdata, caplen, lt, lastTs, pk, &pay, &payLen)) {
                 out.push_back(std::move(pk));
                 hello.feed(out, pay, payLen);
+                tlsHs.feed(out, pay, payLen);
                 quic.feed(out, pay, payLen);
                 dnsTcp.feed(out, pay, payLen);
             }
@@ -2011,6 +2125,7 @@ static std::vector<Packet> readPcap(const std::string& path, std::string& err) {
 
     size_t pos = 24; // после глобального заголовка
     HelloReassembler hello;
+    TlsHsTracker tlsHs;
     QuicHelloCollector quic;
     DnsTcpReassembler dnsTcp;
     while (pos + 16 <= buf.size()) {
@@ -2029,6 +2144,7 @@ static std::vector<Packet> readPcap(const std::string& path, std::string& err) {
         if (parseFrame(buf.data() + pos, caplen, (int)linkType, ts, pk, &pay, &payLen)) {
             out.push_back(std::move(pk));
             hello.feed(out, pay, payLen);
+            tlsHs.feed(out, pay, payLen);
             quic.feed(out, pay, payLen);
             dnsTcp.feed(out, pay, payLen);
         }
@@ -2392,6 +2508,10 @@ bool loadDumpSet(const std::vector<std::string>& paths,
                 for (size_t b = a, n = 0; b-- > 0 && n < 512 && mt[a] - mt[b] <= kDupWinUs; n++) {
                     if (drop[b] || packets[b].wireHash != h || origin[b] == origin[a]) continue;
                     drop[b] = 2; drop[a] = 1; dupCross++;
+                    // рукопожатие TLS разбиралось по каждому файлу отдельно: в
+                    // одном поток мог прерваться дыркой, в другом — нет
+                    if (!(packets[b].tlsHs & TLSHS_ALERT)) packets[b].tlsAlert = packets[a].tlsAlert;
+                    packets[b].tlsHs |= packets[a].tlsHs;
                     break;
                 }
             }

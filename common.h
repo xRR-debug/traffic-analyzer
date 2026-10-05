@@ -245,6 +245,9 @@ struct Packet {
     // 2 — VoWiFi точно (звонки по Wi-Fi через ePDG оператора), 0 — не ясно
     uint8_t     ipsecPeer = 0;
     uint8_t     l7 = L7_NONE;    // протокол потока по содержимому (L7Proto), только pcap
+    // рукопожатие TLS открытым текстом (TLSHS_*): что началось в этом сегменте; только pcap
+    uint8_t     tlsHs = 0;
+    int         tlsAlert = -1;   // код открытого TLS Alert (при TLSHS_ALERT), -1 — нет
     // DNS (из текстового tcpdump: "A? domain" / "id 1/0/0 A 1.2.3.4" / NXDomain,
     // либо из UDP-payload бинарного дампа — поля заполняются в том же виде)
     std::string dnsQuery;        // запрашиваемый домен (если это DNS-запрос)
@@ -273,6 +276,34 @@ struct Packet {
     int         dir = -1;
     bool        valid = false;
 };
+
+// Packet::tlsHs. До ChangeCipherSpec записи TLS 1.2 идут открытым текстом; в
+// TLS 1.3 всё после ServerHello зашифровано, и запрос сертификата не виден.
+enum : uint8_t {
+    TLSHS_CERT_REQ   = 1,    // CertificateRequest: сервер просит сертификат клиента (mTLS)
+    TLSHS_CERT_EMPTY = 2,    // Certificate без сертификатов («сертификата нет»)
+    TLSHS_CERT       = 4,    // Certificate с сертификатом
+    TLSHS_CCS        = 8,    // ChangeCipherSpec: дальше записи шифрованы
+    TLSHS_ALERT      = 16,   // открытый Alert (код — Packet::tlsAlert)
+};
+// Alert, которым сервер отвергает сертификат клиента: handshake_failure,
+// bad/unsupported/revoked/expired/unknown certificate, unknown_ca,
+// access_denied, certificate_required
+inline bool tlsAlertCertReject(int a) {
+    return a == 40 || (a >= 42 && a <= 46) || a == 48 || a == 49 || a == 116;
+}
+// mTLS без сертификата: сервер запросил сертификат клиента, а абонент прислал
+// пустой (clientCert 0) или предъявленный (1) сервер отверг открытым Alert.
+// Пустой сертификат при необязательной проверке сервер принимает и отдаёт
+// данные как обычно — поэтому без Alert проблема, только если сервер после
+// рукопожатия прислал немного (страница/код ошибки, а не содержимое).
+// inAppBytes — байт данных от сервера после его ChangeCipherSpec.
+// Общее для причины TLS_CLIENT_CERT и таблицы соединений GUI.
+inline bool clientCertProblem(bool certReq, int clientCert, int alertIn, long long inAppBytes) {
+    if (!certReq || clientCert < 0) return false;
+    if (tlsAlertCertReject(alertIn)) return true;
+    return clientCert == 0 && inAppBytes <= 8192;
+}
 
 // IP ID отправителя — счётчик (Linux, Windows): у каждого следующего пакета на
 // 1 больше. 0 — счётчика нет (DF без счётчика: PS5, часть стеков), -1 — неизвестно.
@@ -365,7 +396,8 @@ enum { JA4K_UNKNOWN = 0, JA4K_BROWSER = 1, JA4K_LIBRARY = 2, JA4K_FAKE = 3 };
 // ------------------------------------------------------------------
 // Причина недоступности одного ресурса — итог по всем его соединениям в дампе.
 // code: HTTP_STUB, TLS_RST_FORGED, TLS_RST, TLS_DROP, TCP16, SYN_DROP, UDP_DROP;
-// UDP_SESSION (оборвавшаяся UDP-сессия игры/голоса) — не блокировка, см. blockReasonIsBlock.
+// UDP_SESSION (оборвавшаяся UDP-сессия игры/голоса) и TLS_CLIENT_CERT (сервер
+// требует сертификат клиента, mTLS) — не блокировки, см. blockReasonIsBlock.
 struct BlockReason {
     std::string target;     // домен (SNI / Host / DNS) или IP
     std::string ip;         // удалённый адрес (первый, если их несколько)
@@ -476,7 +508,7 @@ void runVpnAnalysis(std::vector<Packet>& packets, const std::vector<std::string>
 // ---- detector_dpi.cpp ----
 const char* blockReasonTitle(const std::string& code);   // «Молчаливый дроп после ClientHello»
 const char* blockReasonAdvice(const std::string& code);  // подсказка для техподдержки
-// false — проблема связи, а не признак блокировки (UDP_SESSION): показывать
+// false — проблема связи, а не признак блокировки (UDP_SESSION, TLS_CLIENT_CERT): показывать
 // отдельно от «Признаков блокировок»
 bool blockReasonIsBlock(const std::string& code);
 

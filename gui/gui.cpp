@@ -1108,7 +1108,7 @@ void drawOverview(const View& v) {
     // --- блокировки ---
     if (s) {
         ImGui::Spacing();
-        // причины-не-блокировки (UDP_SESSION) — отдельным блоком ниже
+        // причины-не-блокировки (UDP_SESSION, TLS_CLIENT_CERT) — отдельным блоком ниже
         bool anyReasonBlock = false, anyReasonOther = false;
         for (const auto& r : s->blockReasons)
             (blockReasonIsBlock(r.code) ? anyReasonBlock : anyReasonOther) = true;
@@ -1369,6 +1369,28 @@ void flowTooltip(const FlowRow& r, bool blocked) {
     if (!r.ja4.empty()) ImGui::Text("JA4: %s", r.ja4.c_str());
     if (r.ech) ImGui::TextUnformatted("ClientHello с ECH: настоящий домен зашифрован, в SNI — "
                                       "публичное имя провайдера");
+    if (r.certReq) {
+        std::string line = "TLS: сервер запросил сертификат клиента (mTLS) — ";
+        line += r.clientCert == 0 ? "устройство прислало пустой"
+              : r.clientCert == 1 ? "устройство предъявило сертификат"
+              : "ответа устройства не видно";
+        if (r.tlsAlertIn >= 0) line += "; ошибка TLS от сервера, код " + std::to_string(r.tlsAlertIn);
+        if (r.mtlsReqUs >= 0) {
+            char b[96];
+            if (r.mtlsRespUs >= r.mtlsReqUs)
+                snprintf(b, sizeof(b), "; ответ на запрос через %.1f с", (r.mtlsRespUs - r.mtlsReqUs) / 1e6);
+            else
+                snprintf(b, sizeof(b), "; на запрос сервер не ответил");
+            line += b;
+        }
+        if (r.certProblem) {
+            ImGui::TextColored(kWarn, "%s", line.c_str());
+            ImGui::TextColored(kDim, "Не блокировка и не сеть: сервис требует сертификат клиента "
+                                     "(брокер, банк, корп. доступ) — его нужно установить на устройство.");
+        } else {
+            ImGui::TextUnformatted(line.c_str());
+        }
+    }
     // blockedIps/blockedSnis — вывод самой программы по дампу, не внешний реестр
     if (blocked) ImGui::TextColored(kBad, "Программа считает адрес/имя недоступным (см. «Обзор»): "
                                           "по одному дампу не определить, где теряются пакеты.");
