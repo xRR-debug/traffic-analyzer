@@ -525,8 +525,31 @@ struct UdpTunnelStat {
 };
 }  // namespace
 
-// Туннель «шлём — в ответ почти ничего». Вызывать, только если входящий UDP
-// в дампе вообще есть (иначе дамп однонаправленный). Условия:
+// Записано ли в дампе входящее направление. Считается один раз по ВСЕМУ дампу,
+// до фильтра по цели: у заблокированного туннеля к цели входящих нет как раз
+// потому, что он заблокирован, а доказывают направление и чужие ответы. Признак —
+// любой пакет к адресу абонента (в т.ч. ответ DNS роутера из ЛВС: оба адреса
+// «свои», и проверка sLoc==dLoc его отбрасывает) или с внешнего адреса внутрь
+// (входящий TCP, UDP, ICMP). Нет ни одного — дамп снят в одну сторону, и «ответа
+// нет» ничего не доказывает.
+bool dumpHasInbound(const std::vector<Packet>& packets, const std::string& localIp) {
+    auto isLocal = [&](const std::string& ip) {
+        return isLocalIp(ip) || (!localIp.empty() && ip == localIp);
+    };
+    auto isSubscriber = [&](const std::string& ip) {
+        return (!localIp.empty() && ip == localIp) || (!g_localIp.empty() && ip == g_localIp) ||
+               (!g_localIp6.empty() && ip == g_localIp6);
+    };
+    for (const auto& p : packets) {
+        if (p.srcIp == p.dstIp) continue;
+        if (isSubscriber(p.dstIp) || (!isLocal(p.srcIp) && isLocal(p.dstIp))) return true;
+    }
+    return false;
+}
+
+// Туннель «шлём — в ответ почти ничего». Вызывать, только если входящее
+// направление в дампе записано (dumpHasInbound), иначе «ответа нет» ничего
+// не значит. Условия:
 //  - попытки идут ≥10 с (WireGuard повторяет handshake раз в 5 с);
 //  - IPsec: судим по ESP-данным — ESP уходит (≥3), в ответ ESP нет;
 //  - иначе ≥10 пакетов ушло, ≤2 пришло. Не строго 0: ТСПУ часто пропускает
@@ -547,10 +570,13 @@ static bool udpTunnelStarved(const UdpTunnelStat& s) {
 //  - TCP: рукопожатие не проходит (много SYN, ни одного SYN-ACK/RST);
 //  - UDP: VPN-туннель, в который долго шлём, а в ответ почти ничего (udpTunnelStarved).
 // Используется чтобы пометить такие адреса прямо в единой таблице.
+// inboundIn — dumpHasInbound по всему дампу, когда packets — только пакеты цели
+// (иначе считается по packets).
 std::set<std::string> collectTspuBlockedIps(const std::vector<Packet>& packets,
                                             const std::string& localIp,
                                             const TcpConnTable* ttIn /*= nullptr*/,
-                                            const std::unordered_map<std::string, IpInfo>* ipCache /*= nullptr*/) {
+                                            const std::unordered_map<std::string, IpInfo>* ipCache /*= nullptr*/,
+                                            const bool* inboundIn /*= nullptr*/) {
     auto isLocal = [&](const std::string& ip) {
         return isLocalIp(ip) || (!localIp.empty() && ip == localIp);
     };
@@ -617,20 +643,19 @@ std::set<std::string> collectTspuBlockedIps(const std::vector<Packet>& packets,
     // это точно IPsec-VPN (ipsecClass: по самому дампу или хостинг из ipCache);
     // иначе это может быть VoWiFi, и «ТСПУ?» на ePDG оператора было бы ложным.
     std::map<std::string, UdpTunnelStat> uc;
-    bool anyInboundUdp = false;
+    const bool inbound = inboundIn ? *inboundIn : dumpHasInbound(packets, localIp);
     std::vector<long long> absT = absTimes(packets);
     for (size_t i = 0; i < packets.size(); i++) {
         const Packet& p = packets[i];
         if (p.proto != "UDP") continue;
         bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
         if (sLoc == dLoc) continue;
-        if (!sLoc) anyInboundUdp = true;
         std::string ip = sLoc ? p.dstIp : p.srcIp;
         int rport = sLoc ? p.dstPort : p.srcPort;
         int lport = sLoc ? p.srcPort : p.dstPort;
         uc[ip].add(p, sLoc, absT[i], rport, lport, ipInfoOf(ipCache, ip));
     }
-    if (anyInboundUdp)
+    if (inbound)
         for (const auto& kv : uc)
             if (kv.second.kind && udpTunnelStarved(kv.second)) blocked.insert(kv.first);
 
@@ -692,6 +717,9 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
     };
     std::map<std::string, UConn> conns;
     long long matched = 0;
+    // входящее направление в дампе вообще записано? Если нет — дамп снят в одну
+    // сторону, и «ответа нет» ничего не доказывает. По всему дампу, до фильтра по цели
+    const bool inbound = dumpHasInbound(packets, localIp);
 
     const std::vector<long long> absT = absTimes(packets);
     for (size_t i = 0; i < packets.size(); i++) {
@@ -758,11 +786,6 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
 
     printf("  %-16s %-6s %-6s %-9s %-8s %s\n",
            "IP", "→пак", "←пак", "RTT мс", "порты", "примечание");
-    // входящий UDP в дампе вообще есть? Если нет — дамп снят в одну сторону,
-    // и «ответа нет» ничего не доказывает (как anyInboundUdp в analyzeQuic)
-    bool anyInboundUdp = false;
-    for (auto& kv : conns) if (kv.second.in > 0) { anyInboundUdp = true; break; }
-
     const int kShowRows = 12;                  // в таблице — только крупнейшие
     int shown = 0;
     std::vector<std::string> notes;
@@ -781,10 +804,10 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
         if (inTable) {
             std::string rttStr = "-";
             if (c.rttCnt > 0) { char b[48]; snprintf(b,sizeof(b),"%lld",(c.rttSum/c.rttCnt)/1000); rttStr=b; }
-            const char* col = (oneWay && anyInboundUdp) ? C::RED : (c.vpn ? C::YEL : C::WHT);
+            const char* col = (oneWay && inbound) ? C::RED : (c.vpn ? C::YEL : C::WHT);
             std::string note;
-            if (oneWay) note = anyInboundUdp ? "нет ответа (порт закрыт/фильтр?)"
-                                             : "нет ответа (дамп в одну сторону?)";
+            if (oneWay) note = inbound ? "нет ответа (порт закрыт/фильтр?)"
+                                       : "нет ответа (дамп в одну сторону?)";
             else if (c.vpn) {
                 note = (c.kind ? "VPN: " : "") + c.vpnName;   // VoWiFi / не ясно — не «VPN:»
                 if (c.espOut > 0 && c.espIn > 0)            note += " (ESP в обе стороны)";
@@ -800,7 +823,7 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
                        C::GRY, (int)rows.size() - kShowRows, C::RST);
         }
 
-        if (inTable && oneWay && !c.vpn && anyInboundUdp) {
+        if (inTable && oneWay && !c.vpn && inbound) {
             char b[512];
             snprintf(b, sizeof(b),
                 "UDP к %s (порт %s): %lld пакетов ушло, ответа нет — порт закрыт, "
@@ -815,13 +838,13 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
             // неверного ключа/конфига (WireGuard молча игнорирует чужой handshake)
             // и от лежащего сервера — поэтому не «ЗАБЛОКИРОВАН», а перечень причин.
             // То же правило, что в таблице и обзоре, — иначе отчёты разойдутся.
-            const bool starved = anyInboundUdp && udpTunnelStarved(c);
+            const bool starved = inbound && udpTunnelStarved(c);
             // IPsec: судим по ESP-данным, IKE — лишь уточнение. Туннель, поднятый до
             // начала съёма, в дампе виден одним ESP, без IKE, — это норма.
             const bool espSeen = c.espOut + c.espIn > 0;
             const bool ikeSeen = c.ikeInit + c.ikeMore > 0;
             // ответа нет, но попыток мало или они шли меньше 10 с — для «НЕ работает» мало
-            const bool weakOneWay = anyInboundUdp &&
+            const bool weakOneWay = inbound &&
                 (espSeen ? (c.espOut >= 3 && c.espIn == 0) : (c.out >= 3 && c.in == 0));
             const double span = c.t0 >= 0 ? (c.t1 - c.t0) / 1e6 : 0.0;
             // как назвать IPsec в итоге: VoWiFi точно — только VoWiFi, не ясно — оба
@@ -867,9 +890,9 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
                     "ESP-данных в UDP нет — аутентификация не прошла, в туннеле не было "
                     "трафика или ESP идёт без NAT-T (IP-протокол 50 программа не разбирает).",
                     ipsecTag, kv.first.c_str(), c.out, c.in);
-            } else if (!anyInboundUdp && c.in == 0) {
+            } else if (!inbound && c.in == 0) {
                 snprintf(b, sizeof(b),
-                    "%s (порт %d, %s): %lld пакетов ушло, ответов нет, но входящего UDP "
+                    "%s (порт %d, %s): %lld пакетов ушло, ответов нет, но входящих пакетов "
                     "в дампе нет вовсе — похоже, дамп снят в одну сторону; вывод невозможен.",
                     c.vpnName.c_str(), c.vpnPort, kv.first.c_str(), c.out);
             } else if (starved) {
@@ -952,7 +975,6 @@ void analyzeQuic(const std::vector<Packet>& packets,
     std::map<std::string, QF> flows;          // rip|rport|lport; порядок вставки не важен
     std::set<std::string> tcpSni;             // имена из TCP ClientHello
     std::set<std::string> tcpAnsweredIp;      // серверы, приславшие данные по TCP
-    bool anyInboundUdp = false;
     long long tEnd = -1;
     for (size_t i = 0; i < packets.size(); i++) {
         const Packet& p = packets[i];
@@ -965,7 +987,6 @@ void analyzeQuic(const std::vector<Packet>& packets,
             continue;
         }
         if (p.proto != "UDP") continue;
-        if (!sLoc) anyInboundUdp = true;
         if (!targetIp.empty() && p.srcIp != targetIp && p.dstIp != targetIp) continue;
         std::string rip = sLoc ? p.dstIp : p.srcIp;
         int rport = sLoc ? p.dstPort : p.srcPort, lport = sLoc ? p.srcPort : p.dstPort;
@@ -990,8 +1011,9 @@ void analyzeQuic(const std::vector<Packet>& packets,
     if (flows.empty()) return;
 
     printf("\n%s=== QUIC (HTTP/3): ОТВЕТ СЕРВЕРА НА INITIAL ===%s\n", C::BOLD, C::RST);
-    if (!anyInboundUdp) {
-        printf("  %sQUIC-соединений: %d, но входящего UDP в дампе нет вовсе — похоже,\n"
+    // ответов на Initial нет — блокировка или дамп в одну сторону: по всему дампу
+    if (!dumpHasInbound(packets, localIp)) {
+        printf("  %sQUIC-соединений: %d, но входящих пакетов в дампе нет вовсе — похоже,\n"
                "  записано одно направление. О блокировке QUIC судить нельзя.%s\n",
                C::GRY, (int)flows.size(), C::RST);
         return;
@@ -1837,7 +1859,9 @@ std::vector<BlockReason> collectBlockReasons(
     struct Sess : UdpSessStat { int rport = 0, lport = 0; bool quic = false; };
     std::map<std::string, Sess> sess;       // "ip|rport|lport"
     long long lastInAny = -1;               // последний входящий пакет любого протокола
-    bool anyInboundUdp = false;
+    // входящее направление в дампе записано — по всему дампу, до фильтра onlyIp:
+    // ответ DNS (и от роутера) или входящий TCP доказывает его не хуже UDP цели
+    const bool inbound = dumpHasInbound(packets, localIp);
     std::vector<long long> absT = absTimes(packets);
     for (size_t i = 0; i < packets.size(); i++) {
         const Packet& p = packets[i];
@@ -1847,8 +1871,6 @@ std::vector<BlockReason> collectBlockReasons(
         if (p.proto != "UDP") continue;
         std::string ip = sLoc ? p.dstIp : p.srcIp;
         if (!onlyIp.empty() && ip != onlyIp) continue;
-        // ответ DNS тоже доказывает, что входящее направление в дампе есть
-        if (!sLoc) anyInboundUdp = true;
         if (p.srcPort == 53 || p.dstPort == 53) continue;
         int rport = sLoc ? p.dstPort : p.srcPort;
         int lport = sLoc ? p.srcPort : p.dstPort;
@@ -1864,7 +1886,7 @@ std::vector<BlockReason> collectBlockReasons(
         if (p.quic || rport == 443) u.quic = true;
         if (u.sni.empty() && !p.sni.empty()) u.sni = p.sni;
     }
-    if (anyInboundUdp) {
+    if (inbound) {
         for (const auto& kv : uc) {
             const U& u = kv.second;
             if (u.t0 < 0) continue;

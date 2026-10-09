@@ -193,10 +193,13 @@ bool connIsForgedRst(const TcpConnState& c);
 std::vector<std::string> detectDpiInjection(const TcpConnTable& tt);
 std::vector<std::string> detectDpiInjection(const std::vector<Packet>& packets,
                                             const std::string& localIp);
+// Входящее направление в дампе записано (по всему дампу — до фильтра по цели)
+bool dumpHasInbound(const std::vector<Packet>& packets, const std::string& localIp);
 std::set<std::string> collectTspuBlockedIps(const std::vector<Packet>& packets,
                                             const std::string& localIp,
                                             const TcpConnTable* ttIn = nullptr,
-                                            const std::unordered_map<std::string, IpInfo>* ipCache = nullptr);
+                                            const std::unordered_map<std::string, IpInfo>* ipCache = nullptr,
+                                            const bool* inboundIn = nullptr);
 std::map<std::string,std::string> collectBlockedSnis(const std::vector<Packet>& packets,
                                                      const std::string& localIp,
                                                      const TcpConnTable* ttIn = nullptr);
