@@ -905,22 +905,29 @@ static bool parseFrame(const unsigned char* d, size_t len, int linkType,
         // если есть полезная нагрузка и порт похож на TLS — пробуем вытащить SNI
         const uint8_t* payload = l4 + doff;
         size_t payLen = (l4len > (size_t)doff) ? (l4len - doff) : 0;
-        if (payLen >= 5 && payload + payLen <= d + len && payload[0] == 0x16) {
-            std::string sni = parseTlsSni(payload, payLen);
+        // захваченная часть payload: при обрезке кадра snaplen (tcpdump -s 1500,
+        // зеркало с обрезкой) она короче payLen
+        const size_t cap = (payLen > 0 && payload < d + len)
+                         ? std::min(payLen, (size_t)((d + len) - payload)) : 0;
+        if (payLen >= 5 && cap > 0 && payload[0] == 0x16) {
+            // SNI — и по обрезанному сегменту: parseTlsSni терпит обрыв, а имя
+            // лежит в первых сотнях байт. Раньше в таком дампе SNI терялся у
+            // всех HTTPS-соединений, и блокировки по имени не находились
+            std::string sni = parseTlsSni(payload, cap);
             if (!sni.empty()) pk.sni = sni;
-            // ClientHello целиком в одном сегменте — сразу и JA4; иначе
-            // дособерёт HelloReassembler
-            if (payLen >= 6 && payload[5] == 0x01) ja4FromTlsRecords(payload, payLen, pk);
-        } else if (payLen >= 8 && payload < d + len) {
+            // ClientHello целиком в одном сегменте — сразу и JA4 (только по
+            // сегменту целиком); иначе дособерёт HelloReassembler
+            if (cap == payLen && payLen >= 6 && payload[5] == 0x01) ja4FromTlsRecords(payload, payLen, pk);
+        } else if (payLen >= 8 && cap > 0) {
             // HTTP: хватает и обрезанного snaplen начала сегмента
-            size_t cap = std::min(payLen, (size_t)((d + len) - payload));
             uint8_t c0 = payload[0];
             if (c0 == 'H' || c0 == 'G' || c0 == 'P' || c0 == 'O' || c0 == 'C')
                 parseHttpHead(payload, cap, pk);
         }
-        if (payLen > 0 && payload < d + len)
-            pk.l7 = detectL7(payload, std::min(payLen, (size_t)((d + len) - payload)), payLen, true);
-        if (tcpPay && tcpPayLen && payLen > 0 && payload + payLen <= d + len) {
+        if (cap > 0)
+            pk.l7 = detectL7(payload, cap, payLen, true);
+        // в сборку ClientHello — только сегмент целиком, иначе в ней будет дыра
+        if (tcpPay && tcpPayLen && payLen > 0 && cap == payLen) {
             *tcpPay = payload;
             *tcpPayLen = payLen;
         }
