@@ -2025,10 +2025,26 @@ class QuicHelloCollector {
         QuicKeys keys{};
         std::vector<uint8_t> buf, have; // CRYPTO-поток и карта заполненных байт
         bool done = false;
+        int noHead = 0;                  // Initial-пакетов, после которых байта 0 всё нет
     };
     std::map<std::string, Flow> fl_;    // ключ — направление потока (клиент -> сервер)
     static constexpr size_t kMaxCrypto = 64 * 1024;
     static constexpr size_t kMaxFlows = 20000;
+    // Память сборки: буфер растёт только на пришедшие байты и дырку перед ними
+    // не больше kMaxGap (Chrome перемешивает CRYPTO-фреймы, но в пределах
+    // нескольких КБ), а все буферы вместе — не больше kMaxTotal. Иначе фрейм с
+    // offset 65535 и length 1 раздувал буфер потока до 64 КБ (вдвое — с картой),
+    // и 20000 таких потоков в подложенном дампе съедали ~2,5 ГБ памяти.
+    static constexpr size_t kMaxGap = 8 * 1024;
+    static constexpr size_t kMaxTotal = 32 * 1024 * 1024;
+    size_t total_ = 0;                  // байт в buf и have всех потоков
+
+    // поток собран или брошен — его буферы больше не нужны
+    void release(Flow& f) {
+        total_ -= f.buf.size() + f.have.size();
+        std::vector<uint8_t>().swap(f.buf);
+        std::vector<uint8_t>().swap(f.have);
+    }
 
     // ClientHello клиента: ключи потока, иначе — выведенные из DCID этого пакета.
     // Пакет сервера (другие ключи, "server in") просто не расшифруется — тег не сойдётся.
@@ -2040,7 +2056,7 @@ class QuicHelloCollector {
                           pk.dstIp + " " + std::to_string(pk.dstPort);
         auto it = fl_.find(key);
         if (it != fl_.end() && it->second.done) return;
-        if (it == fl_.end() && fl_.size() >= kMaxFlows) return;
+        if (it == fl_.end() && (fl_.size() >= kMaxFlows || total_ >= kMaxTotal)) return;
         std::vector<uint8_t> plain;
         QuicKeys k;
         bool ok = false;
@@ -2084,11 +2100,15 @@ class QuicHelloCollector {
                 p++;
                 uint64_t off = 0, len = 0;
                 if (!quicVarint(d, n, p, off) || !quicVarint(d, n, p, len) || len > n - p) break;
-                if (off < kMaxCrypto && len > 0) {
-                    size_t e = (size_t)std::min<uint64_t>(off + len, kMaxCrypto);
-                    if (f.buf.size() < e) { f.buf.resize(e, 0); f.have.resize(e, 0); }
-                    for (size_t i = (size_t)off; i < e; i++) { f.buf[i] = d[p + (i - (size_t)off)]; f.have[i] = 1; }
+                size_t e = 0;                         // конец фрейма в буфере (0 — не берём)
+                if (off < kMaxCrypto && len > 0 && off <= f.buf.size() + kMaxGap)
+                    e = (size_t)std::min<uint64_t>(off + len, kMaxCrypto);
+                if (e > f.buf.size()) {
+                    const size_t add = 2 * (e - f.buf.size());   // buf и have
+                    if (total_ + add > kMaxTotal) e = 0;           // бюджет исчерпан — фрейм пропускаем
+                    else { total_ += add; f.buf.resize(e, 0); f.have.resize(e, 0); }
                 }
+                for (size_t i = (size_t)off; i < e; i++) { f.buf[i] = d[p + (i - (size_t)off)]; f.have[i] = 1; }
                 p += (size_t)len;
                 continue;
             }
@@ -2098,8 +2118,13 @@ class QuicHelloCollector {
         // непрерывное начало потока — это ClientHello (без TLS-записи)
         size_t pre = 0;
         while (pre < f.have.size() && f.have[pre]) pre++;
-        if (pre == 0) return;
-        if (f.buf[0] != 0x01) { f.done = true; return; }
+        if (pre == 0) {
+            // начала ClientHello нет и после нескольких Initial — поток брошен
+            // (или подложен): память отдаём
+            if (++f.noHead >= 3) { f.done = true; release(f); }
+            return;
+        }
+        if (f.buf[0] != 0x01) { f.done = true; release(f); return; }
         std::vector<uint8_t> hs(f.buf.begin(), f.buf.begin() + pre);
         Packet& first = out[f.idx];
         if (first.sni.empty()) {
@@ -2112,6 +2137,7 @@ class QuicHelloCollector {
             if (pre >= need) {                        // ClientHello целиком
                 ja4FromHello(hs.data(), need, 'q', first.ja4, first.tlsClient, first.ja4Kind, &first.ech);
                 f.done = true;
+                release(f);
             }
         }
     }
