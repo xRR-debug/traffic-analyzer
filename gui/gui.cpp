@@ -2005,18 +2005,18 @@ void drawWaterfall(const View& v) {
         }
         if (!s.empty()) ImGui::TextUnformatted(s.c_str());
     }
-    // «заморозка ~16 КБ»: принято freeze_min..max КБ, затем тишина — та же
-    // картина, что ищет режим 2 (здесь только подсказка, без вердикта)
-    for (const auto& g : w.gaps) {
-        if (g.second - g.first < cfg().freezeSilenceUs) continue;
-        long long got = 0;
-        for (const FlowEvent& e : r.wf)
-            if (!e.out && e.kind == FE_DATA && e.endUs <= g.first) got += e.bytes;
-        if (got >= cfg().freezeMinBytes && got <= cfg().freezeMaxBytes)
-            ImGui::TextColored(kWarn, "Принято %s, затем тишина %s — так выглядит «заморозка ~16 КБ» "
-                                      "(ТСПУ к зарубежному хостингу).",
-                               fmtBytes(got).c_str(), fmtUs(g.second - g.first).c_str());
-        break;
+    // «заморозка ~16 КБ» — по правилам connFreeze16k режима 2 (счётчики — в
+    // buildFlows): ClientHello или порт 443, от сервера ни RST, ни FIN, принято
+    // freeze_min..max КБ, после — тишина до конца записи, а повторы без ответа ещё
+    // идут. Здесь только подсказка, без вердикта (хостинг не проверяется)
+    {
+        const AppConfig& k = cfg();
+        if ((!r.sni.empty() || r.remotePort == 443) && r.rstIn == 0 && r.finIn == 0 &&
+            r.frzBytes >= k.freezeMinBytes && r.frzBytes <= k.freezeMaxBytes &&
+            r.frzSilenceUs >= k.freezeSilenceUs && r.frzLater >= k.freezeLaterPkts)
+            ImGui::TextColored(kWarn, "Принято %s, затем до конца записи тишина %s, а повторы без ответа "
+                                      "идут — так выглядит «заморозка ~16 КБ» (ТСПУ к зарубежному хостингу).",
+                               fmtBytes(r.frzBytes).c_str(), fmtUs(r.frzSilenceUs).c_str());
     }
     for (size_t i = 0; i < r.wf.size(); i++)
         if (wfRstForged(r, i, w, nullptr) >= 2) {

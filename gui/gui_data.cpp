@@ -102,10 +102,21 @@ struct WfBuild {
     int rstLastId = -1;
     long long rstLastSeq = -1;
     bool inRst = false;                  // входящий RST уже был
+    // «заморозка ~16 КБ» — как в buildTcpConnTable (см. frzAdd)
+    long long frzInEnd = -1, frzOutEnd = -1;   // правый край принятых / отправленных данных (seq)
+    long long frzLastIn = -1;                  // последний входящий пакет (любой)
+    long long frzProbeOut = -1;                // последний исходящий ACK/keepalive/FIN (0–1 байт)
+    long long frzLastNew = -1;                 // последние новые данные сервера
 };
 
 // a не дальше b по seq (с переполнением 32 бит)
 bool seqLE(long long a, long long b) { return (int32_t)((uint32_t)a - (uint32_t)b) <= 0; }
+
+// позади правого края больше чем на 2^30 — не повтор, а смена базы номеров
+// (как seqRebased в analyzer.cpp)
+bool seqRebased(long long maxEnd, long long seq) {
+    return maxEnd >= 0 && (int32_t)((uint32_t)seq - (uint32_t)maxEnd) < -(1 << 30);
+}
 
 int wfPush(FlowRow& r, const FlowEvent& e) {
     if (r.wf.size() >= kWfMaxEvents) { r.wfDropped++; return -1; }
@@ -209,6 +220,47 @@ void wfAdd(FlowRow& r, WfBuild& b, const Packet& p, bool out, long long rel) {
         }
     }
     if (F) { e.bytes = 0; point(FE_FIN); }
+}
+
+// «Заморозка ~16 КБ»: счётчики по тем же правилам, что inUniqBytes / lastNewData /
+// laterPkts в buildTcpConnTable, — подсказка в профиле не расходится с режимом 2.
+// Отдельно от wfAdd: у профиля свои правила (1 байт — тоже данные).
+void frzAdd(FlowRow& r, WfBuild& b, const Packet& p, bool out, long long rel) {
+    const bool S = p.flags.find('S') != std::string::npos;
+    const bool R = p.flags.find('R') != std::string::npos;
+    bool repeat = false;   // повтор уже отправленного/принятого
+    if (out) {
+        if (S || R) return;
+        if (p.length > 1) {
+            // данные: повтор, если этот seq уже уходил (без seq повтор не отличить)
+            if (p.seq < 0 || (b.frzOutEnd >= 0 && seqLE(p.seq, b.frzOutEnd) && !seqRebased(b.frzOutEnd, p.seq)))
+                repeat = true;
+            else b.frzOutEnd = p.seq;
+        } else {
+            // ACK, keepalive, FIN: повтор, только если на прошлый такой сервер не ответил
+            // ничем — простаивающее keep-alive-соединение не «заморозка»
+            if (b.frzProbeOut >= 0 && b.frzLastIn < b.frzProbeOut) repeat = true;
+            b.frzProbeOut = rel;
+        }
+    } else {
+        b.frzLastIn = rel;
+        if (p.length > 0 && !R) {
+            // новые данные или повтор уже принятого; перекрытие с принятым не в счёт
+            bool fresh = true;
+            long long add = p.length;
+            if (p.seq >= 0) {
+                const long long maxEnd = seqRebased(b.frzInEnd, p.seq) ? -1 : b.frzInEnd;
+                if (maxEnd >= 0 && seqLE(p.seq, maxEnd)) fresh = false;
+                else if (maxEnd >= 0)
+                    add = std::min(add, (long long)(uint32_t)((uint32_t)p.seq - (uint32_t)maxEnd));
+                if (fresh) b.frzInEnd = p.seq;
+            }
+            if (fresh) { r.frzBytes += add; b.frzLastNew = rel; r.frzLater = 0; return; }
+            repeat = true;
+        }
+    }
+    // повтор (в любую сторону) спустя ≥1 с после последних новых данных
+    if (repeat && b.frzLastNew >= 0 && rel - b.frzLastNew >= 1000000) r.frzLater++;
 }
 
 // После прохода: эталонный TTL сервера для входящих RST — данные сервера
@@ -370,7 +422,10 @@ void buildFlows(Dataset& ds) {
         }
         if (!out && !p.httpBlockMark.empty() && r.httpBlockMark.empty())
             r.httpBlockMark = p.httpBlockMark;
-        if (p.proto == "TCP" && rel >= 0) wfAdd(r, wb[ins.first->second], p, out, rel);
+        if (p.proto == "TCP" && rel >= 0) {
+            wfAdd(r, wb[ins.first->second], p, out, rel);
+            frzAdd(r, wb[ins.first->second], p, out, rel);
+        }
         if (p.ech) r.ech = true;
         if (p.quic) r.quic = true;
         if (p.wgType) r.wg = true;
@@ -409,6 +464,9 @@ void buildFlows(Dataset& ds) {
         // ECH показываем только настоящий: внешний SNI — публичное имя провайдера.
         // Иначе расширение холостое (GREASE ECH браузера), и SNI — сам домен.
         r.ech = r.ech && isEchPublicName(r.sni);
+        // «заморозка ~16 КБ»: тишина от последних новых данных сервера до конца записи
+        // (как tEnd − lastNewData в connFreeze16k)
+        if (wb[ri].frzLastNew >= 0) r.frzSilenceUs = durUs - wb[ri].frzLastNew;
 
         // SYN в самом конце дампа: ответ мог просто не попасть в запись
         const bool inTail = durUs > 0 && r.firstUs >= 0 && r.firstUs > durUs - tail;

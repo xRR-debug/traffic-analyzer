@@ -132,6 +132,11 @@ struct FlowRow {
     bool certProblem = false;                  // clientCertProblem — сертификат не предъявлен/отвергнут
     std::vector<FlowEvent> wf;                 // временной профиль (только TCP), по времени
     int wfDropped = 0;                         // событий сверх лимита — не записаны
+    // «заморозка ~16 КБ», как inUniqBytes / laterPkts в buildTcpConnTable: новых байт от
+    // сервера, тишина после последних из них до конца записи (-1 — данных не было) и
+    // повторов без ответа спустя ≥1 с после них
+    long long frzBytes = 0, frzSilenceUs = -1;
+    int frzLater = 0;
     int state = FS_OK;
     bool problem = false;                      // стоит показать в «только проблемные»
     std::string search;                        // строка для фильтра (нижний регистр)
