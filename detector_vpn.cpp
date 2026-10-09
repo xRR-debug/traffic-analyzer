@@ -355,7 +355,11 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
         long long firstUs = -1, bytes = 0;
     };
     std::map<std::string, PortHit> portHits;   // ключ "ip|rport|lport|proto"
-    const long long captureStartUs = packets.empty() ? 0 : tsToMicros(packets.front().ts);
+    // время — с поправкой на полночь (absTimes): от начала суток поток после 00:00
+    // оказывался «раньше» начала записи и шёл за «с начала записи» (midStream)
+    const std::vector<long long> absT = absTimes(packets);
+    long long captureStartUs = -1;
+    for (long long t : absT) if (t >= 0) { captureStartUs = t; break; }
     auto normName = [](std::string s) {
         for (auto& c : s) c = (char)::tolower((unsigned char)c);
         while (!s.empty() && s.back() == '.') s.pop_back();
@@ -374,7 +378,8 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
         if (dn != dnsNamesOfIp.end() && dn->second.count(normName(c.sni))) siteByDns.insert(c.ip);
     }
     long long vlessDnsBytes = 0;   // TLS к хостингу, но к сайту по DNS (siteByDns)
-    for (const auto& p : packets) {
+    for (size_t i = 0; i < packets.size(); i++) {
+        const Packet& p = packets[i];
         const std::string* rip = remoteSideOf(p);   // ровно одна сторона локальная
         if (!rip) continue;
         const std::string& remote = *rip;
@@ -417,7 +422,7 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
             if (h.init < 0) {
                 h.ip = remote; h.proto = p.proto; h.rport = remotePort;
                 h.vpn = vp != nullptr; h.name = vp ? vp : px;
-                h.init = srcLocal ? 1 : 0; h.firstUs = tsToMicros(p.ts);
+                h.init = srcLocal ? 1 : 0; h.firstUs = absT[i];
             }
             if (p.proto == "TCP" && flagHas(p.flags, 'S') && !flagHas(p.flags, '.') && !h.synSeen) {
                 h.init = srcLocal ? 1 : 0; h.synSeen = true;
@@ -466,7 +471,7 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
         const IpInfo& i = infoFor(h.ip);
         const bool host = (i.hosting || looksHostingOrg(i.org, i.asn)) &&
                           !isOwnIspOrg(i.org, i.asn) && !looksCdnOrg(i.org);
-        const bool midStream = !h.synSeen && h.firstUs >= 0 &&
+        const bool midStream = !h.synSeen && h.firstUs >= 0 && captureStartUs >= 0 &&
                                h.firstUs - captureStartUs < kCaptureHeadUs;
         const bool byUser = h.init == 1 || midStream;
         const bool big = h.bytes >= kPortHitBytes;
