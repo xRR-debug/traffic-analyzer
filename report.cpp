@@ -365,7 +365,8 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
     // RTT рукопожатия — отдельная выборка от RTT по данным (см. ниже, у SYN-ACK)
     long long synRttCnt = 0, synRttSum = 0, synRttMin = -1, synRttMax = -1;
     // потери по протоколу/порту: порт -> {ретрансмиссии, RST}
-    struct PortLoss { long long retr = 0, rst = 0, syn = 0, synack = 0; std::string proto; };
+    // rstRem — RST с удалённой стороны: порт ответил (закрыт), это не «SYN без ответа»
+    struct PortLoss { long long retr = 0, rst = 0, syn = 0, synack = 0, rstRem = 0; std::string proto; };
     std::map<int, PortLoss> byPort;
 
     // время с поправкой на полночь: дамп, склеенный из файлов, может её пересекать
@@ -456,7 +457,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             // «ранний» — только если начало соединения (наш SYN) есть в дампе: у
             // соединения, начатого до захвата, первые увиденные пакеты — середина
             // сессии, и RST среди них ничего не говорит о старте
-            if (fromRem) { c.rstRem++; if (c.total <= 3 && c.syn > 0) c.rstEarly++; }
+            if (fromRem) { c.rstRem++; pl.rstRem++; if (c.total <= 3 && c.syn > 0) c.rstEarly++; }
         }
 
         // TCP-опции. MSS и window scale передаются только в SYN/SYN-ACK; масштаб
@@ -606,7 +607,10 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
     long long synNoReplyExt = 0;
     for (auto& kv : conns) {
         const Conn& c = kv.second;
-        if (!(c.syn > 0 && c.synack == 0 && !c.sawData)) continue;
+        // RST с удалённой стороны в ответ на SYN — тоже ответ (порт закрыт), а не
+        // «нет ответа»: такие соединения считает sumRstEarly со своим порогом 4
+        // (одиночный RST — норм. закрытый порт), как и режим 10 (!c.inRst)
+        if (!(c.syn > 0 && c.synack == 0 && !c.sawData && c.rstRem == 0)) continue;
         if (c.firstSynT >= 0 && lastTsUs >= 0) {
             long long tail = lastTsUs - c.firstSynT;
             if (tail >= 0 && tail < TAIL_US) { synTailSkipped++; continue; }
@@ -748,6 +752,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
         std::vector<long long> rttSamples;      // для медианы
         std::set<int> ports;
         bool sawData = false;
+        bool refused = false;                   // узел отвечал RST (порт закрыт) — жив, не DOWN
     };
     std::map<std::string, IpRow> byIp;
     for (auto& kv : conns) {
@@ -763,6 +768,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
         r.synRetr += c.synRetrans; r.dataPkts += c.dataPkts;
         if (c.rstRem > 0 && (c.rstEarly > 0 || c.bytesIn == 0)) r.rstBadConns++;
         if (c.sawData) r.sawData = true;
+        if (c.rstRem > 0) r.refused = true;
         if (c.maxPayload > r.maxPayload) r.maxPayload = c.maxPayload;
         if (port > 0) r.ports.insert(port);
         if (c.rttCnt > 0) {
@@ -802,7 +808,8 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
     for (auto& kv : byIp) {
         IpRow& r = kv.second;
         // SYN без ответа — только если нет данных вообще (иначе просто асимметрия дампа)
-        bool synFail = (r.syn > 0 && r.synack == 0 && !r.sawData);
+        // и узел не отвечал RST (это ответ: порт закрыт — как synNoReply выше)
+        bool synFail = (r.syn > 0 && r.synack == 0 && !r.sawData && !r.refused);
         r.score = (synFail ? 5 : 0) + r.rst * 2 + r.retr + r.dup + r.zw + r.synRetr;
         // в таблицу: проблемные (score>0) ВСЕГДА; а если задан конкретный target —
         // показываем и его (даже если он чистый, score=0) — карточка по запросу.
@@ -1031,7 +1038,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             };
             std::string bytesStr = human(r.bytesIn) + "/" + human(r.bytesOut);
             // вердикт по адресу
-            bool hardFail = (r.syn > 0 && r.synack == 0 && !r.sawData);
+            bool hardFail = (r.syn > 0 && r.synack == 0 && !r.sawData && !r.refused);   // как synFail
             bool tspu = tspuBlocked.count(r.ip) > 0;
             bool sniBlk = sniBlockIps.count(r.ip) > 0;   // общий адрес, блок по имени
             // повторы SYN — проблема, ТОЛЬКО если соединения реально не встают.
@@ -1331,11 +1338,15 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
 
         // что именно теряется/режется — разбивка по протоколу (порту)
         {
+            // «SYN без ответа» — ни SYN-ACK, ни RST с этого порта: RST — тоже
+            // ответ (порт закрыт), как в synNoReply выше
+            auto noAnswer = [](const PortLoss& pl) {
+                return pl.syn > 0 && pl.synack == 0 && pl.rstRem == 0;
+            };
             // соберём порты с заметными потерями или сбросами
             std::vector<std::pair<int, PortLoss>> hot;
             for (auto& kv : byPort)
-                if (kv.second.retr >= 5 || kv.second.rst >= 5 ||
-                    (kv.second.syn > 0 && kv.second.synack == 0))
+                if (kv.second.retr >= 5 || kv.second.rst >= 5 || noAnswer(kv.second))
                     hot.push_back(kv);
             std::sort(hot.begin(), hot.end(),
                 [](auto& a, auto& b){ return (a.second.retr + a.second.rst) > (b.second.retr + b.second.rst); });
@@ -1346,7 +1357,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
                 const char* app = appByPort(port, pl.proto);
                 std::string appName = app ? app : "сервис";
                 char b[512];   // кириллица в UTF-8 — 2 байта на букву
-                if (pl.syn > 0 && pl.synack == 0)
+                if (noAnswer(pl))
                     snprintf(b, sizeof(b),
                         "Не подключается %s (порт %d/%s): SYN без ответа.",
                         appName.c_str(), port, pl.proto.c_str());
@@ -1354,7 +1365,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
                     snprintf(b, sizeof(b),
                         "Страдает %s (порт %d/%s): %lld ретрансмиссий, %lld RST.",
                         appName.c_str(), port, pl.proto.c_str(), pl.retr, pl.rst);
-                say((pl.syn > 0 && pl.synack == 0) ? C::RED : C::YEL,
+                say(noAnswer(pl) ? C::RED : C::YEL,
                     std::string(b) + "  [tcp.port==" + std::to_string(port) + "]");
             }
         }
