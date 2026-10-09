@@ -669,8 +669,12 @@ std::string fmtDur(double sec) {
     char b[64];
     if (sec < 1) snprintf(b, sizeof(b), "%.0f мс", sec * 1000);
     else if (sec < 120) snprintf(b, sizeof(b), "%.1f с", sec);
-    else if (sec < 7200) snprintf(b, sizeof(b), "%d мин %02d с", (int)sec / 60, (int)sec % 60);
-    else snprintf(b, sizeof(b), "%d ч %02d мин", (int)sec / 3600, ((int)sec % 3600) / 60);
+    else {
+        // в long long: испорченные метки времени дают миллиарды секунд — в int не влезают (UB)
+        const long long s = (long long)std::min(sec, 9.0e15);
+        if (s < 7200) snprintf(b, sizeof(b), "%lld мин %02lld с", s / 60, s % 60);
+        else snprintf(b, sizeof(b), "%lld ч %02lld мин", s / 3600, (s % 3600) / 60);
+    }
     return b;
 }
 
