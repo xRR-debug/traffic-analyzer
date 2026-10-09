@@ -1147,7 +1147,7 @@ void runTraceMode() {
     ensureWsa();
 
     std::cout << "Укажите цель трассировки (IP или домен).\nЦель: " << std::flush;
-    std::string s; std::getline(std::cin, s);
+    std::string s; readLine(s);
     s = trim(s);
     if (s.empty()) { std::cout << "Цель не указана.\n"; return; }
 
@@ -1350,7 +1350,7 @@ void runTraceMode() {
     // --- встречная трассировка с внешних зондов (Globalping) ---
     std::cout << "\nСделать трассировку с внешних зондов (Globalping, из-за рубежа)? "
               << "Сравнить маршрут со стороны [y/N]: " << std::flush;
-    std::string yn; std::getline(std::cin, yn);
+    std::string yn; readLine(yn);
     if (isYesAnswer(yn)) {
         printf("\n=== ТРАССИРОВКА С ВНЕШНИХ ЗОНДОВ (Globalping) ===\n");
         std::string tgt = !targetName.empty() ? targetName : targetIp;
@@ -1439,7 +1439,7 @@ void runGeoRttMode() {
 
     std::cout << "Укажите цель (IP или домен).\n"
               << "Пример: 8.8.8.8   или   youtube.com\nЦель: " << std::flush;
-    std::string s; std::getline(std::cin, s);
+    std::string s; readLine(s);
     s = trim(s);
     if (s.empty()) { std::cout << "Цель не указана.\n"; return; }
 
@@ -1720,7 +1720,7 @@ void runPortCheckMode() {
     ensureWsa();
     std::cout << "Проверка доступности TCP-порта ИЗВНЕ (зонды Globalping на разных континентах).\n";
     std::cout << "Цель (IP или домен): " << std::flush;
-    std::string host; std::getline(std::cin, host);
+    std::string host; readLine(host);
     host = trim(host);
     if (host.empty()) { std::cout << "Цель не указана.\n"; return; }
     for (auto& ch : host) ch = (char)tolower((unsigned char)ch);
@@ -1735,7 +1735,7 @@ void runPortCheckMode() {
     }
 
     std::cout << "Порт (Enter — 443): " << std::flush;
-    std::string portStr; std::getline(std::cin, portStr);
+    std::string portStr; readLine(portStr);
     portStr = trim(portStr);
     long long port = 443;
     if (!portStr.empty()) {
@@ -2066,7 +2066,7 @@ void runPortScanMode() {
     ensureWsa();
 
     std::cout << "Скан портов с нашей машины.\nIP цели: " << std::flush;
-    std::string ip; std::getline(std::cin, ip);
+    std::string ip; readLine(ip);
     ip = trim(ip);
     if (!isValidIpv4Str(ip)) {
         // допускаем домен — резолвим
@@ -2080,7 +2080,7 @@ void runPortScanMode() {
     std::cout << "Диапазон портов: 'full' (1-65535), 'top' (частые),\n"
               << "  'service' (22,80,443,SSH/HTTP/почта/БД...), 'vpn' (VPN-порты),\n"
               << "  диапазон 1-1024 или список 80,443,8080: " << std::flush;
-    std::string rng; std::getline(std::cin, rng);
+    std::string rng; readLine(rng);
     rng = trim(rng);
 
     // парсим режим портов
@@ -2319,7 +2319,7 @@ void runDpiLocatorMode() {
 
     std::cout << "TSPU DPI Locator — поиск хопа, где режется по SNI.\n";
     std::cout << "Заблокированный домен (SNI), напр. rutracker.org: " << std::flush;
-    std::string host; std::getline(std::cin, host);
+    std::string host; readLine(host);
     host = trim(host);
     if (host.empty()) { std::cout << "Домен не задан.\n"; return; }
     // имя длиннее 253 символов невалидно и не влезло бы в буфер ClientHello ниже
@@ -2327,7 +2327,7 @@ void runDpiLocatorMode() {
 
     // целевой IP: можно ввести явно (IP сервера домена) или разрешить домен
     std::cout << "IP сервера (Enter — разрешить домен через DNS): " << std::flush;
-    std::string ip; std::getline(std::cin, ip);
+    std::string ip; readLine(ip);
     ip = trim(ip);
     if (ip.empty()) {
         ip = resolveHostToIp(host);
@@ -2349,7 +2349,7 @@ void runDpiLocatorMode() {
                "сервера вручную или отключите перехват DNS.%s\n",
                C::YEL, ip.c_str(), C::RST);
         std::cout << "Продолжить всё равно? [y/N]: " << std::flush;
-        std::string yn; std::getline(std::cin, yn);
+        std::string yn; readLine(yn);
         if (!isYesAnswer(yn)) return;
     }
 
@@ -2499,7 +2499,7 @@ void runUdpProbeMode() {
     ensureWsa();
 
     std::cout << "UDP handshake-пробы.\nIP цели: " << std::flush;
-    std::string ip; std::getline(std::cin, ip);
+    std::string ip; readLine(ip);
     ip = trim(ip);
     if (!isValidIpv4Str(ip)) {
         if (looksLikeDomainStr(ip)) {
@@ -2510,7 +2510,7 @@ void runUdpProbeMode() {
     }
 
     std::cout << "Порты (список 51820,500,1194,53 или 'vpn' для типичных VPN): " << std::flush;
-    std::string rng; std::getline(std::cin, rng);
+    std::string rng; readLine(rng);
     rng = trim(rng);
 
     std::vector<int> ports;
@@ -2868,7 +2868,7 @@ void runDnsHonestyMode() {
     std::cout << "Проверка честности DNS.\n"
                  "Домены через запятую (Enter — стандартный набор: контрольные + "
                  "часто блокируемые): " << std::flush;
-    std::string line; std::getline(std::cin, line);
+    std::string line; readLine(line);
     line = trim(line);
 
     std::vector<DnsDomainRes> doms;
@@ -3405,7 +3405,7 @@ void runTcp16Mode() {
     std::cout << "Тест «16 КБ» по зарубежным хостингам.\n"
                  "Свои URL через запятую (добавятся к стандартным; Enter — только стандартные): "
               << std::flush;
-    std::string line; std::getline(std::cin, line);
+    std::string line; readLine(line);
     for (auto& u : splitInput(trim(line))) {
         std::string url = u;
         if (url.find("://") == std::string::npos) url = "https://" + url;
@@ -3626,7 +3626,7 @@ static std::string rcodeName(int rc) {
 void runIpOwnerMode() {
     std::cout << "Кому принадлежит IP / домен.\n"
                  "IP или домен (можно несколько через запятую или пробел): " << std::flush;
-    std::string line; std::getline(std::cin, line);
+    std::string line; readLine(line);
     runIpOwnerFor(line);
 }
 

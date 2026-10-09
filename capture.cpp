@@ -50,14 +50,14 @@ void runCaptureMode() {
             printf("Скачайте установщик с https://npcap.com/#download («Npcap ... installer»),\n"
                    "установите его, затем снова выберите режим 5.\n\n");
             printf("Открыть страницу загрузки? (y/n): ");
-            std::string ans; std::getline(std::cin, ans);
+            std::string ans; readLine(ans);
             if (isYesAnswer(ans))
                 ShellExecuteA(nullptr, "open", "https://npcap.com/#download", nullptr, nullptr, SW_SHOWNORMAL);
             return;
         }
         printf("Установщик Npcap встроен в эту программу.\n\n");
         printf("Установить сейчас? (y/n): ");
-        std::string ans; std::getline(std::cin, ans);
+        std::string ans; readLine(ans);
         if (!isYesAnswer(ans)) {
             printf("Отменено. Можно установить Npcap вручную с https://npcap.com\n");
             return;
@@ -114,7 +114,7 @@ void runCaptureMode() {
     if (devs.empty()) { printf("Интерфейсы не найдены.\n"); pcap_freealldevs(alldevs); return; }
 
     printf("\nВыберите интерфейс (1-%d): ", (int)devs.size());
-    std::string line; std::getline(std::cin, line);
+    std::string line; readLine(line);
     int sel = atoi(line.c_str());
     if (sel < 1 || sel > (int)devs.size()) { printf("Неверный выбор.\n"); pcap_freealldevs(alldevs); return; }
     pcap_if_t* dev = devs[sel-1];
@@ -124,7 +124,7 @@ void runCaptureMode() {
     printf("Можно просто номер порта (443) или IP (8.8.8.8), либо полный\n");
     printf("синтаксис: host 8.8.8.8 | udp port 51820 | tcp port 443\n");
     printf("Фильтр: ");
-    std::string filter; std::getline(std::cin, filter);
+    std::string filter; readLine(filter);
     while (!filter.empty() && (filter.back()=='\r'||filter.back()=='\n'||filter.back()==' ')) filter.pop_back();
     while (!filter.empty() && filter.front()==' ') filter.erase(filter.begin());
 

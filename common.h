@@ -452,6 +452,7 @@ std::string regionName(const std::string& cc);    // "RUSSIA" (колонка RE
 std::string countryNameRu(const std::string& cc); // "Россия" (режим гео-RTT)
 std::string fixPad(const std::string& s);
 bool isYesAnswer(const std::string& s);
+bool readLine(std::string& s);   // строка с консоли; false — Ctrl+C или конец ввода
 bool isValidIpv4Str(const std::string& str);
 bool looksLikeDomainStr(const std::string& str);
 std::string askTargetIp();

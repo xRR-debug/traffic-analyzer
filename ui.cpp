@@ -379,6 +379,20 @@ bool isYesAnswer(const std::string& s) {
     return s.rfind("д", 0) == 0 || s.rfind("Д", 0) == 0;   // /utf-8: литералы в UTF-8
 }
 
+// Строка, введённая в консоли, — для всех запросов вместо std::getline(std::cin, …).
+// На Windows Ctrl+C обрывает ожидающий ReadConsole, CRT отдаёт конец ввода, и у
+// std::cin взводятся eofbit|failbit: без clear() все следующие getline сразу
+// возвращали пустую строку (окно --tool закрывалось, меню стирало отчёт).
+// Состояние сбрасываем, прерванный ввод — пустая строка, как отмена.
+// false — строки нет (Ctrl+C или конец ввода).
+bool readLine(std::string& s) {
+    s.clear();
+    if (std::getline(std::cin, s)) return true;
+    std::cin.clear();
+    clearerr(stdin);
+    return false;
+}
+
 // Спрашивает у пользователя цель диагностики: IP или домен.
 // Если домен — резолвит в IPv4. Возвращает IP-строку или пустую при отмене.
 // Строгая проверка IPv4: ровно 4 октета 0..255 и ничего лишнего. Вручную, без
@@ -420,7 +434,7 @@ std::string askTargetIp() {
               << "Пример: 31.56.27.51   или   youtube.com\n"
               << "Цель: " << std::flush;
     std::string s;
-    std::getline(std::cin, s);
+    readLine(s);
     while (!s.empty() && (s.back() == ' ' || s.back() == '\r' || s.back() == '\n')) s.pop_back();
     while (!s.empty() && (s.front() == ' '))  s.erase(s.begin());
     if (s.empty()) return "";
@@ -629,7 +643,14 @@ static int menuKey() {
 static void waitEnter(const char* msg) {
     std::cout << "\n" << C::GRY << msg << C::RST;
     std::cout.flush(); fflush(stdout);
-    std::string dummy; std::getline(std::cin, dummy);
+    std::string dummy;
+    // Ctrl+C обрывает ожидание (см. readLine) — ждём Enter дальше. Флаг ставит
+    // обработчик в своём потоке, иногда чуть позже, чем вернулся ввод
+    while (!readLine(dummy)) {
+        Sleep(50);
+        if (!g_traceAbort) break;      // настоящий конец ввода — не ждём вечно
+        g_traceAbort = false;
+    }
 }
 
 // Режимы 3..13 — интерактивные инструменты: цель и параметры спрашивают сами.
@@ -704,7 +725,7 @@ static int consoleMain(std::vector<std::string> files, int tool) {
             // меню сразу очищает экран — без паузы предупреждения никто не увидит
             printf("Enter — продолжить...");
             fflush(stdout);
-            std::string dummy; std::getline(std::cin, dummy);
+            std::string dummy; readLine(dummy);
         }
     }
 
