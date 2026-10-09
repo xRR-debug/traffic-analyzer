@@ -662,6 +662,29 @@ static bool jsonTrue(const std::string& obj, const std::string& key) {
 }
 
 // ------------------------------------------------------------------
+// Лимит /batch ip-api.com — 15 запросов в минуту. Когда ip-api ответил X-Rl = 0,
+// до сброса окна (X-Ttl секунд) его не трогаем ни из resolveIps, ни из asnOf
+// (трассировка), ни из режима 13: запрос в закрытое окно — снова 429, а за
+// систематическое превышение ip-api банит адрес на час. Окно общее на процесс.
+// ------------------------------------------------------------------
+static std::atomic<long long> g_ipApiBatchNotBefore{0};   // steady_clock, мс
+
+static long long steadyNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+// Запоминает окно по заголовкам ответа (rlRemain/rlTtl из httpPost).
+static void ipApiNoteLimit(int rlRemain, int rlTtl) {
+    if (rlRemain == 0)
+        g_ipApiBatchNotBefore = steadyNowMs() + (long long)((rlTtl > 0 ? rlTtl : 60) + 1) * 1000;
+}
+// Сколько мс ещё ждать открытия окна (0 — можно спрашивать).
+static long long ipApiWaitMs() {
+    const long long w = g_ipApiBatchNotBefore.load() - steadyNowMs();
+    return w > 0 ? w : 0;
+}
+
+// ------------------------------------------------------------------
 // Своя сеть: AS провайдера по собственному внешнему адресу
 // ------------------------------------------------------------------
 // Только по кнопке «Определить» в настройках — сама программа в сеть за этим
@@ -728,10 +751,19 @@ void resolveIps(const std::vector<std::string>& ipsIn,
         // до 3 попыток к ip-api.com; печатаем номер попытки, при таймауте сообщаем
         std::string resp;
         int rlRemain = -1, rlTtl = -1;
+        // Окно лимита закрыто (X-Rl = 0 — здесь, в трассировке или режиме 13):
+        // ждём сброса, как между батчами. Раньше после 429 батч уходил в ipwho.is,
+        // а следующий тут же снова стучался в закрытое окно.
+        if (long long w = ipApiWaitMs()) {
+            std::cout << "  ip-api.com: исчерпан лимит запросов, жду " << (w + 999) / 1000
+                      << " с ...\n" << std::flush;
+            Sleep((DWORD)w);
+        }
         for (int attempt = 1; attempt <= 3; attempt++) {
             std::cout << "  ip-api.com: запрос " << (i / BATCH + 1)
                       << ", попытка " << attempt << "/3 ..." << std::flush;
             resp = httpPost(L"ip-api.com", L"/batch", body, &rlRemain, &rlTtl);
+            ipApiNoteLimit(rlRemain, rlTtl);
             // поле query запрошено в fields — без него это не ответ батча
             // (страница провайдера/прокси, обрезанный ответ): не разбираем в пустоту
             if (resp.find("\"query\"") == std::string::npos) resp.clear();
@@ -816,14 +848,10 @@ void resolveIps(const std::vector<std::string>& ipsIn,
         }
         // Лимит batch-эндпойнта ip-api — 15 запросов в минуту. Раньше после
         // КАЖДОГО батча (и после последнего тоже) стояла пауза 1,5 с. Теперь
-        // ждём, только если есть следующий батч, и только когда ip-api сам
-        // сообщил, что окно исчерпано (X-Rl = 0) — ровно X-Ttl секунд.
+        // ждём, только когда ip-api сам сообщил, что окно исчерпано (X-Rl = 0),
+        // — ровно X-Ttl секунд, в начале следующего батча (ipApiWaitMs).
         bool more = end < ips.size();
-        if (more && rlRemain == 0) {
-            int waitS = (rlTtl > 0 ? rlTtl : 60) + 1;
-            std::cout << "  ip-api.com: исчерпан лимит запросов, жду " << waitS << " с ...\n";
-            Sleep((DWORD)waitS * 1000);
-        } else if (more && rlRemain < 0) {
+        if (more && rlRemain < 0) {
             Sleep(1500);   // заголовков нет — прежняя осторожная пауза
         }
     }
@@ -968,8 +996,15 @@ static std::string reverseDns(const std::string& ip) {
 
 // ASN/организация одного IP через ip-api.com (одиночный запрос).
 static std::string asnOf(const std::string& ip) {
+    // Частные/служебные хопы (роутер 192.168.x, 10.x и 100.64 оператора) ip-api
+    // не знает («private range»), а квоту /batch (15 в минуту) они тратили — как
+    // и в resolveIps, наружу их не шлём. В закрытое окно лимита тоже не стучимся
+    // (ipApiWaitMs): хоп останется «no info», зато не будет 429 и бана на час.
+    if (isPrivateIp(ip) || ipApiWaitMs() > 0) return "";
+    int rlRemain = -1, rlTtl = -1;
     std::string resp = httpPost(L"ip-api.com", L"/batch",
-        std::string("[\"") + ip + "\"]"); // используем batch для единообразия
+        std::string("[\"") + ip + "\"]", &rlRemain, &rlTtl); // используем batch для единообразия
+    ipApiNoteLimit(rlRemain, rlTtl);
     if (resp.empty()) return "";
     // ВАЖНО: имена ASN часто содержат запятые («REG.RU, Ltd», «..., Inc»).
     // jsonStr режет на запятой -> jsonText (до закрывающей кавычки, с \uXXXX).
@@ -3941,9 +3976,15 @@ void runIpOwnerFor(const std::string& input) {
     const std::wstring path = L"/batch?lang=ru&fields=status,message,country,countryCode,"
                               L"regionName,city,isp,org,as,asname,reverse,mobile,proxy,hosting,query";
     std::string resp;
-    for (int attempt = 1; attempt <= 2 && resp.empty() && !res.empty(); attempt++) {
-        resp = httpPost(L"ip-api.com", path, body);
+    // в закрытое окно лимита /batch не стучимся (ipApiWaitMs) — сразу запасной;
+    // после 429 второй попытки тоже нет: она снова попала бы в закрытое окно
+    const bool ipApiLimited = ipApiWaitMs() > 0;
+    for (int attempt = 1; attempt <= 2 && resp.empty() && !res.empty() && !ipApiLimited; attempt++) {
+        int rlRemain = -1, rlTtl = -1;
+        resp = httpPost(L"ip-api.com", path, body, &rlRemain, &rlTtl);
+        ipApiNoteLimit(rlRemain, rlTtl);
         if (resp.find("\"query\"") == std::string::npos) resp.clear();
+        if (resp.empty() && rlRemain == 0) break;
         if (resp.empty() && attempt < 2) Sleep(1000);
     }
     if (!resp.empty()) {
@@ -3982,7 +4023,9 @@ void runIpOwnerFor(const std::string& input) {
         }
     } else if (!res.empty()) {
         // запасной сервис: ipwho.is (по одному адресу, в несколько потоков)
-        std::cout << "  ip-api.com недоступен — запасной сервис ipwho.is\n";
+        std::cout << (ipApiWaitMs() > 0 ? "  ip-api.com: исчерпан лимит запросов"
+                                        : "  ip-api.com недоступен")
+                  << " — запасной сервис ipwho.is\n";
         std::vector<std::wstring> paths;
         for (auto& r : res) paths.push_back(L"/" + std::wstring(r.ip.begin(), r.ip.end()) + L"?lang=ru");
         std::vector<std::string> answers = httpsGetMany(L"ipwho.is", paths, 4);
