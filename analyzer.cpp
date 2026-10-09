@@ -564,6 +564,20 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
     TcpConnTable tt;
     std::vector<long long> absT = absTimes(packets);
     std::vector<int> outTtls;
+    // Смещение сегмента абонента от начала потока (ISN+1) по модулю 2^32. В pcap и
+    // tcpdump -S номера абсолютные; текстовый tcpdump без -S после рукопожатия
+    // печатает их от ISN или ISN+1 (seqBase). Абсолютное прочтение дальше 1 МБ от
+    // ISN — значит, номера относительные.
+    auto streamOff = [](const TcpConnState& c, long long seq) -> long long {
+        const int32_t a = (int32_t)((uint32_t)seq - (uint32_t)c.isn - 1u);
+        if (a > -(1 << 20) && a < (1 << 20)) return a;
+        return (int32_t)((uint32_t)seq - (c.seqBase == 0 ? 0u : 1u));
+    };
+    // ClientHello абонента — настоящий выбирается после прохода (нужен outTtlTypical).
+    // pos: 1 — сегмент начинает поток (накрывает ISN+1), -1 — целиком до начала
+    // потока (фейк с неверным seq), 0 — дальше в потоке или рукопожатия в дампе нет
+    struct Hello { TcpConnState* c; size_t i; long long t; int pos; };
+    std::vector<Hello> hellos;
     for (size_t i = 0; i < packets.size(); i++) {
         const Packet& p = packets[i];
         long long t = absT[i];
@@ -597,16 +611,30 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
                     c.lastProbeOut = t;
                 }
             }
-            if (S && !A) { c.syn++; if (c.synTime < 0) c.synTime = t; }
+            if (S && !A) {
+                c.syn++;
+                if (c.synTime < 0) c.synTime = t;
+                if (p.seqStart >= 0) c.isn = p.seqStart;
+            }
             if (!p.httpHost.empty() && c.httpHost.empty()) c.httpHost = p.httpHost;
             if (p.ttl > 0 && outTtls.size() < 20000) outTtls.push_back(p.ttl);
-            if (p.length > 0 && c.firstOutDataLen < 0) c.firstOutDataLen = (int)p.length;
-            if (!p.sni.empty()) {
-                if (!c.ch) { c.ch = true; c.sni = p.sni; c.chTime = t; }
-                c.snis.insert(p.sni);
-            }
+            // первый ACK абонента: в тексте «ack 1» — SYN-ACK этот tcpdump видел,
+            // номера от ISN; иначе этот ACK начал отсчёт сам — от ISN+1
+            if (A && !S && c.syn > 0 && c.seqBase < 0) c.seqBase = p.ack == 1 ? 1 : 0;
+            // где сегмент в потоке — только если рукопожатие в дампе: у соединения,
+            // начатого до записи, первым с данными бывает keep-alive Windows (1 байт,
+            // seq = SND.NXT−1), а не «разрезанный ClientHello»
+            const bool known = !S && p.length > 0 && c.syn > 0 && c.isn >= 0 && p.seqStart >= 0;
+            const long long off = known ? streamOff(c, p.seqStart) : 0;
+            const int pos = !known ? 0 : off + p.length <= 0 ? -1 : off <= 0 ? 1 : 0;
+            // первый сегмент потока — накрывающий ISN+1 (seqovl начинается раньше —
+            // считаем байты с ISN+1)
+            if (pos > 0 && c.firstOutDataLen < 0) c.firstOutDataLen = (int)(off + p.length);
+            // данные раньше ISN+1 (keep-alive — 1 байт с seq = ISN — не в счёт)
+            if (known && off < 0 && p.length > 1) c.preIsnOut++;
+            if (!p.sni.empty()) c.snis.insert(p.sni);
+            if (!p.sni.empty() || !p.ja4.empty()) hellos.push_back({&c, i, t, pos});
             if (p.ech) c.ech = true;
-            if (!p.ja4.empty() && c.ja4.empty()) { c.ja4 = p.ja4; c.ja4Kind = p.ja4Kind; }
             // mTLS: какой сертификат прислал абонент; первый запрос после рукопожатия
             if (p.tlsHs & TLSHS_CERT) c.clientCert = 1;
             else if (p.tlsHs & TLSHS_CERT_EMPTY) c.clientCert = 0;
@@ -706,6 +734,28 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
             if (it != tt.conns.end()) it->second.lowTtlOut++;
         }
     }
+    // Настоящий ClientHello. Обходчики DPI (zapret, GoodbyeDPI, ByeDPI) шлют перед
+    // ним фейки с чужим SNI: по первому блокировка доставалась домену-приманке или
+    // гасилась рабочими соединениями с тем же фейком. Фейки с малым TTL (как
+    // lowTtlOut) и целиком до начала потока не берём; из остальных — начинающий
+    // поток (ISN+1), а из равных — последний: фейк уходит раньше настоящего (фейк с
+    // верным seq и испорченной контрольной суммой иначе не отличить). JA4 — так же.
+    // Время — первого ClientHello с выбранным SNI: повторы его не сдвигают.
+    std::unordered_map<const TcpConnState*, int> sniRank, ja4Rank;
+    for (const Hello& h : hellos) {
+        const Packet& p = packets[h.i];
+        if (h.pos < 0 || (tt.outTtlTypical >= 32 && p.ttl > 0 && p.ttl <= 12)) continue;
+        const int r = h.pos > 0 ? 2 : 1;
+        if (!p.sni.empty() && r >= sniRank[h.c]) { sniRank[h.c] = r; h.c->sni = p.sni; }
+        if (!p.ja4.empty() && r >= ja4Rank[h.c]) {
+            ja4Rank[h.c] = r;
+            h.c->ja4 = p.ja4; h.c->ja4Kind = p.ja4Kind;
+        }
+    }
+    for (const Hello& h : hellos)
+        if (!h.c->ch && !h.c->sni.empty() && packets[h.i].sni == h.c->sni) {
+            h.c->ch = true; h.c->chTime = h.t;
+        }
     for (const auto& kv : tt.conns)
         if (kv.second.serverBytes >= 200) tt.workedIps.insert(kv.second.ip);
     return tt;

@@ -265,6 +265,7 @@ struct Packet {
     int         wscale = -1;     // window scale (сдвиг) из SYN/SYN-ACK
     int         sackBlocks = 0;  // число SACK-блоков (>0 = получатель сообщает о дырах)
     long long   tsVal = -1, tsEcr = -1;   // TCP timestamps (RFC 7323): TSval / TSecr
+    bool        tcpMd5 = false;  // опция MD5 (19, только pcap): ею zapret метит фейки (fooling=md5sig)
     // HTTP без TLS (только pcap, первый сегмент с данными):
     int         httpStatus = 0;  // код ответа "HTTP/1.x NNN" (0 = не ответ)
     std::string httpHost;        // Host: из запроса

@@ -32,23 +32,34 @@ struct FlowRec {
 // ------------------------------------------------------------------
 struct TcpConnState {
     std::string ip; int rport = 0, lport = 0;
-    std::string sni;                  // SNI первого ClientHello
+    // SNI настоящего ClientHello: у обходчика DPI перед ним уходят фейки с чужим
+    // SNI — их не берём (см. buildTcpConnTable)
+    std::string sni;
     std::set<std::string> snis;       // все SNI в соединении (фейк-ClientHello обхода DPI)
-    bool ch = false;                  // был ClientHello от абонента
+    bool ch = false;                  // был ClientHello от абонента (= sni не пуст)
     bool ech = false;                 // в ClientHello расширение ECH
-    std::string ja4; int ja4Kind = -1; // отпечаток первого ClientHello (-1 — не разобран)
-    long long chTime = -1;
+    std::string ja4; int ja4Kind = -1; // отпечаток настоящего ClientHello (-1 — не разобран)
+    long long chTime = -1;            // время первого ClientHello с этим SNI
     long long firstTime = -1, lastTime = -1;
     long long syn = 0, synack = 0;    // чистые SYN (с повторами) / SYN-ACK
+    long long isn = -1;               // seq исходящего SYN: данные потока — с ISN+1
+    // текстовый tcpdump без -S печатает seq абонента от ISN (1), а если SYN-ACK
+    // в этом файле нет (дамп _out из пары) — от ISN+1 (0); -1 — ещё не видно
+    int seqBase = -1;
     int synAckTtl = -1;               // TTL SYN-ACK — эталон, если данных сервера нет
     long long firstData = -1, serverBytes = 0;
     int dataTtl = -1;
     bool inRst = false; long long rstTime = -1; int rstTtl = -1;   // ПЕРВЫЙ входящий RST
     bool inFin = false;
     long long outBytes = 0;
-    int firstOutDataLen = -1;         // длина первого исходящего сегмента с данными
+    // длина первого исходящего сегмента потока — того, что начинается с ISN+1 (у
+    // seqovl — байт с ISN+1); -1 — рукопожатия в дампе нет (keep-alive не считаем)
+    int firstOutDataLen = -1;
     long long firstOutDataTime = -1;  // время первого исходящего сегмента с данными (>1 байта)
     int lowTtlOut = 0;                // исходящих сегментов с данными и аномально низким TTL
+    // исходящих сегментов с данными, начатых раньше потока (seq до ISN+1): фейки
+    // с неверным seq (GoodbyeDPI --wrong-seq, zapret badseq) и перекрытие seqovl
+    int preIsnOut = 0;
     // «заморозка» после ~16 КБ: уникальные входящие байты и что было после
     long long inMaxEnd = -1;          // правый край принятых данных (seq)
     long long inUniqBytes = 0;

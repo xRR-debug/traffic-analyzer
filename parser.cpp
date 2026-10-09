@@ -816,7 +816,7 @@ static bool parseFrame(const unsigned char* d, size_t len, int linkType,
         if (fl & 0x20) fs += 'U';
         pk.flags = "[" + (fs.empty() ? std::string("-") : fs) + "]";
         pk.win = be16(l4 + 14);
-        // TCP-опции: MSS(2), window scale(3), SACK(5), timestamps(8)
+        // TCP-опции: MSS(2), window scale(3), SACK(5), timestamps(8), MD5(19)
         if (doff > 20) {
             const uint8_t* o = l4 + 20;
             const uint8_t* oe = l4 + doff;
@@ -832,6 +832,7 @@ static bool parseFrame(const unsigned char* d, size_t len, int linkType,
                 else if (kind == 3 && ol == 3) pk.wscale = std::min<int>(o[2], 14);
                 else if (kind == 5 && ol >= 10) pk.sackBlocks = (ol - 2) / 8;
                 else if (kind == 8 && ol == 10) { pk.tsVal = be32(o + 2); pk.tsEcr = be32(o + 6); }
+                else if (kind == 19) pk.tcpMd5 = true;
                 o += ol;
             }
         }
@@ -1011,12 +1012,17 @@ static std::string parseTlsSni(const uint8_t* d, size_t n) {
 // расширений — server_name примерно в половине случаев оказывается во
 // втором сегменте, и SNI по одному пакету теряется. Кроме того, средства
 // обхода DPI режут ClientHello на несколько TLS-записей — их тоже склеиваем.
+// Они же шлют части задом наперёд (disorder) и фейки: ClientHello с чужим SNI
+// вне потока (seq раньше ISN+1 — GoodbyeDPI --wrong-seq, zapret badseq и
+// seqovl) и куски из нулей с тем же seq (zapret fakedsplit) — см. HelloReassembler.
 // ------------------------------------------------------------------
 
 // Выделить handshake-сообщение ClientHello из потока TLS-записей s.
 // 1 — собран целиком, 0 — нужны ещё байты, -1 — это не ClientHello.
-// В hs остаётся всё, что удалось собрать (даже при 0/-1).
-static int tlsCollectHello(const std::vector<uint8_t>& s, std::vector<uint8_t>& hs) {
+// В hs остаётся всё, что удалось собрать (даже при 0/-1); end (при 1) — где в s
+// кончается запись с последним байтом ClientHello.
+static int tlsCollectHello(const std::vector<uint8_t>& s, std::vector<uint8_t>& hs,
+                           size_t* end = nullptr) {
     hs.clear();
     size_t pos = 0;
     while (pos + 5 <= s.size()) {
@@ -1029,7 +1035,11 @@ static int tlsCollectHello(const std::vector<uint8_t>& s, std::vector<uint8_t>& 
         if (hs.size() >= 4) {
             size_t need = 4 + (((size_t)hs[1] << 16) | ((size_t)hs[2] << 8) | hs[3]);
             if (need > 65536) return -1;
-            if (hs.size() >= need) { hs.resize(need); return 1; }
+            if (hs.size() >= need) {
+                hs.resize(need);
+                if (end) *end = pos + 5 + rlen;
+                return 1;
+            }
         }
         if (avail < rlen) return 0;
         pos += 5 + rlen;
@@ -1087,6 +1097,10 @@ static std::string sha256Hex12(const std::string& s) {
 
 // hs — handshake-сообщение ClientHello (начинается с 0x01, без TLS-записи).
 // transport: 't' — TCP, 'q' — QUIC. false — ClientHello неполный или битый.
+// Проверка строгая: в сборку из сегментов обходчик DPI подмешивает фейки (zapret
+// fakedsplit — куски из нулей с тем же seq), и мусор не должен давать отпечаток:
+// хоть один шифр, среди методов сжатия есть null, расширения ровно до конца
+// сообщения и без повторов, имя в server_name печатное.
 // ech (необязательно) — выставляется, если в ClientHello есть расширение
 // encrypted_client_hello (0xfe0d). Chrome шлёт его и «вхолостую» (GREASE ECH),
 // поэтому настоящий ECH отличаем уже в анализе — по внешнему SNI (isEchPublicName).
@@ -1103,7 +1117,7 @@ static bool ja4FromHello(const uint8_t* hs, size_t n, char transport,
     p += 1 + (size_t)hs[p];                         // session_id
     if (p + 2 > end) return false;
     size_t csLen = be16(hs + p); p += 2;
-    if (p + csLen > end || (csLen & 1)) return false;
+    if (csLen < 2 || p + csLen > end || (csLen & 1)) return false;
     std::vector<uint16_t> ciphers;
     bool grease = false;
     for (size_t i = 0; i < csLen; i += 2) {
@@ -1112,17 +1126,21 @@ static bool ja4FromHello(const uint8_t* hs, size_t n, char transport,
     }
     p += csLen;
     if (p + 1 > end) return false;
-    p += 1 + (size_t)hs[p];                         // compression_methods
-    if (p > end) return false;
+    const size_t cmLen = hs[p];                     // compression_methods
+    if (cmLen < 1 || p + 1 + cmLen > end ||
+        std::find(hs + p + 1, hs + p + 1 + cmLen, 0) == hs + p + 1 + cmLen)
+        return false;
+    p += 1 + cmLen;
 
     std::vector<uint16_t> exts, sigAlgs, groups;
-    bool hasSni = false;
+    bool hasSni = false, hasEch = false;
     std::string alpn;
     uint16_t maxVer = 0;
-    if (p + 2 <= end) {
+    if (p < end) {
+        if (p + 2 > end) return false;
         size_t extEnd = p + 2 + be16(hs + p);
         p += 2;
-        if (extEnd > end) return false;
+        if (extEnd != end) return false;
         while (p + 4 <= extEnd) {
             uint16_t t = be16(hs + p);
             size_t l = be16(hs + p + 2);
@@ -1131,10 +1149,16 @@ static bool ja4FromHello(const uint8_t* hs, size_t n, char transport,
             const uint8_t* e = hs + p;
             if (tlsIsGrease(t)) grease = true;
             else {
+                if (std::find(exts.begin(), exts.end(), t) != exts.end()) return false;
                 exts.push_back(t);
-                if (t == 0xfe0d && ech) *ech = true;
-                if (t == 0x0000) hasSni = true;
-                else if (t == 0x0010 && l >= 3) {          // ALPN: len2, {len1, имя}...
+                if (t == 0xfe0d) hasEch = true;
+                if (t == 0x0000) {                         // список(2), тип(1)=0, длина(2), имя
+                    const size_t nl = l >= 5 ? be16(e + 3) : 0;
+                    if (nl == 0 || e[2] != 0 || 5 + nl > l) return false;
+                    for (size_t i = 5; i < 5 + nl; i++)
+                        if (e[i] < 0x20 || e[i] > 0x7e) return false;
+                    hasSni = true;
+                } else if (t == 0x0010 && l >= 3) {        // ALPN: len2, {len1, имя}...
                     size_t nl = e[2];
                     if (3 + nl <= l) alpn.assign((const char*)e + 3, nl);
                 } else if (t == 0x000d && l >= 2) {        // signature_algorithms
@@ -1164,7 +1188,9 @@ static bool ja4FromHello(const uint8_t* hs, size_t n, char transport,
             }
             p += l;
         }
+        if (p != extEnd) return false;
     }
+    if (ech && hasEch) *ech = true;
 
     uint16_t ver = maxVer ? maxVer : legacyVer;
     const char* vs = "00";
@@ -1297,84 +1323,166 @@ static bool ja4FromTlsRecords(const uint8_t* d, size_t n, Packet& pk) {
 }
 
 class HelloReassembler {
+    // SYN абонента: где начинается поток (ISN+1) и чем помечены его настоящие пакеты
+    struct Syn {
+        uint32_t isn = 0;
+        int ttl = -1;
+        long long tsVal = -1;
+        bool md5 = false;
+    };
     struct Pending {
-        size_t idx = 0;              // пакет с первым сегментом — ему и пишем SNI
-        uint32_t nextSeq = 0;        // ожидаемый seq следующего сегмента
-        std::vector<uint8_t> buf;    // склеенные байты потока
+        uint32_t base = 0;           // seq байта 0: ISN+1 (или, без SYN в дампе, начало ClientHello)
+        std::vector<uint8_t> buf;    // байты потока от base
+        std::vector<uint8_t> have;   // 1 — байт пришёл (части бывают и задом наперёд)
+        size_t idx = SIZE_MAX;       // последний пакет с байтом 0 — ему и пишем SNI
+        std::vector<uint8_t> head;   // его байты
+        size_t end = 0;              // ClientHello собран и кончается здесь (0 — ещё нет)
         int segs = 0;
     };
-    std::map<std::string, Pending> pend_;   // ключ — направление потока
+    // ключ — направление потока; SYN забываем, когда поток собран или он не TLS
+    std::unordered_map<std::string, Syn> syn_;
+    std::unordered_map<std::string, Pending> pend_;
     static const size_t kMaxBuf = 24 * 1024;
     static const int kMaxSegs = 64;
+    static const size_t kMaxStreams = 20000;
+
+    // начало ClientHello. Средства обхода DPI (zapret/GoodbyeDPI/ByeDPI) режут его
+    // на сегменты по 1–2 байта — поэтому начало ловим и по крошечному сегменту.
+    static bool helloStart(const uint8_t* d, size_t n) {
+        return d[0] == 0x16 && (n < 2 || d[1] == 0x03) && (n < 6 || d[5] == 0x01);
+    }
+    // ClientHello из собранного подряд от байта 0 (1/0/-1 — как tlsCollectHello)
+    static int collect(const Pending& pd, std::vector<uint8_t>& hs, size_t* end = nullptr) {
+        size_t n = 0;
+        while (n < pd.have.size() && pd.have[n]) n++;
+        return tlsCollectHello(std::vector<uint8_t>(pd.buf.begin(), pd.buf.begin() + n), hs, end);
+    }
 
     // записать SNI из того, что собрано (в т.ч. частично — parseTlsSni
     // терпит обрыв, и имя часто уже есть в собранной части)
-    // JA4 — только если ClientHello собран целиком
+    // JA4 — только если ClientHello собран целиком. Пишем пакету с байтом 0, если
+    // его байты в сборке целы: с байта 0 начинается и фейк с тем же seq (GoodbyeDPI
+    // --wrong-chksum), а настоящий ClientHello ложится поверх. Неполный или битый
+    // ClientHello записанного раньше не стирает.
     static void apply(std::vector<Packet>& out, const Pending& pd) {
-        if (pd.idx >= out.size()) return;
-        std::vector<uint8_t> hs;
-        int st = tlsCollectHello(pd.buf, hs);
+        if (pd.idx >= out.size() || pd.head.size() > pd.buf.size() ||
+            !std::equal(pd.head.begin(), pd.head.end(), pd.buf.begin()))
+            return;
         Packet& pk = out[pd.idx];
-        if (pk.sni.empty()) {
-            std::string sni = sniFromHello(hs);
-            if (!sni.empty()) pk.sni = sni;
+        // ClientHello целиком в этом сегменте — его уже разобрал parseFrame
+        if (pd.end && pd.head.size() >= pd.end && !pk.ja4.empty()) return;
+        std::vector<uint8_t> hs;
+        int st = collect(pd, hs);
+        std::string sni = sniFromHello(hs);
+        if (!sni.empty()) pk.sni = sni;
+        std::string ja4, client;
+        int kind = 0;
+        bool ech = false;
+        if (st == 1 && ja4FromHello(hs.data(), hs.size(), 't', ja4, client, kind, &ech)) {
+            pk.ja4 = ja4; pk.tlsClient = client; pk.ja4Kind = kind; pk.ech = ech;
         }
-        if (st == 1 && pk.ja4.empty())
-            ja4FromHello(hs.data(), hs.size(), 't', pk.ja4, pk.tlsClient, pk.ja4Kind, &pk.ech);
+    }
+    // сборка закончена: дописать, что собрано, и больше этот поток не смотреть
+    void finish(std::vector<Packet>& out, std::unordered_map<std::string, Pending>::iterator it) {
+        apply(out, it->second);
+        syn_.erase(it->first);
+        pend_.erase(it);
     }
 
 public:
     // вызывать сразу после out.push_back(pk) с payload этого TCP-сегмента
+    // (и для SYN без данных: по нему видно, где начинается поток)
     void feed(std::vector<Packet>& out, const uint8_t* pay, size_t n) {
-        if (out.empty() || !pay || n == 0) return;
+        if (out.empty()) return;
         const size_t idx = out.size() - 1;
-        const Packet& pk = out[idx];
+        Packet& pk = out[idx];
         if (pk.proto != "TCP" || pk.seqStart < 0) return;
-        const uint32_t seq = (uint32_t)pk.seqStart;
+        const bool syn = pk.flags.find('S') != std::string::npos;
+        if (!syn && (!pay || n == 0)) return;
+        if (syn && pk.flags.find('.') != std::string::npos) return;   // SYN-ACK: поток сервера
+        uint32_t seq = (uint32_t)pk.seqStart;
         std::string key = pk.srcIp + " " + std::to_string(pk.srcPort) + ">" +
                           pk.dstIp + " " + std::to_string(pk.dstPort);
+        if (syn) {
+            if (syn_.size() >= kMaxStreams) syn_.clear();
+            Syn& s = syn_[key];
+            s = Syn();
+            s.isn = seq; s.ttl = pk.ttl; s.tsVal = pk.tsVal; s.md5 = pk.tcpMd5;
+            auto old = pend_.find(key);               // порт занят заново — новый поток
+            if (old != pend_.end()) { apply(out, old->second); pend_.erase(old); }
+            if (!pay || n == 0) return;
+            seq++;                                    // данные в SYN (TFO) — с ISN+1
+        }
+        auto sy = syn_.find(key);
+        Syn* sn = sy != syn_.end() ? &sy->second : nullptr;
+        // Фейки обходчиков DPI (zapret) в сборку не берём: TTL меньше, чем у SYN
+        // (fooling=ttl), TSval из прошлого (ts), опция MD5 (md5sig), данные без ACK
+        // (datanoack). Разобранный с них самих SNI остаётся — настоящий выбирает
+        // анализ (buildTcpConnTable)
+        if (sn && ((sn->ttl >= 0 && pk.ttl >= 0 && pk.ttl < sn->ttl) ||
+                   (sn->tsVal >= 0 && pk.tsVal >= 0 &&
+                    (int32_t)((uint32_t)pk.tsVal - (uint32_t)sn->tsVal) < 0) ||
+                   (pk.tcpMd5 && !sn->md5) || (!syn && pk.flags.find('.') == std::string::npos)))
+            return;
 
         auto it = pend_.find(key);
-        if (it != pend_.end()) {
-            Pending& pd = it->second;
-            int32_t diff = (int32_t)(seq - pd.nextSeq);
-            if (diff <= 0) {
-                // продолжение; перекрытие (ретрансмит) отрезаем
-                size_t skip = (size_t)(-(int64_t)diff);
-                if (skip < n) {
-                    pd.buf.insert(pd.buf.end(), pay + skip, pay + n);
-                    pd.nextSeq += (uint32_t)(n - skip);
-                }
-                pd.segs++;
-                std::vector<uint8_t> hs;
-                int st = tlsCollectHello(pd.buf, hs);
-                if (st != 0 || pd.buf.size() > kMaxBuf || pd.segs > kMaxSegs) {
-                    apply(out, pd);
-                    pend_.erase(it);
-                }
-                return;
-            }
-            // дырка (сегмент потерян при съёме) — берём, что успели собрать
-            apply(out, pd);
-            pend_.erase(it);
+        const uint32_t base = it != pend_.end() ? it->second.base : sn ? sn->isn + 1 : seq;
+        const int32_t d = (int32_t)(seq - base);
+        size_t skip = 0, off = 0;
+        if (d < 0) {
+            // весь сегмент до начала потока — фейк (GoodbyeDPI --wrong-seq, zapret badseq)
+            if ((int64_t)n <= -(int64_t)d) return;
+            skip = (size_t)(-(int64_t)d);
+            // начало потока внутри сегмента, перед ним — чужие байты (zapret seqovl:
+            // фейковый ClientHello «поверх» ещё не отправленного). SNI и JA4,
+            // разобранные с начала сегмента, — фейка
+            if (sn) { pk.sni.clear(); pk.ja4.clear(); pk.tlsClient.clear(); pk.ja4Kind = 0; pk.ech = false; }
+        } else {
+            off = (size_t)d;
         }
-
-        // начало нового ClientHello, которого не хватило одного сегмента?
-        // (SNI бывает уже в первом сегменте, а для JA4 нужен ClientHello целиком)
-        // Средства обхода DPI (zapret/GoodbyeDPI/ByeDPI) режут ClientHello
-        // на сегменты по 1–2 байта — поэтому начало ловим и по крошечному сегменту.
-        if (!pk.sni.empty() && !pk.ja4.empty()) return;
-        if (pay[0] != 0x16 || (n > 1 && pay[1] != 0x03) || (n > 5 && pay[5] != 0x01)) return;
-        Pending pd;
-        pd.idx = idx;
-        pd.nextSeq = seq + (uint32_t)n;
-        pd.buf.assign(pay, pay + n);
-        pd.segs = 1;
-        std::vector<uint8_t> hs;
-        int st = tlsCollectHello(pd.buf, hs);
-        if (st < 0) return;
-        if (st == 1) { apply(out, pd); return; }   // несколько записей в одном сегменте
-        pend_[key] = std::move(pd);
+        const uint8_t* q = pay + skip;
+        const size_t room = off < kMaxBuf ? kMaxBuf - off : 0;
+        const size_t qn = std::min(n - skip, room);
+        if (off == 0 && !helloStart(q, qn)) {
+            // байт 0 — не ClientHello: поток не TLS, больше не смотрим. После начала
+            // ClientHello это фейк из нулей с тем же seq (zapret fakedsplit) — пропускаем
+            if (it == pend_.end() || it->second.idx == SIZE_MAX) {
+                if (sn) syn_.erase(sy);
+                if (it != pend_.end()) pend_.erase(it);
+            }
+            return;
+        }
+        if (it == pend_.end()) {
+            // без SYN поток открывает только начало ClientHello; с SYN — и часть,
+            // пришедшая раньше начала (disorder)
+            if (off >= kMaxBuf || (off > 0 && !sn)) return;
+            if (pend_.size() >= kMaxStreams) flush(out);   // брошенные сборки
+            Pending np;
+            np.base = base;
+            it = pend_.emplace(key, std::move(np)).first;
+        }
+        Pending& pd = it->second;
+        // за собранным ClientHello пошли следующие данные (или поток слишком длинный)
+        if ((pd.end && off >= pd.end) || off >= kMaxBuf) { finish(out, it); return; }
+        if (pd.buf.size() < off + qn) { pd.buf.resize(off + qn); pd.have.resize(off + qn); }
+        bool changed = off == 0;
+        for (size_t i = 0; i < qn; i++) {
+            if (!pd.have[off + i] || pd.buf[off + i] != q[i]) changed = true;
+            pd.buf[off + i] = q[i];
+            pd.have[off + i] = 1;
+        }
+        if (off == 0) { pd.idx = idx; pd.head.assign(q, q + qn); }
+        if (changed) {
+            std::vector<uint8_t> hs;
+            size_t end = 0;
+            const int st = collect(pd, hs, &end);
+            pd.end = st == 1 ? end : 0;
+            if (pd.end) apply(out, pd);
+            // не ClientHello. С SYN это бывает и временно — фейк поверх заголовка
+            // записи, настоящие байты ещё придут; без SYN сборка на этом кончена
+            if (st < 0 && !sn) { finish(out, it); return; }
+        }
+        if (++pd.segs > kMaxSegs || n - skip > qn) finish(out, it);
     }
 
     // конец файла: дописать SNI по незавершённым сборкам

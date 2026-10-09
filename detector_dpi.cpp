@@ -1936,21 +1936,26 @@ std::vector<BlockReason> collectBlockReasons(
 //  • split/disorder — ClientHello режется на крошечный первый сегмент;
 //  • fake — перед настоящим ClientHello уходит фейковый с чужим SNI
 //    (в одном TCP-соединении два разных SNI);
-//  • фейки с малым TTL — пакет доживает до DPI, но не до сервера.
+//  • фейки с малым TTL — пакет доживает до DPI, но не до сервера;
+//  • фейки с seq раньше начала потока и перекрытие seqovl — сервер их
+//    отбрасывает как старые данные.
+// Первый сегмент и начало потока видны, только если рукопожатие в дампе
+// (firstOutDataLen, preIsnOut): keep-alive Windows не «разрезанный ClientHello».
 // ------------------------------------------------------------------
 void analyzeDpiBypass(const TcpConnTable& tt) {
-    std::vector<const TcpConnState*> splitC, multiC, lowTtlC;
-    long long lowTtlPkts = 0;
+    std::vector<const TcpConnState*> splitC, multiC, lowTtlC, preIsnC;
+    long long lowTtlPkts = 0, preIsnPkts = 0;
     for (const auto& kv : tt.conns) {
         const TcpConnState& c = kv.second;
         bool webish = c.ch || c.rport == 443 || c.rport == 80;
         if (webish && c.firstOutDataLen >= 1 && c.firstOutDataLen <= 5) splitC.push_back(&c);
         if (c.snis.size() > 1) multiC.push_back(&c);
         if (c.lowTtlOut > 0) { lowTtlC.push_back(&c); lowTtlPkts += c.lowTtlOut; }
+        if (c.preIsnOut > 0) { preIsnC.push_back(&c); preIsnPkts += c.preIsnOut; }
     }
     // одиночный крошечный сегмент бывает и у обычных программ — нужен повтор
     bool splitSig = (int)splitC.size() >= cfg().splitMinConns;
-    if (!splitSig && multiC.empty() && lowTtlC.empty()) return;
+    if (!splitSig && multiC.empty() && lowTtlC.empty() && preIsnC.empty()) return;
 
     printf("\n%s=== СРЕДСТВА ОБХОДА DPI У АБОНЕНТА ===%s\n", C::BOLD, C::RST);
     auto examples = [](const std::vector<const TcpConnState*>& v, bool withSnis) {
@@ -1981,6 +1986,13 @@ void analyzeDpiBypass(const TcpConnTable& tt) {
                "      соединениях — фейки с малым TTL (доходят до DPI, но не до сервера).\n",
                C::YEL, C::RST, tt.outTtlTypical, lowTtlPkts, (int)lowTtlC.size());
         examples(lowTtlC, false);
+    }
+    if (!preIsnC.empty()) {
+        printf("  %s[!]%s Исходящие пакеты с данными раньше начала потока (seq до ISN+1): %lld шт.\n"
+               "      в %d соединениях — фейки с неверным seq (GoodbyeDPI --wrong-seq, zapret\n"
+               "      badseq) или перекрытие seqovl (zapret): DPI их видит, сервер отбрасывает.\n",
+               C::YEL, C::RST, preIsnPkts, (int)preIsnC.size());
+        examples(preIsnC, false);
     }
     printf("  %sУ абонента, похоже, работает обходчик DPI (zapret / GoodbyeDPI / ByeDPI /\n"
            "  SpoofDPI и т.п.). Он сам может ломать соединения: при жалобах на «не\n"
