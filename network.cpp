@@ -3873,12 +3873,17 @@ void runIpOwnerFor(const std::string& input) {
     if (line.empty()) { std::cout << "Ничего не введено.\n"; return; }
 
     const size_t kMaxIps = 40;
+    // Эталонные адреса (DoH) лимит kMaxIps не режет: раньше они шли последними,
+    // и у 3–5 CDN-доменов в проверку не попадали — без их ASN обычный ответ CDN
+    // выглядел «ДРУГИЕ адреса: ?». Предел для них — 100: столько держит один
+    // батч ip-api.
+    const size_t kMaxRefIps = 100;
     std::vector<OwnerRes> res;
     std::vector<std::string> privateIps;
     bool truncated = false;
     const size_t kMaxDomains = 5;          // сравнение резолверов — не больше 5 доменов
     std::vector<DomainResolvers> domains;
-    auto addIp = [&](const std::string& ip, const std::string& host) {
+    auto addIp = [&](const std::string& ip, const std::string& host, bool ref = false) {
         if (isPrivateIp(ip)) {
             if (std::find(privateIps.begin(), privateIps.end(), ip) == privateIps.end())
                 privateIps.push_back(ip);
@@ -3890,7 +3895,7 @@ void runIpOwnerFor(const std::string& input) {
                     r.hosts.push_back(host);
                 return;
             }
-        if (res.size() >= kMaxIps) { truncated = true; return; }
+        if (res.size() >= (ref ? kMaxRefIps : kMaxIps)) { truncated = true; return; }
         OwnerRes r; r.ip = ip;
         if (!host.empty()) r.hosts.push_back(host);
         res.push_back(r);
@@ -3987,7 +3992,12 @@ void runIpOwnerFor(const std::string& input) {
                 th.emplace_back([&a, &d]() { queryResolver(a, d.name); });
         for (auto& x : th) x.join();
         // адреса от резолверов тоже проверяем на владельца (заглушки — нет:
-        // они и так помечены в таблице)
+        // они и так помечены в таблице). Сначала эталон (DoH) всех доменов —
+        // с ним сверяются остальные резолверы, — потом прочие ответы.
+        for (auto& d : domains)
+            for (auto& a : d.rs)
+                if (a.kind >= 2 && a.ok)
+                    for (auto& ip : a.ips) if (!isStubAddr(ip)) addIp(ip, d.name, true);
         for (auto& d : domains)
             for (auto& a : d.rs) {
                 for (auto& ip : a.ips)  if (!isStubAddr(ip)) addIp(ip, d.name);
@@ -3999,8 +4009,9 @@ void runIpOwnerFor(const std::string& input) {
         printf("  %s%s — частный / служебный адрес (LAN, CGNAT, loopback): во внешних базах "
                "владельца нет, это адрес внутри чьей-то сети%s\n", C::GRY, ip.c_str(), C::RST);
     if (res.empty() && domains.empty()) { std::cout << "Нет публичных адресов для проверки.\n"; return; }
-    if (truncated)
-        printf("  %sпроверяю первые %zu адресов%s\n", C::GRY, kMaxIps, C::RST);
+    if (truncated)   // эталонные адреса сверх kMaxIps тоже в res — число берём фактическое
+        printf("  %sадресов больше лимита — проверяю %zu, остальные пропущены%s\n",
+               C::GRY, res.size(), C::RST);
 
     if (!res.empty())
         printf("%s\nЗапрашиваю геобазу и реестры (RDAP) для %zu адрес(ов)...%s\n",
@@ -4203,13 +4214,21 @@ void runIpOwnerFor(const std::string& input) {
                 bool same = false;
                 for (auto& ip : a.ips) same = same || std::find(ref.begin(), ref.end(), ip) != ref.end();
                 bool sameNet = !refAsn.empty();
+                bool otherNet = false;      // есть адрес с известным ASN не из сети эталона
                 for (auto& ip : a.ips) {
                     std::string n = asnOfRes(ip);
                     sameNet = sameNet && !n.empty() && refAsn.count(n);
+                    otherNet = otherNet || (!refAsn.empty() && !n.empty() && !refAsn.count(n));
                 }
                 std::string asn = asnOfRes(a.ips[0]), who = ispOfRes(a.ips[0]);
                 if (same)         { verdict = "как у DoH"; col = C::GRN; }
                 else if (sameNet) { verdict = "другой узел той же сети (" + asn + ")"; col = C::GRN; }
+                else if (!otherNet) {
+                    // ASN нет у эталона или у этих адресов (сверх лимита, геобаза не
+                    // ответила) — сравнивать нечем; раньше тут было «ДРУГИЕ адреса: ?»
+                    verdict = "другие адреса, чем у DoH; сеть сравнить нечем — нет данных геобазы";
+                    col = C::GRY;
+                }
                 else {
                     verdict = "ДРУГИЕ адреса: " + (who.empty() ? std::string("?") : who) +
                               (asn.empty() ? std::string() : " (" + asn + ")");
