@@ -351,6 +351,9 @@ std::string guessKind(const Packet& p, const IpInfo& srcI, const IpInfo& dstI) {
     if (l7IsProxy(p.l7))    return std::string("(proxy: ") + l7Name(p.l7) + ")";
     if (p.l7 == L7_SSH)     return "(ssh session)";
     if (p.l7 == L7_BITTORRENT || p.l7 == L7_BT_DHT) return "(torrent)";
+    // STUN в потоке — WebRTC-звонок к пиру с эфемерным портом (бывает и 51820),
+    // не VPN-порт (computeVpnVerdict его тоже не считает)
+    if (p.l7 == L7_STUN)    return "(stun/webrtc)";
 
     // явные VPN-порты — только если порт на удалённой (серверной) стороне.
     // локальный эфемерный порт может случайно совпасть (напр. 1194) — это не VPN.

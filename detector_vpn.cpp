@@ -402,10 +402,14 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
         // (IPsec, не опознанный как VPN точно, guessKind пометил «(ipsec: …)» —
         // VoWiFi или не ясно; это не VPN-порт, см. ipsecClass.) Адрес из белого
         // списка по номеру порта не судим — только по сигнатурам ниже.
+        // Поток, опознанный по содержимому как BitTorrent, DHT или STUN (метка на
+        // всём потоке), — P2P или звонок, а не туннель: случайный порт пира
+        // (10808, 51820, 500…) VPN-портом не считаем, как и guessKind («(torrent)»)
         const bool white = infoFor(remote).vpnWhite;
-        const char* vp = (white || kind.rfind("(ipsec:", 0) == 0) ? nullptr
-                                                                  : vpnPortName(remotePort, p.proto);
-        const char* px = white ? nullptr : proxyPortName(remotePort);
+        const bool p2p = p.l7 == L7_BITTORRENT || p.l7 == L7_BT_DHT || p.l7 == L7_STUN;
+        const char* vp = (white || p2p || kind.rfind("(ipsec:", 0) == 0) ? nullptr
+                                                                         : vpnPortName(remotePort, p.proto);
+        const char* px = (white || p2p) ? nullptr : proxyPortName(remotePort);
         if (vp || px) {
             const int localPort = srcLocal ? p.srcPort : p.dstPort;
             PortHit& h = portHits[remote + "|" + std::to_string(remotePort) + "|" +
@@ -920,6 +924,7 @@ void runVpnAnalysis(std::vector<Packet>& packets, const std::vector<std::string>
                     kind.find("http)")        != std::string::npos ||
                     kind.find("ssh")          != std::string::npos ||
                     kind.find("torrent")      != std::string::npos ||
+                    kind.find("stun/webrtc")  != std::string::npos ||
                     kind.find("dns")          != std::string::npos ||
                     kind.find("udp/quic")     != std::string::npos ||
                     kind.find("VPN:")         != std::string::npos ||
@@ -941,7 +946,11 @@ void runVpnAnalysis(std::vector<Packet>& packets, const std::vector<std::string>
                 // медиа» по высокому UDP-порту) лишний и противоречит. Подавляем.
                 bool kindIsVpn = (kind.find("VPN") != std::string::npos ||
                                   kind.find("proxy:") != std::string::npos);
-                if (app && !kindIsVpn) {
+                // торрент/STUN опознан по содержимому, порт пира случайный —
+                // подсказка по нему («[WireGuard]» на 51820) противоречит метке
+                bool kindIsP2p = kind.find("torrent") != std::string::npos ||
+                                 kind.find("stun/webrtc") != std::string::npos;
+                if (app && !kindIsVpn && !kindIsP2p) {
                     std::string appStr = app;
                     // фильтруем дубли: если app содержит то же что kind — пропускаем
                     bool appDups =
