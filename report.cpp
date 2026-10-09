@@ -1950,7 +1950,7 @@ DumpSummary summarizeDump(const std::vector<Packet>& packets, const std::string&
     // «н/д» — только когда SYN были, а входящего TCP нет; без TCP вовсе «0» честный
     s.noInboundTcp = !tt.anyInboundTcp && s.tcpConns > 0;
 
-    std::map<std::string,long long> synT;       // rip|rport|lport -> время первого SYN
+    std::map<std::string,long long> synT;       // rip|rport|lport -> время последнего SYN до SYN-ACK
     // Ретрансмиссии — по тому же правилу, что в analyzeTcp (режим 2): повтор
     // сегмента с тем же начальным seq и той же длиной, пришедший позже порога
     // max(15 мс, 2×RTT). Отличия: здесь только исходящие, и RTT — рукопожатия
@@ -1993,7 +1993,10 @@ DumpSummary summarizeDump(const std::vector<Packet>& packets, const std::string&
         std::string ck = rip + "|" + std::to_string(rport) + "|" + std::to_string(lport);
         bool S = flagHas(p.flags, 'S'), A = flagHas(p.flags, '.');
         if (sLoc) {
-            if (S && !A && t >= 0 && !synT.count(ck)) synT[ck] = t;
+            // База RTT рукопожатия — ПОСЛЕДНИЙ SYN, как c.lastSynT в режиме 2: от
+            // первого при потерянном SYN вышел бы весь RTO (~1 с) — «рост задержки»
+            // вместо потерь, а порог ретрансмиссий 2×RTT (ниже) упирался бы в 1 с
+            if (S && !A && t >= 0) synT[ck] = t;
             if (p.length > 0 && p.seq >= 0) {
                 s.outDataSegs++;
                 const long long rkey = p.seqStart >= 0 ? p.seqStart : p.seq;
