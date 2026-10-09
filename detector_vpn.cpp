@@ -395,8 +395,10 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
 
         VpnRemote& fl = v.byRemote[remote];
         fl.bytes += p.length;                       // то же правило, что bytesByRemote
-        // MSS из SYN-ACK удалённой стороны: у IPv6 заголовок на 20 байт больше — приводим к IPv4
-        if (p.proto == "TCP" && p.mss > 0 && flagHas(p.flags, 'S') && !srcLocal)
+        // MSS из SYN-ACK удалённой стороны: у IPv6 заголовок на 20 байт больше — приводим к IPv4.
+        // Только SYN-ACK (ответ сервера абоненту): чистый SYN удалённого клиента
+        // (входящее — Plex/NAS/RDP с телефона в LTE) говорит о канале клиента, не о туннеле
+        if (p.proto == "TCP" && p.mss > 0 && flagHas(p.flags, 'S') && flagHas(p.flags, '.') && !srcLocal)
             fl.synMss = p.mss + ((remote.find(':') != std::string::npos) ? 20 : 0);
         if (remotePort > 0) fl.remotePorts.insert(remotePort);
         if (!p.sni.empty() && srcLocal) fl.snis.insert(normName(p.sni));
