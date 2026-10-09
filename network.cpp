@@ -1546,6 +1546,7 @@ void runGeoRttMode() {
     double minRtt = -1; int got = 0;
 #ifndef _WIN32
     printf("Пингую (5 проб)... ");
+    fflush(stdout);     // stdout полностью буферизован (ui.cpp) — иначе экран пуст до конца проб
     for (int i = 0; i < 5; i++) {
         IcmpReply ir = icmpEcho(targetIp, 0, 2000, "maryno-geo");
         if (ir.noSocket) { printf("Не удалось открыть ICMP-сокет.\n"); return; }
@@ -1561,6 +1562,7 @@ void runGeoRttMode() {
     if (hIcmp == INVALID_HANDLE_VALUE) { printf("Не удалось создать ICMP-хендл.\n"); return; }
     char sendData[32] = "maryno-geo";
     printf("Пингую (5 проб)... ");
+    fflush(stdout);     // stdout полностью буферизован (ui.cpp) — иначе экран пуст до конца проб
     for (int i = 0; i < 5; i++) {
         char replyBuf[sizeof(ICMP_ECHO_REPLY)+64] = {0};
         LARGE_INTEGER f,a,b; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&a);
@@ -1586,6 +1588,7 @@ void runGeoRttMode() {
         return;
     }
     printf("готово. Минимальный RTT: %s%.2f мс%s\n", C::BWHT, minRtt, C::RST);
+    fflush(stdout);     // дальше — несколько сетевых запросов к геобазам
 
     // 2) GeoIP через ip-api
     std::string resp = httpPost(L"ip-api.com", L"/batch",
@@ -2532,6 +2535,9 @@ void runDpiLocatorMode() {
            "  TTL. Пока CH не доходит до фильтра — тишина; первый TTL, на котором\n"
            "  приходит RST, — участок фильтра.%s\n", C::GRY, C::RST);
     printf("  %s(Ctrl+C — прервать)%s\n\n", C::GRY, C::RST);
+    // stdout полностью буферизован (ui.cpp): без fflush шапка, контроль и строки
+    // по TTL копились до конца замера — минутами пустой экран, похоже на зависание
+    fflush(stdout);
     g_traceAbort = false;
 
     unsigned char ch[1024], chCtl[1024];
@@ -2553,6 +2559,7 @@ void runDpiLocatorMode() {
     // 1) контроль: TCP и TLS до сервера вообще работают (нейтральный SNI, обычный TTL)
     DpiProbe ctl = dpiTlsProbe(ip, PORT, chCtl, chCtlLen, 0, 3000);
     printf("  Контроль, SNI example.com, полный TTL: %s\n", probeName(ctl));
+    fflush(stdout);
     if (ctl == DpiProbe::NoTcp) {
         printf("\n%sTCP до %s:%d не устанавливается — сервер недоступен или блокировка\n"
                "по IP (режется SYN). SNI-локатор тут неприменим — нужна трассировка.%s\n",
@@ -2569,6 +2576,7 @@ void runDpiLocatorMode() {
     // 2) базовая проба: заблокированный SNI с обычным TTL — есть ли блокировка вообще
     DpiProbe base = dpiTlsProbe(ip, PORT, ch, chLen, 0, 3000);
     printf("  SNI %s, полный TTL: %s\n\n", host.c_str(), probeName(base));
+    fflush(stdout);
     if (base == DpiProbe::Reply) {
         printf("=================== ВЫВОД ===================\n");
         printf("%sClientHello с SNI «%s» дошёл до сервера — блокировки по SNI "
@@ -2598,6 +2606,7 @@ void runDpiLocatorMode() {
     int noTcpStreak = 0;
 
     printf("  %-4s %-16s %-22s %s\n", "TTL", "ХОП (ICMP)", "TLS-РЕАКЦИЯ", "ВЕРДИКТ");
+    fflush(stdout);
     for (int ttl = 1; ttl <= kMaxTtl && !g_traceAbort; ttl++) {
         std::string hopIp = icmpHopAtTtl(ip, ttl);
         DpiProbe r = dpiTlsProbe(ip, PORT, ch, chLen, ttl, PROBE_TO);
@@ -2618,6 +2627,7 @@ void runDpiLocatorMode() {
         printf("  %-4d %s%-16s%s %-22s %s%s%s\n",
                ttl, C::CYN, hopIp.empty()?"*":hopIp.c_str(), C::RST,
                probeName(r), vcol, verdict, C::RST);
+        fflush(stdout);             // строка на каждый TTL — сразу, как в трассировке
 
         if (blockTtl > 0 || reachedServer || noTcpStreak >= 3) break;
         // ICMP уже дошёл до самого сервера — CH с этим TTL тоже до него доставал,
@@ -2702,6 +2712,7 @@ void runUdpProbeMode() {
     printf("\n=================== UDP HANDSHAKE-ПРОБЫ ===================\n");
     printf("Цель: %s\n", ip.c_str());
     printf("  %s(Ctrl+C — прервать)%s\n\n", C::GRY, C::RST);
+    fflush(stdout);     // как в DPI-локаторе: stdout буферизован, проба — до 1,2 с на порт
 
     g_traceAbort = false;
     unsigned char buf[1300];
@@ -2743,6 +2754,7 @@ void runUdpProbeMode() {
                 printf("  UDP:%-6d %-16s %sтихо (no-reply / filtered)%s\n",
                        p, kind, C::GRY, C::RST);
             }
+            fflush(stdout);
         }
     }
 
