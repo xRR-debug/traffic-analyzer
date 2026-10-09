@@ -199,8 +199,9 @@ enum L7Proto : uint8_t {
     L7_SOCKS5, L7_SOCKS4, L7_RDP, L7_TELNET, L7_SMB, L7_STUN, L7_DNS,
     L7_OPENVPN,
     // только на пакете, до сборки потока: OpenVPN засчитываем, лишь когда в
-    // потоке есть и сброс клиента, и ответ сервера (одиночный байт — не сигнатура)
-    L7_OVPN_CLIENT, L7_OVPN_SERVER,
+    // потоке есть и сброс клиента, и ответ сервера (одиночный байт — не сигнатура),
+    // а по UDP — ещё и управляющий пакет (P_CONTROL_V1/P_ACK_V1) с session id сброса
+    L7_OVPN_CLIENT, L7_OVPN_SERVER, L7_OVPN_CTRL,
 };
 const char* l7Name(int code);            // "SSH", "BitTorrent", ...; "" для L7_NONE
 inline bool l7IsProxy(int c) { return c == L7_SOCKS5 || c == L7_SOCKS4 || c == L7_HTTP_PROXY; }
@@ -245,6 +246,8 @@ struct Packet {
     // 2 — VoWiFi точно (звонки по Wi-Fi через ePDG оператора), 0 — не ясно
     uint8_t     ipsecPeer = 0;
     uint8_t     l7 = L7_NONE;    // протокол потока по содержимому (L7Proto), только pcap
+    // OpenVPN по UDP (L7_OVPN_*): 8 байт session id за опкодом, как есть; 0 — нет
+    uint64_t    ovpnSid = 0;
     // рукопожатие TLS открытым текстом (TLSHS_*): что началось в этом сегменте; только pcap
     uint8_t     tlsHs = 0;
     int         tlsAlert = -1;   // код открытого TLS Alert (при TLSHS_ALERT), -1 — нет

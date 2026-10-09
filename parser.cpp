@@ -603,11 +603,14 @@ static uint8_t detectL7(const uint8_t* p, size_t n, size_t full, bool tcp) {
     // OpenVPN: опкод в старших 5 битах, key_id = 0. 7/10 — сброс от клиента
     // (v2 / tls-crypt-v2), 8 — ответ сервера. Поток признаётся OpenVPN только
     // если это ПЕРВЫЕ пакеты обеих сторон (флоу-маркировка в loadDumpSet).
+    // 4/5 — P_CONTROL_V1/P_ACK_V1 (рукопожатие TLS внутри): вторая улика для UDP,
+    // байтов 0x20/0x28 у короткого заголовка QUIC не бывает (бит 0x40 есть всегда)
     auto ovpn = [](uint8_t b) -> uint8_t {
         if ((b & 7) != 0) return L7_NONE;
         uint8_t op = b >> 3;
         if (op == 7 || op == 10) return L7_OVPN_CLIENT;
         if (op == 8)             return L7_OVPN_SERVER;
+        if (op == 4 || op == 5)  return L7_OVPN_CTRL;
         return L7_NONE;
     };
     if (tcp) {
@@ -886,6 +889,11 @@ static bool parseFrame(const unsigned char* d, size_t len, int linkType,
         if (!pk.wgType && pk.length > 0 && up < d + len)
             pk.l7 = detectL7(up, std::min((size_t)pk.length, (size_t)((d + len) - up)),
                              (size_t)pk.length, false);
+        // session id OpenVPN (8 байт за опкодом, открыт и при tls-auth/tls-crypt):
+        // по нему loadDumpSet сверяет сброс стороны с её управляющим пакетом
+        if ((pk.l7 == L7_OVPN_CLIENT || pk.l7 == L7_OVPN_SERVER || pk.l7 == L7_OVPN_CTRL) &&
+            up + 9 <= d + len)
+            memcpy(&pk.ovpnSid, up + 1, 8);
         // IPsec: на 4500 первые 4 байта 0 — маркер non-ESP (дальше IKE), иначе
         // это SPI ESP-пакета; 1 байт 0xFF — NAT-keepalive. Заголовок IKE:
         // SPIi(8) SPIr(8) next(1) версия(1) тип обмена(1) флаги(1) …
@@ -2811,6 +2819,9 @@ bool loadDumpSet(const std::vector<std::string>& paths,
         // Слабые сигнатуры (SOCKS, Telnet, опкод OpenVPN) — только из ПЕРВОГО
         // пакета с данными своей стороны: в середине потока такие байты
         // встречаются случайно (напр. короткий заголовок QUIC 0x40/0x50).
+        // Но если дамп начат посреди QUIC-соединения, первыми и окажутся
+        // короткие заголовки — поэтому OpenVPN по UDP требует ещё управляющий
+        // пакет (P_CONTROL_V1/P_ACK_V1) с тем же session id, что у сброса его стороны.
         std::unordered_map<std::string, int> ids;
         for (const auto& p : packets)
             if (p.l7 != L7_NONE) ids.emplace(p.proto + flowKey(p), (int)ids.size());
@@ -2820,10 +2831,14 @@ bool loadDumpSet(const std::vector<std::string>& paths,
                 std::string srcA;                       // сторона первого пакета с данными
                 bool seenA = false, seenB = false;
                 uint8_t firstA = L7_NONE, firstB = L7_NONE;
+                uint64_t sidA = 0, sidB = 0;            // session id OpenVPN в первом пакете стороны
+                bool udp = false, ovpnCtrl = false;     // ovpnCtrl — управляющий пакет той же сессии
             };
-            auto weak = [](uint8_t c) {
-                return c == L7_SOCKS5 || c == L7_SOCKS4 || c == L7_TELNET ||
-                       c == L7_OVPN_CLIENT || c == L7_OVPN_SERVER;
+            auto isOvpn = [](uint8_t c) {
+                return c == L7_OVPN_CLIENT || c == L7_OVPN_SERVER || c == L7_OVPN_CTRL;
+            };
+            auto weak = [&](uint8_t c) {
+                return c == L7_SOCKS5 || c == L7_SOCKS4 || c == L7_TELNET || isOvpn(c);
             };
             std::vector<Acc> acc(ids.size());
             std::vector<int> fid(packets.size(), -1);
@@ -2840,16 +2855,24 @@ bool loadDumpSet(const std::vector<std::string>& paths,
                 const bool first = sideA ? !a.seenA : !a.seenB;
                 (sideA ? a.seenA : a.seenB) = true;
                 const uint8_t c = p.l7;
-                if (first) (sideA ? a.firstA : a.firstB) = c;
+                if (p.proto == "UDP") a.udp = true;
+                if (first) {
+                    (sideA ? a.firstA : a.firstB) = c;
+                    (sideA ? a.sidA : a.sidB) = p.ovpnSid;
+                } else if (c == L7_OVPN_CTRL && p.ovpnSid != 0 &&
+                           p.ovpnSid == (sideA ? a.sidA : a.sidB)) {
+                    a.ovpnCtrl = true;
+                }
                 if (c == L7_NONE || a.code != L7_NONE) continue;
-                if (c == L7_OVPN_CLIENT || c == L7_OVPN_SERVER) continue;
+                if (isOvpn(c)) continue;
                 if (weak(c) && !first) continue;
                 a.code = c;
             }
             for (Acc& a : acc) {
                 const bool vpn = (a.firstA == L7_OVPN_CLIENT && a.firstB == L7_OVPN_SERVER) ||
                                  (a.firstA == L7_OVPN_SERVER && a.firstB == L7_OVPN_CLIENT);
-                if (vpn) a.code = L7_OPENVPN;
+                // по TCP сброс и так сверен с длиной в 2-байтном префиксе
+                if (vpn && (!a.udp || a.ovpnCtrl)) a.code = L7_OPENVPN;
             }
             for (size_t i = 0; i < packets.size(); i++)
                 if (fid[i] >= 0) packets[i].l7 = acc[(size_t)fid[i]].code;
