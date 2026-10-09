@@ -2478,8 +2478,21 @@ void runDpiLocatorMode() {
     std::cout << "TSPU DPI Locator — поиск хопа, где режется по SNI.\n";
     std::cout << "Заблокированный домен (SNI), напр. rutracker.org: " << std::flush;
     std::string host; readLine(host);
-    host = idnToAscii(trim(host));   // SNI — только ASCII (punycode)
+    host = trim(host);
+    // Домен из жалобы часто вставляют ссылкой («https://rutracker.org/forum/»):
+    // в SNI она ушла бы как есть, не совпала бы с правилами ТСПУ, и вышло бы
+    // ложное «блокировки нет». Берём только хост, без порта и точки в конце —
+    // как в режиме 13; кириллицу — в punycode, как её шлёт в SNI браузер.
+    for (const char* sch : { "http://", "https://", "HTTP://", "HTTPS://" })
+        if (host.compare(0, strlen(sch), sch) == 0) { host = host.substr(strlen(sch)); break; }
+    host = host.substr(0, host.find_first_of("/?#:"));
+    while (!host.empty() && host.back() == '.') host.pop_back();
+    host = idnToAscii(host);   // SNI — только ASCII (punycode), нижний регистр
     if (host.empty()) { std::cout << "Домен не задан.\n"; return; }
+    if (!looksLikeDomainStr(host)) {
+        std::cout << "Это не похоже на доменное имя. Отмена.\n";
+        return;
+    }
     // имя длиннее 253 символов невалидно и не влезло бы в буфер ClientHello ниже
     if (host.size() > 253) { std::cout << "Слишком длинный домен.\n"; return; }
 
