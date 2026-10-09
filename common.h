@@ -219,6 +219,8 @@ struct Packet {
     long long   seq = -1;        // конец диапазона (для RTT seq->ack)
     long long   seqStart = -1;   // начало диапазона (для детекта ретрансмиссий)
     long long   ack = -1;
+    bool        seqRelFixed = false; // текстовый tcpdump: первый пакет беседы напечатан
+                                     // абсолютным, переведён в относительный (fixFirstAbsoluteSeq)
     long long   win = -1;
     long long   length = 0;
     std::string appHint;         // "HTTP" если в дампе помечено

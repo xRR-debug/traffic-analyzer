@@ -2401,6 +2401,7 @@ static void fixFirstAbsoluteSeq(std::vector<Packet>& pk) {
                 f.seqStart = 0;
             }
             if (f.ack >= 0) f.ack = 1;
+            f.seqRelFixed = true;
         }
         fi = kDone;
     }

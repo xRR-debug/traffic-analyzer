@@ -619,8 +619,10 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
             if (!p.httpHost.empty() && c.httpHost.empty()) c.httpHost = p.httpHost;
             if (p.ttl > 0 && outTtls.size() < 20000) outTtls.push_back(p.ttl);
             // первый ACK абонента: в тексте «ack 1» — SYN-ACK этот tcpdump видел,
-            // номера от ISN; иначе этот ACK начал отсчёт сам — от ISN+1
-            if (A && !S && c.syn > 0 && c.seqBase < 0) c.seqBase = p.ack == 1 ? 1 : 0;
+            // номера от ISN; иначе этот ACK начал отсчёт сам — от ISN+1. «ack 1»,
+            // поставленный fixFirstAbsoluteSeq, — второй случай: tcpdump напечатал
+            // этот ACK абсолютным
+            if (A && !S && c.syn > 0 && c.seqBase < 0) c.seqBase = p.ack == 1 && !p.seqRelFixed ? 1 : 0;
             // где сегмент в потоке — только если рукопожатие в дампе: у соединения,
             // начатого до записи, первым с данными бывает keep-alive Windows (1 байт,
             // seq = SND.NXT−1), а не «разрезанный ClientHello»
