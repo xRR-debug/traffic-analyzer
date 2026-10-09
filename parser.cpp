@@ -513,6 +513,24 @@ static void parseDnsPayload(const uint8_t* d, size_t n, Packet& pk) {
 static std::string parseTlsSni(const uint8_t* d, size_t n); // объявление (тело ниже)
 static bool ja4FromTlsRecords(const uint8_t* d, size_t n, Packet& pk); // тоже ниже
 
+// Значения из HTTP — чужие байты из дампа: управляющие символы (ESC, BEL,
+// CR/LF, DEL и C1 U+0080…U+009F в UTF-8) заменяем на «?», как у имён DNS.
+// Иначе Location вида «http://x/\x1b[2J…» в консоли (--console, --batch)
+// стирал экран и подменял вердикт, OSC 52 — буфер обмена, а в файле отчёта
+// stripAnsiTo съедал всё от чужого ESC до ближайшей «m».
+static std::string httpSafe(std::string v) {
+    for (size_t i = 0; i < v.size(); i++) {
+        const unsigned char c = (unsigned char)v[i];
+        if (c < 0x20 || c == 0x7f) v[i] = '?';
+        else if (c == 0xC2 && i + 1 < v.size() &&
+                 (unsigned char)v[i + 1] >= 0x80 && (unsigned char)v[i + 1] <= 0x9F) {
+            v[i] = '?';
+            v.erase(i + 1, 1);
+        }
+    }
+    return v;
+}
+
 // Нешифрованный HTTP в начале сегмента: запрос -> Host, ответ -> код,
 // Location и признаки страницы-заглушки о блокировке (провайдерские
 // заглушки РКН обычно приходят ответом 302 на warning.rt.ru/lawfilter или
@@ -531,7 +549,7 @@ static void parseHttpHead(const uint8_t* d, size_t n, Packet& pk) {
         if (e == std::string::npos) e = s.size();
         std::string v = s.substr(p, e - p);
         size_t b = v.find_first_not_of(" \t");
-        return b == std::string::npos ? "" : v.substr(b, 200);
+        return b == std::string::npos ? "" : httpSafe(v.substr(b, 200));
     };
     static const char* kMethods[] = { "GET ", "POST ", "HEAD ", "PUT ", "OPTIONS ", "CONNECT " };
     for (const char* m : kMethods) {
@@ -544,7 +562,7 @@ static void parseHttpHead(const uint8_t* d, size_t n, Packet& pk) {
             // строка) — до конца строки, чтобы не захватить заголовки
             size_t ps = strlen(m), pe = std::min(s.find(' ', ps), s.find("\r\n", ps));
             if (pe == std::string::npos && s.size() > ps) pe = s.size();
-            if (pe != std::string::npos && pe > ps) pk.httpPath = s.substr(ps, std::min<size_t>(pe - ps, 200));
+            if (pe != std::string::npos && pe > ps) pk.httpPath = httpSafe(s.substr(ps, std::min<size_t>(pe - ps, 200)));
             return;
         }
     }
