@@ -829,6 +829,18 @@ void resolveIps(const std::vector<std::string>& ipsIn,
     }
 }
 
+// ipapi.is с 1 сентября 2026 без ключа API отвечает урезанно: страна, ASN,
+// компания — а флагов is_vpn/is_proxy/is_tor/is_datacenter в ответе нет.
+// Нет флага — это не «false»: такой ответ о VPN ничего не говорит, и считать
+// адрес проверенным («чисто») нельзя.
+static bool ipapiHasFlags(const std::string& resp) {
+    return resp.find("\"is_datacenter\"") != std::string::npos ||
+           resp.find("\"is_vpn\"") != std::string::npos;
+}
+// Урезанный ответ уже видели — до конца работы программы ipapi.is не спрашиваем:
+// адреса туда уходили бы впустую.
+static std::atomic<bool> g_ipapiNoFlags{false};
+
 // Вторичная проверка хостинга/VPN через ipapi.is (по одному IP, HTTPS GET).
 // Запускаем ТОЛЬКО для адресов, которые ip-api не отметил как hosting и которые
 // не являются известными CDN — чтобы добрать пропуски (напр. CGI Global).
@@ -856,14 +868,37 @@ void resolveHostingSecondary(std::unordered_map<std::string, IpInfo>& cache,
         paths.push_back(L"/?q=" + std::wstring(ip.begin(), ip.end()));
     }
     if (todo.empty()) return;
-    // 2) спрашиваем параллельно (раньше — по одному с паузой 400 мс)
+    // printf, а не cout: предупреждение должно попасть и в отчёт рядом с вердиктом
+    auto warnNoFlags = [] {
+        printf("  %sipapi.is: без ключа API сервис больше не отдаёт флаги VPN/прокси/Tor/"
+               "датацентр — вторичная проверка недоступна. Адреса ею НЕ проверены (это не "
+               "«чисто»): хостинг/VPN видны только по ip-api и базе IP2Proxy (если подключена).%s\n",
+               C::YEL, C::RST);
+    };
+    if (g_ipapiNoFlags) { warnNoFlags(); return; }
+    // 2) первый адрес — отдельно: урезанный ответ без ключа виден сразу, и
+    // остальной бюджет на пустые ответы не тратится
     std::cout << "  ipapi.is: проверка " << todo.size() << " адрес(ов) ...\n" << std::flush;
-    std::vector<std::string> answers = httpsGetMany(L"api.ipapi.is", paths, 6);
+    std::vector<std::string> answers(todo.size());
+    answers[0] = httpsGet(L"api.ipapi.is", paths[0]);
+    if (!answers[0].empty() && !ipapiHasFlags(answers[0])) {
+        g_ipapiNoFlags = true;
+        warnNoFlags();
+        return;
+    }
+    // остальные — параллельно (раньше — по одному с паузой 400 мс)
+    if (todo.size() > 1) {
+        std::vector<std::wstring> rest(paths.begin() + 1, paths.end());
+        std::vector<std::string> more = httpsGetMany(L"api.ipapi.is", rest, 6);
+        for (size_t n = 0; n < more.size(); n++) answers[n + 1] = std::move(more[n]);
+    }
     // 3) разбираем ответы
+    size_t noFlags = 0;
     for (size_t n = 0; n < todo.size(); n++) {
         IpInfo& info = *todo[n];
         const std::string& resp = answers[n];
         if (resp.empty()) continue;
+        if (!ipapiHasFlags(resp)) { noFlags++; continue; }   // флагов нет — адрес не проверен
         auto isTrue = [&](const char* key) {
             std::string k = std::string("\"") + key + "\"";
             size_t p = resp.find(k);
@@ -883,6 +918,11 @@ void resolveHostingSecondary(std::unordered_map<std::string, IpInfo>& cache,
         info.isVpn = info.isVpn || fVpn; info.isProxy = info.isProxy || fProxy; info.isTor = info.isTor || fTor;
         if (fVpn || fProxy || fTor)
             info.flagSrc = info.flagSrc.empty() ? "ipapi.is" : info.flagSrc + " + ipapi.is";
+    }
+    // первый адрес не ответил, а остальные пришли урезанными — то же самое
+    if (noFlags) {
+        g_ipapiNoFlags = true;
+        warnNoFlags();
     }
 }
 
@@ -1511,7 +1551,8 @@ void runGeoRttMode() {
 
     // --- сверка по нескольким GeoIP-источникам с полной инфой + security-флаги ---
     // Опрашиваем ip-api, ipwho.is, iplocate.io, ipapi.is. Для каждого показываем
-    // страну/город/ASN; ipapi.is даёт флаги is_vpn/proxy/tor/datacenter/abuser.
+    // страну/город/ASN; ipapi.is даёт флаги is_vpn/proxy/tor/datacenter/abuser
+    // (с сентября 2026 — только с ключом API, см. ipapiHasFlags).
     std::string cc2, cc3;
     std::string city1 = jsonStr(resp, "city");
     std::wstring wip(targetIp.begin(), targetIp.end());
@@ -1543,9 +1584,11 @@ void runGeoRttMode() {
     // security-флаги от ipapi.is
     std::string ccSec, citySec, orgSec;
     bool fVpn=false, fProxy=false, fTor=false, fDc=false, fAbuser=false;
+    int secState = 0;   // 0 — нет ответа, 1 — ответ без флагов (нет ключа API), 2 — флаги есть
     {
         std::string rs = httpsGet(L"api.ipapi.is", L"/?q=" + wip);
         if (!rs.empty()) {
+            secState = ipapiHasFlags(rs) ? 2 : 1;
             ccSec = jsonStr(rs, "country_code");
             citySec = jsonStr(rs, "city");
             auto bf = [&](const char* k){ return jsonStr(rs, k) == "true"; };
@@ -1598,8 +1641,14 @@ void runGeoRttMode() {
         if (fDc)     printf("%sDATACENTER%s ", C::YEL, C::RST);
         if (fAbuser) printf("%sABUSER%s ", C::RED, C::RST);
         printf("\n");
-    } else {
+    } else if (secState == 2) {
         printf("  %sФлаги (ipapi.is): чисто (не VPN/proxy/tor/datacenter)%s\n", C::GRY, C::RST);
+    } else if (secState == 1) {
+        // без флага — не «чисто»: урезанный ответ без ключа о VPN ничего не говорит
+        printf("  %sФлаги (ipapi.is): недоступны — без ключа API сервис их больше не отдаёт "
+               "(это не «чисто»)%s\n", C::YEL, C::RST);
+    } else {
+        printf("  %sФлаги (ipapi.is): нет ответа — проверка не выполнена%s\n", C::YEL, C::RST);
     }
 
     int floorRtt = minPlausibleRttForCountry(cc);
