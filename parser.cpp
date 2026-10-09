@@ -180,22 +180,77 @@ static Packet parseLine(const std::string& raw) {
     //   запрос:  "... 40905+ A? top-fwz1.mail.ru. (34)"
     //   ответ A: "... 40905 1/0/0 A 95.163.52.67 (50)"
     //   NXDomain:"... 40905 NXDomain 0/1/0 (90)"
+    //   -vv:     "... [udp sum ok] 40905 q: A? mail.ru. 1/1/1 mail.ru. A 1.2.3.4 ns: … ar: … (90)"
+    // Сообщение начинается с id: у UDP — сразу за адресами (при -vv, а у IPv6 и при -v,
+    // перед ним метка «[udp sum ok]» / «[bad udp cksum 0x… -> 0x…!]»), у TCP — за
+    // «, length N». Раньше id был первым числом строки — «0» из метки, у TCP номер
+    // seq, — и запрос не находил ответа. Сегмент TCP без данных (SYN, ACK, FIN) — не
+    // DNS, как и в pcap.
     if (pk.srcPort == 53 || pk.dstPort == 53) {
-        std::istringstream ds(rest);
-        std::string w;
-        std::vector<std::string> toks;
-        while (ds >> w) toks.push_back(w);
-        // transaction id — первый токен вида "40905" или "40905+" или "40905*"
-        for (auto& tk : toks) {
-            std::string digits;
-            for (char c : tk) { if (isdigit((unsigned char)c)) digits+=c; else break; }
-            if (!digits.empty()) { pk.dnsId = digits; break; }
+        size_t m = std::string::npos;
+        if (pk.proto == "UDP") {
+            m = rest.find_first_not_of(' ');
+            while (m != std::string::npos && rest[m] == '[') {
+                size_t e = rest.find(']', m);
+                m = (e == std::string::npos) ? e : rest.find_first_not_of(' ', e + 1);
+            }
+        } else if (pk.proto == "TCP") {
+            size_t lp = rest.find(", length ");
+            if (lp != std::string::npos && atoll(rest.c_str() + lp + 9) > 0) {
+                m = rest.find(' ', lp + 9);
+                if (m != std::string::npos) m = rest.find_first_not_of(' ', m);
+            }
         }
-        bool isQuery = (rest.find("? ") != std::string::npos);  // "A? ", "AAAA? "
-        if (isQuery) {
-            pk.dnsIsResponse = false;
-            // домен идёт сразу после "A? " / "AAAA? " / "CNAME? "
-            size_t q = rest.find("? ");
+        std::vector<std::pair<size_t, std::string>> ws;   // слова сообщения: (позиция, слово)
+        for (size_t p = m; p != std::string::npos; p = rest.find_first_not_of(' ', p)) {
+            size_t e = std::min(rest.find(' ', p), rest.size());
+            ws.emplace_back(p, rest.substr(p, e - p));
+            p = e;
+        }
+        // id — число до 65535 и флаги заголовка: «+» (RD), «%» у запроса, «*-|$» у ответа
+        const std::string idw = ws.empty() ? std::string() : ws[0].second;
+        const size_t nd = std::min(idw.find_first_not_of("0123456789"), idw.size());
+        bool ok = nd >= 1 && nd <= 5 && atol(idw.c_str()) <= 65535 &&
+                  idw.find_first_not_of("+%*-|$", nd) == std::string::npos;
+        if (ok && ws.size() > 1) {          // код операции не QUERY — пропускаем, как и в pcap
+            static const char* kOps[] = { "inv_q", "stat", "op3", "notify", "update", "op6",
+                "op7", "op8", "updateA", "updateD", "updateDA", "updateM", "updateMA",
+                "zoneInit", "zoneRef" };
+            const std::string op = ws[1].second.substr(0, ws[1].second.find_first_of("+%*-|$"));
+            for (const char* o : kOps) if (op == o) ok = false;
+        }
+        // Запрос от ответа отличаем по заголовку, а не по «? » где угодно: при -vv ответ
+        // повторяет вопрос («q: A? имя.») и считался запросом. Только у ответа есть
+        // счётчики записей «N/N/N», у запроса раньше них идёт «ТИП? имя». Сообщение
+        // оборвано («[|domain]») — запрос, только если у id есть «+»/«%» (у ответа их нет).
+        auto isCounts = [](const std::string& w) {        // "1/0/0"
+            int sl = 0; bool dig = false;
+            for (char c : w) {
+                if (isdigit((unsigned char)c)) dig = true;
+                else if (c == '/' && dig && sl < 2) { sl++; dig = false; }
+                else return false;
+            }
+            return sl == 2 && dig;
+        };
+        int kind = 0;                        // 1 — запрос, 2 — ответ
+        size_t q = std::string::npos;        // «?» за типом первого вопроса
+        size_t ansB = std::string::npos;     // записи ответа — за «N/N/N»
+        bool vvQ = false, nx = false;
+        for (size_t i = 1; ok && !kind && i < ws.size(); i++) {
+            const std::string& w = ws[i].second;
+            if (w == "q:") vvQ = true;
+            else if (w.back() == '?') {
+                if (q == std::string::npos) q = ws[i].first + w.size() - 1;
+                if (!vvQ) kind = 1;
+            } else if (isCounts(w)) { kind = 2; ansB = ws[i].first + w.size(); }
+            else if (w.compare(0, 8, "NXDomain") == 0) nx = true;
+        }
+        if (ok && !kind) kind = (!vvQ && idw.find_first_of("+%", nd) != std::string::npos) ? 1 : 2;
+        if (kind) {
+            pk.dnsId = idw.substr(0, nd);
+            pk.dnsIsResponse = (kind == 2);
+            pk.dnsNxdomain = nx && kind == 2;
+            // имя вопроса — и в ответе (при -vv, из «q:»), как в pcap
             if (q != std::string::npos) {
                 // тип — слово перед "?": "A", "AAAA", "HTTPS", неизвестные — "Type65"
                 size_t tb = q;
@@ -207,6 +262,7 @@ static Packet parseLine(const std::string& raw) {
                 for (const auto& e : kQt) if (qt == e.first) { pk.dnsQtype = e.second; break; }
                 if (pk.dnsQtype == 0 && qt.size() > 4 && qt.compare(0, 4, "Type") == 0)
                     pk.dnsQtype = (uint16_t)atoi(qt.c_str() + 4);
+                // домен идёт сразу после "A? " / "AAAA? " / "CNAME? "
                 std::string dom;
                 size_t p = q + 2;
                 while (p < rest.size() && (isalnum((unsigned char)rest[p])||rest[p]=='.'||rest[p]=='-'||rest[p]=='_'))
@@ -214,20 +270,23 @@ static Packet parseLine(const std::string& raw) {
                 while (!dom.empty() && dom.back()=='.') dom.pop_back();
                 pk.dnsQuery = dom;
             }
-        } else {
-            pk.dnsIsResponse = true;
-            if (rest.find("NXDomain") != std::string::npos) pk.dnsNxdomain = true;
+        }
+        if (kind == 2 && ansB != std::string::npos) {
+            // записи ответа — до секций полномочий и дополнительной («ns:», «ar:» при -vv):
+            // адреса оттуда (glue NS-серверов) — не ответ на вопрос
+            const size_t ae = std::min(rest.find(" ns: ", ansB), rest.find(" ar: ", ansB));
+            const std::string ans = rest.substr(ansB, ae == std::string::npos ? ae : ae - ansB);
             // все "A <ip>" / "AAAA <ip>" ответа: "3/0/0 CNAME x., A 1.2.3.4, A 5.6.7.8"
             // dnsAnswerIp — первая A (если её нет — первая AAAA), dnsAnswers — все
             std::string firstA, firstA6;
             for (const char* rr : { " A ", " AAAA " }) {
                 size_t ap = 0;
-                while ((ap = rest.find(rr, ap)) != std::string::npos) {
+                while ((ap = ans.find(rr, ap)) != std::string::npos) {
                     size_t p = ap + strlen(rr);
                     ap = p;
                     std::string ip;
-                    while (p < rest.size() && (isxdigit((unsigned char)rest[p])||rest[p]=='.'||rest[p]==':'))
-                        ip += rest[p++];
+                    while (p < ans.size() && (isxdigit((unsigned char)ans[p])||ans[p]=='.'||ans[p]==':'))
+                        ip += ans[p++];
                     if (ip.find('.') == std::string::npos && ip.find(':') == std::string::npos) continue;
                     pk.dnsAnswers.push_back(ip);
                     if (rr[2] == ' ') { if (firstA.empty()) firstA = ip; }
@@ -237,12 +296,12 @@ static Packet parseLine(const std::string& raw) {
             pk.dnsAnswerIp = !firstA.empty() ? firstA : firstA6;
             // "CNAME fp-back.facct.ru., A 185.17.9.134" — цели CNAME по порядку
             size_t cp = 0;
-            while ((cp = rest.find(" CNAME ", cp)) != std::string::npos) {
+            while ((cp = ans.find(" CNAME ", cp)) != std::string::npos) {
                 size_t p = cp + 7;
                 cp = p;
                 std::string nm;
-                while (p < rest.size() && (isalnum((unsigned char)rest[p])||rest[p]=='.'||rest[p]=='-'||rest[p]=='_'))
-                    nm += rest[p++];
+                while (p < ans.size() && (isalnum((unsigned char)ans[p])||ans[p]=='.'||ans[p]=='-'||ans[p]=='_'))
+                    nm += ans[p++];
                 while (!nm.empty() && nm.back()=='.') nm.pop_back();
                 if (!nm.empty()) pk.dnsCnames.push_back(nm);
             }
@@ -2187,6 +2246,50 @@ std::string siblingDumpPath(const std::string& path) {
     return f ? cand : std::string();
 }
 
+// tcpdump без -S печатает номера TCP от начала беседы, а первый пакет беседы с
+// флагом ACK — абсолютными: с него счёт и начинается (print-tcp.c). Обычно это
+// SYN-ACK, но у соединения, начатого до записи, — пакет с данными:
+// «seq 1000000000:1000020272, ack 3000000000», а за ним «seq 20272:21720, ack 1».
+// Из-за скачка номеров в миллиарды buildTcpConnTable принимал все дальнейшие
+// данные за повторы (ложная «заморозка 16 КБ»), а отчёт — за перестановки.
+// Переводим такой пакет в относительные номера, как посчитал бы сам tcpdump:
+// seq — от него самого, ack — 1. Дамп с -S (все номера абсолютные) узнаём по
+// следующему пакету беседы: его номера ближе к абсолютным первого — не трогаем.
+static void fixFirstAbsoluteSeq(std::vector<Packet>& pk) {
+    std::unordered_map<std::string, size_t> first;   // беседа -> её первый пакет (ждёт проверки)
+    const size_t kDone = SIZE_MAX;                     // проверять нечего
+    auto dist = [](long long a, long long b) {         // расстояние по модулю 2^32
+        return std::llabs((long long)(int32_t)((uint32_t)a - (uint32_t)b));
+    };
+    for (size_t i = 0; i < pk.size(); i++) {
+        Packet& p = pk[i];
+        // без ACK tcpdump номера не пересчитывает — такие пакеты не в счёт
+        if (p.proto != "TCP" || p.flags.find('.') == std::string::npos) continue;
+        const std::string a = p.srcIp + "|" + std::to_string(p.srcPort);
+        const std::string b = p.dstIp + "|" + std::to_string(p.dstPort);
+        auto ins = first.emplace(a < b ? a + "#" + b : b + "#" + a, i);
+        size_t& fi = ins.first->second;
+        if (p.flags.find('S') != std::string::npos) { fi = kDone; continue; }  // SYN-ACK — начало счёта
+        if (ins.second || fi == kDone) continue;
+        Packet& f = pk[fi];
+        const bool same = p.srcIp == f.srcIp && p.srcPort == f.srcPort;
+        // номера стороны первого пакета: seq её пакетов и ack встречных; другой — наоборот
+        const long long x = same ? p.seqStart : p.ack, y = same ? p.ack : p.seqStart;
+        int rel = 0;   // 1 — дальше номера относительные, -1 — абсолютные
+        if (x >= 0 && f.seqStart >= 0) rel = dist(x, 0) < dist(x, f.seqStart) ? 1 : -1;
+        else if (y >= 0 && f.ack >= 0) rel = dist(y, 1) < dist(y, f.ack) ? 1 : -1;
+        if (!rel) continue;            // сравнить не с чем — ждём следующий пакет беседы
+        if (rel > 0) {
+            if (f.seqStart >= 0 && f.seq >= 0) {
+                f.seq = (uint32_t)(f.seq - f.seqStart);
+                f.seqStart = 0;
+            }
+            if (f.ack >= 0) f.ack = 1;
+        }
+        fi = kDone;
+    }
+}
+
 // Загрузка ОДНОГО файла дампа: бинарный pcap либо текстовый вывод tcpdump.
 // fmt — распознанный формат (для печати). false + err — файл прочитать не вышло.
 static bool loadDumpFile(const std::string& path, std::vector<Packet>& out,
@@ -2270,6 +2373,7 @@ static bool loadDumpFile(const std::string& path, std::vector<Packet>& out,
         Packet p = parseLine(r);
         if (p.valid) out.push_back(std::move(p));
     }
+    fixFirstAbsoluteSeq(out);
     return true;
 }
 

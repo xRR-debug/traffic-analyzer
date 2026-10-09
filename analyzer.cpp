@@ -539,6 +539,14 @@ bool seqLess(long long a, long long b) {
     return (int32_t)((uint32_t)a - (uint32_t)b) < 0;
 }
 
+// Номер позади правого края больше чем на 2^30 — не повтор: окно TCP не больше
+// 2^30 даже с wscale 14. Значит, сменилась база нумерации (в текстовом дампе не
+// распознан абсолютный первый пакет беседы — см. fixFirstAbsoluteSeq в parser.cpp —
+// или это новое соединение на тех же портах), и сегмент — новые данные.
+static bool seqRebased(long long maxEnd, long long seq) {
+    return maxEnd >= 0 && (int32_t)((uint32_t)seq - (uint32_t)maxEnd) < -(1 << 30);
+}
+
 // Внешний SNI настоящего ECH — «публичное имя» провайдера. Chrome кладёт
 // расширение ECH в КАЖДЫЙ ClientHello (GREASE ECH), так что само наличие 0xfe0d
 // ещё не ECH; реальный ECH виден по внешнему имени (у Cloudflare — cloudflare-ech.com).
@@ -577,7 +585,8 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
                 if (p.length > 1) {
                     // данные: повтор, если этот seq уже уходил (сервер не подтвердил)
                     if (p.seq < 0) repeat = true;   // без seq повтор не отличить — как раньше
-                    else if (c.outMaxEnd >= 0 && !seqLess(c.outMaxEnd, p.seq)) repeat = true;
+                    else if (c.outMaxEnd >= 0 && !seqLess(c.outMaxEnd, p.seq) &&
+                             !seqRebased(c.outMaxEnd, p.seq)) repeat = true;
                     else c.outMaxEnd = p.seq;
                     if (c.firstOutDataTime < 0) c.firstOutDataTime = t;
                 } else {
@@ -664,9 +673,10 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
                 // новые ли это данные или ретрансмит уже принятого
                 bool fresh = true; long long add = p.length;
                 if (p.seq >= 0) {
-                    if (c.inMaxEnd >= 0 && !seqLess(c.inMaxEnd, p.seq)) fresh = false;
-                    else if (c.inMaxEnd >= 0) {
-                        long long gap = (long long)(uint32_t)((uint32_t)p.seq - (uint32_t)c.inMaxEnd);
+                    const long long maxEnd = seqRebased(c.inMaxEnd, p.seq) ? -1 : c.inMaxEnd;
+                    if (maxEnd >= 0 && !seqLess(maxEnd, p.seq)) fresh = false;
+                    else if (maxEnd >= 0) {
+                        long long gap = (long long)(uint32_t)((uint32_t)p.seq - (uint32_t)maxEnd);
                         if (gap < add) add = gap;
                     }
                     if (fresh) c.inMaxEnd = p.seq;
