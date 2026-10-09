@@ -942,6 +942,96 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             printf("  %s- %s: %s%s\n", C::GRY, r->target.c_str(), r->detail.c_str(), C::RST);
     };
 
+    // ---- суммарные счётчики по всем (или отфильтрованным) соединениям и вердикт ----
+    // Один раз, ДО выбора ветки ниже: ВЫВОД без таблицы (все адреса чистые) и
+    // ВЫВОД под таблицей судят по одним признакам. Раньше ветка без таблицы их
+    // не смотрела: «SYN без ответа» (к адресу, где другое соединение с данными)
+    // или RTT 600 мс давали «проблем нет», а посторонний безобидный RST к
+    // другому серверу (строка в таблице) — «часть ресурсов недоступна».
+    long long sumSyn=0, sumSA=0, sumRst=0, sumRstEarly=0, sumRetr=0,
+              sumDup=0, sumZw=0, sumRttCnt=0, sumRttSum=0,
+              rttMinAll=-1, rttMaxAll=-1;
+    // сброшены сервером ПОСЛЕ рукопожатия, но до первых его данных (этап
+    // TLS/запроса) — и RTT рукопожатия именно этих соединений
+    long long rstNoData = 0, rstNoDataRttSum = 0, rstNoDataRttCnt = 0;
+    for (auto& kv : conns) {
+        const Conn& c = kv.second;
+        // ранние сбросы — по СОЕДИНЕНИЯМ (не по пакетам RST) и только к внешним
+        // адресам: так же, как rstBadConns в таблице
+        const bool ext = !isPrivateIp(c.remoteIp);
+        if (ext && c.rstEarly > 0) sumRstEarly++;
+        if (ext && c.syn > 0 && c.synack > 0 && c.rstRem > 0 && c.bytesIn == 0) {
+            rstNoData++;
+            if (c.synRtt >= 0) { rstNoDataRttSum += c.synRtt; rstNoDataRttCnt++; }
+        }
+        sumSyn += c.syn; sumSA += c.synack; sumRst += c.rst;
+        sumRetr += c.retrans; sumDup += c.dupAck; sumZw += c.zeroWin;
+        if (c.rttCnt > 0) {
+            sumRttCnt += c.rttCnt; sumRttSum += c.rttSum;
+            if (rttMinAll < 0 || c.rttMin < rttMinAll) rttMinAll = c.rttMin;
+            if (c.rttMax > rttMaxAll) rttMaxAll = c.rttMax;
+        }
+    }
+    // пакетов с данными (повторы — в обе стороны, как и ретрансмиссии)
+    long long dataPkts = 0;
+    for (auto& kv : conns) dataPkts += (long long)kv.second.seqSeen.size() + kv.second.retrans;
+    // доля ретрансмиссий от data-пакетов (процент важнее абсолюта:
+    // 300 ретр. на мегабайтах — норма, а 30 на 100 пакетах — проблема)
+    const double retrPct = (dataPkts > 0) ? (100.0 * sumRetr / dataPkts) : 0.0;
+    // если data-пакетов много (крупная передача УСПЕШНО прошла), высокий
+    // % ретрансмиссий часто = артефакт offload (TSO/GRO/LRO) в захвате,
+    // а не реальные потери — иначе передача бы не завершилась. Входящие
+    // потери до точки съёма (totalLostIn) — не артефакт: оригинала в дампе
+    // нет вовсе, — если повторы в основном они, оговорку не делаем.
+    const bool offloadLike = (dataPkts >= 500 && totalLostIn * 2 < sumRetr);
+    const long long avgRtt = (sumRttCnt > 0) ? sumRttSum / sumRttCnt : -1;
+
+    // connHard — действительно серьёзные признаки: SYN без ответа,
+    // МНОГО ранних RST (одиночный RST = норм. закрытие/закрытый порт)
+    // или упорные повторы SYN. Одиночный RST больше не триггер.
+    // Повторы SYN — только у соединений, так и не получивших ответа
+    // (synRetrFail): успешные повторы — потери на старте, они в someLoss.
+    // Прямой DPI добавляется в ВЫВОДе (hardBlock).
+    const bool connHard = (synNoReplyExt > 0 || sumRstEarly >= 4 || synRetrFail >= 5);
+    // тяжёлые потери — высокая ДОЛЯ при умеренном объёме. На очень
+    // крупных передачах (>=500 data-пакетов) высокий % обычно offload-
+    // артефакт, а не потери, поэтому туда heavyLoss не распространяем
+    // (кроме входящих потерь до точки съёма — см. offloadLike).
+    const bool heavyLoss = (dataPkts >= 100 && !offloadLike && retrPct >= 10.0);
+    const bool slowRoute = (avgRtt >= 500000);
+    // одиночный повтор SYN — потеря одного пакета, не «потери» (порог 3)
+    const bool someLoss  = (retrPct >= 3.0 || sumDup >= 20 || sumZw >= 10 || totalSynRetr >= 3);
+    const bool elevated  = (avgRtt >= 300000 && avgRtt < 500000);
+    // абзацы ВЫВОДа по этому вердикту — общие для обеих веток
+    auto printConnBad = [&]() {
+        if (connHard && heavyLoss)
+            printf("%sСоединение работает плохо: часть подключений не\n"
+                   "устанавливается, плюс большие потери пакетов. Похоже на\n"
+                   "блокировку/фильтрацию или серьёзную проблему канала.%s\n",
+                   C::RED, C::RST);
+        else if (connHard)
+            printf("%sЕсть неустановленные соединения (SYN без ответа) или ранние\n"
+                   "сбросы. Часть ресурсов недоступна — возможна блокировка,\n"
+                   "закрытый порт или недоступный сервер.%s\n", C::RED, C::RST);
+        else
+            printf("%sСоединения устанавливаются, но качество плохое: %s%s. Это\n"
+                   "указывает на проблему канала/маршрута, а не на блокировку.%s\n",
+                   C::YEL,
+                   heavyLoss ? "много потерь пакетов" : "",
+                   slowRoute ? (heavyLoss ? " и высокий RTT" : "очень высокий RTT (медленный ответ)") : "",
+                   C::RST);
+    };
+    // brief — приписка к другому основному выводу (UDP, mTLS)
+    auto printConnSoft = [&](bool brief) {
+        if (brief)
+            printf("%sTCP-соединения в целом рабочие, есть умеренные потери или "
+                   "повышенный RTT.%s\n", C::YEL, C::RST);
+        else
+            printf("%sСоединения в целом рабочие, есть умеренные потери или\n"
+                   "повышенный RTT. Возможны кратковременные подтормаживания,\n"
+                   "но явной блокировки не видно.%s\n", C::YEL, C::RST);
+    };
+
     if (rows.empty()) {
         if (!targetIp.empty())
             printf("\n%sПо адресу %s в дампе нет трафика (или только приватные пакеты).%s\n",
@@ -956,8 +1046,14 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             }
             const auto udpOther = udpOtherOf(tspuBlocked);
             const bool anyBlock = !tspuBlocked.empty() || !blockedSnisAll.empty() || !dpiFindings.empty();
+            // вердикт по соединениям — тот же, что в ВЫВОДе под таблицей (посчитан
+            // выше): без строк в таблице остаются «SYN без ответа» к адресу, где
+            // было и рабочее соединение, и высокий RTT
+            const bool connBad = connHard || heavyLoss || slowRoute;
+            const bool connSoft = someLoss || elevated;
             // таблицы проблем нет, но блокировка найдена — ВЫВОД всё равно печатаем
-            if (anyBlock || !frz16.empty() || !udpOther.empty() || !udpSess.empty() || !clientCert.empty())
+            if (anyBlock || !frz16.empty() || connBad || !udpOther.empty() || !udpSess.empty() ||
+                !clientCert.empty() || connSoft)
                 printf("\n=================== ВЫВОД ===================");
             if (!tspuBlocked.empty()) {
                 std::set<std::string> tcpIps;
@@ -990,22 +1086,29 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             } else if (!frz16.empty()) {
                 printf("\n");
                 printFreeze(false);
-            } else if (!udpOther.empty()) {
+            } else if (connBad) {
                 printf("\n");
-                printUdpOther(udpOther, false);
-            } else if (!udpSess.empty()) {
+                printConnBad();
+            } else if (!udpOther.empty() || !udpSess.empty()) {
+                // как под таблицей: UDP — основной вывод, TCP — припиской
                 printf("\n");
-                printUdpSess(false);
+                if (!udpOther.empty()) printUdpOther(udpOther, false);
+                if (!udpSess.empty()) printUdpSess(!udpOther.empty());
+                if (connSoft) printConnSoft(true);
             } else if (!clientCert.empty()) {
                 printf("\n");
                 printClientCert(false);
+                if (connSoft) printConnSoft(true);
+            } else if (connSoft) {
+                printf("\n");
+                printConnSoft(false);
             } else {
                 printf("\n%sЯвных проблем соединения не обнаружено.%s\n", C::GRN, C::RST);
             }
             if (anyBlock && !frz16.empty()) printFreeze(true);
-            if ((anyBlock || !frz16.empty()) && !udpOther.empty()) printUdpOther(udpOther, true);
-            if ((anyBlock || !frz16.empty() || !udpOther.empty()) && !udpSess.empty()) printUdpSess(true);
-            if ((anyBlock || !frz16.empty() || !udpOther.empty() || !udpSess.empty()) && !clientCert.empty())
+            if ((anyBlock || !frz16.empty() || connBad) && !udpOther.empty()) printUdpOther(udpOther, true);
+            if ((anyBlock || !frz16.empty() || connBad) && !udpSess.empty()) printUdpSess(true);
+            if ((anyBlock || !frz16.empty() || connBad || !udpOther.empty() || !udpSess.empty()) && !clientCert.empty())
                 printClientCert(true);
         }
     } else {
@@ -1209,31 +1312,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
 
         printf("\n%sДетали:%s\n", C::BOLD, C::RST);
 
-        // соберём суммарные счётчики по всем (или отфильтрованным) соединениям
-        long long sumSyn=0, sumSA=0, sumRst=0, sumRstEarly=0, sumRetr=0,
-                  sumDup=0, sumZw=0, sumRttCnt=0, sumRttSum=0,
-                  rttMinAll=-1, rttMaxAll=-1;
-        // сброшены сервером ПОСЛЕ рукопожатия, но до первых его данных (этап
-        // TLS/запроса) — и RTT рукопожатия именно этих соединений
-        long long rstNoData = 0, rstNoDataRttSum = 0, rstNoDataRttCnt = 0;
-        for (auto& kv : conns) {
-            const Conn& c = kv.second;
-            // ранние сбросы — по СОЕДИНЕНИЯМ (не по пакетам RST) и только к внешним
-            // адресам: так же, как rstBadConns в таблице
-            const bool ext = !isPrivateIp(c.remoteIp);
-            if (ext && c.rstEarly > 0) sumRstEarly++;
-            if (ext && c.syn > 0 && c.synack > 0 && c.rstRem > 0 && c.bytesIn == 0) {
-                rstNoData++;
-                if (c.synRtt >= 0) { rstNoDataRttSum += c.synRtt; rstNoDataRttCnt++; }
-            }
-            sumSyn += c.syn; sumSA += c.synack; sumRst += c.rst;
-            sumRetr += c.retrans; sumDup += c.dupAck; sumZw += c.zeroWin;
-            if (c.rttCnt > 0) {
-                sumRttCnt += c.rttCnt; sumRttSum += c.rttSum;
-                if (rttMinAll < 0 || c.rttMin < rttMinAll) rttMinAll = c.rttMin;
-                if (c.rttMax > rttMaxAll) rttMaxAll = c.rttMax;
-            }
-        }
+        // суммарные счётчики (sumRst, sumRetr, dataPkts…) посчитаны выше, до таблицы
         bool anyFinding = false;
         auto say = [&](const char* color, const std::string& msg) {
             printf("  %s• %s%s\n", color, msg.c_str(), C::RST);
@@ -1329,16 +1408,9 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             say(rstNoData >= 4 ? C::RED : C::YEL, b);
         }
 
-        // ретрансмиссии — оценим долю от пакетов с данными
-        long long dataPkts = 0;
-        for (auto& kv : conns) dataPkts += (long long)kv.second.seqSeen.size() + kv.second.retrans;
-        double retrRate = dataPkts > 0 ? 100.0 * sumRetr / dataPkts : 0.0;
-        // если data-пакетов много (крупная передача УСПЕШНО прошла), высокий
-        // % ретрансмиссий часто = артефакт offload (TSO/GRO/LRO) в захвате,
-        // а не реальные потери — иначе передача бы не завершилась. Входящие
-        // потери до точки съёма (totalLostIn) — не артефакт: оригинала в дампе
-        // нет вовсе, — если повторы в основном они, оговорку не делаем.
-        const bool offloadLike = (dataPkts >= 500 && totalLostIn * 2 < sumRetr);
+        // ретрансмиссии — доля от пакетов с данными (retrPct, dataPkts и
+        // offloadLike посчитаны выше, до таблицы)
+        const double retrRate = retrPct;
         if (sumRetr >= 50 || retrRate >= 5.0) {
             char b[512];
             if (offloadLike) {
@@ -1663,7 +1735,6 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
         // ---- ИТОГОВЫЙ ВЫВОД о состоянии соединений ----
         printf("\n=================== ВЫВОД ===================\n");
         {
-            long long avgRtt = (sumRttCnt > 0) ? sumRttSum / sumRttCnt : -1;
             bool dpiDetected = !dpiFindings.empty();
 
             // все IP с признаками блокировки на ТСПУ (TCP-DPI/SYN-блок + UDP-WG)
@@ -1674,25 +1745,10 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             const auto blockedSnis = targetIp.empty()
                 ? blockedSnisAll : collectBlockedSnis(dpiScope, localIp, &ttScope);
 
-            // доля ретрансмиссий от data-пакетов (процент важнее абсолюта:
-            // 300 ретр. на мегабайтах — норма, а 30 на 100 пакетах — проблема)
-            double retrPct = (dataPkts > 0) ? (100.0 * sumRetr / dataPkts) : 0.0;
-
-            // hardBlock — действительно серьёзные признаки: SYN без ответа,
-            // МНОГО ранних RST (одиночный RST = норм. закрытие/закрытый порт),
-            // прямой DPI или упорные повторы SYN. Одиночный RST больше не триггер.
-            // Повторы SYN — только у соединений, так и не получивших ответа
-            // (synRetrFail): успешные повторы — потери на старте, они в someLoss.
-            bool hardBlock = (synNoReplyExt > 0 || sumRstEarly >= 4 || dpiDetected || synRetrFail >= 5);
-            // тяжёлые потери — высокая ДОЛЯ при умеренном объёме. На очень
-            // крупных передачах (>=500 data-пакетов) высокий % обычно offload-
-            // артефакт, а не потери, поэтому туда heavyLoss не распространяем
-            // (кроме входящих потерь до точки съёма — см. offloadLike в Деталях).
-            bool heavyLoss = (dataPkts >= 100 && !offloadLike && retrPct >= 10.0);
-            bool slowRoute = (avgRtt >= 500000);
-            // одиночный повтор SYN — потеря одного пакета, не «потери» (порог 3)
-            bool someLoss  = (retrPct >= 3.0 || sumDup >= 20 || sumZw >= 10 || totalSynRetr >= 3);
-            bool elevated  = (avgRtt >= 300000 && avgRtt < 500000);
+            // вердикт по соединениям (connHard, heavyLoss, slowRoute, someLoss,
+            // elevated) посчитан выше, до таблицы, — общий с веткой без таблицы;
+            // здесь к нему добавляется прямой DPI
+            bool hardBlock = (connHard || dpiDetected);
             const auto udpOther = udpOtherOf(tspuIps);
             const bool anyBlock = tspuBlock || !blockedSnis.empty() || dpiDetected;
             bool certShown = false;   // абзац mTLS — основной вывод (ниже не повторять)
@@ -1729,40 +1785,21 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             } else if (!frz16.empty()) {
                 // повторы в зависшие соединения — не «потери канала»
                 printFreeze(false);
-            } else if (hardBlock && heavyLoss) {
-                printf("%sСоединение работает плохо: часть подключений не\n"
-                       "устанавливается, плюс большие потери пакетов. Похоже на\n"
-                       "блокировку/фильтрацию или серьёзную проблему канала.%s\n",
-                       C::RED, C::RST);
-            } else if (hardBlock) {
-                printf("%sЕсть неустановленные соединения (SYN без ответа) или ранние\n"
-                       "сбросы. Часть ресурсов недоступна — возможна блокировка,\n"
-                       "закрытый порт или недоступный сервер.%s\n", C::RED, C::RST);
-            } else if (heavyLoss || slowRoute) {
-                printf("%sСоединения устанавливаются, но качество плохое: %s%s. Это\n"
-                       "указывает на проблему канала/маршрута, а не на блокировку.%s\n",
-                       C::YEL,
-                       heavyLoss ? "много потерь пакетов" : "",
-                       slowRoute ? (heavyLoss ? " и высокий RTT" : "очень высокий RTT (медленный ответ)") : "",
-                       C::RST);
+            } else if (hardBlock || heavyLoss || slowRoute) {
+                // hardBlock здесь = connHard: прямой DPI разобран веткой выше
+                printConnBad();
             } else if (!udpOther.empty() || !udpSess.empty()) {
                 // TCP в порядке (или умеренные потери), но UDP без ответа — не «норма»
                 if (!udpOther.empty()) printUdpOther(udpOther, false);
                 if (!udpSess.empty()) printUdpSess(!udpOther.empty());
-                if (someLoss || elevated)
-                    printf("%sTCP-соединения в целом рабочие, есть умеренные потери или "
-                           "повышенный RTT.%s\n", C::YEL, C::RST);
+                if (someLoss || elevated) printConnSoft(true);
             } else if (!clientCert.empty()) {
                 // сеть рабочая, сервис не обслуживает без сертификата
                 printClientCert(false);
                 certShown = true;
-                if (someLoss || elevated)
-                    printf("%sTCP-соединения в целом рабочие, есть умеренные потери или "
-                           "повышенный RTT.%s\n", C::YEL, C::RST);
+                if (someLoss || elevated) printConnSoft(true);
             } else if (someLoss || elevated) {
-                printf("%sСоединения в целом рабочие, есть умеренные потери или\n"
-                       "повышенный RTT. Возможны кратковременные подтормаживания,\n"
-                       "но явной блокировки не видно.%s\n", C::YEL, C::RST);
+                printConnSoft(false);
             } else {
                 printf("%sСоединения в норме: подключения устанавливаются, потерь\n"
                        "мало, время ответа приемлемое. Явных проблем с сетью нет.%s\n",
