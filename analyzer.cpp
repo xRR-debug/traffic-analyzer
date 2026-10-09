@@ -597,10 +597,15 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
         bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
         if (sLoc == dLoc) continue;
         std::string rip = sLoc ? p.dstIp : p.srcIp;
+        const std::string& lip = sLoc ? p.srcIp : p.dstIp;
         int rport = sLoc ? p.dstPort : p.srcPort;
         int lport = sLoc ? p.srcPort : p.dstPort;
-        TcpConnState& c = tt.conns[rip + "|" + std::to_string(rport) + "|" + std::to_string(lport)];
-        if (c.ip.empty()) { c.ip = rip; c.rport = rport; c.lport = lport; }
+        // локальный адрес — в ключе: в дампе сегмента LAN (или «-i any» на роутере
+        // с NAT, сохраняющим порт) два устройства с одним портом к одному серверу
+        // сливались — RST одного и данные другого давали «поддельный RST»
+        TcpConnState& c = tt.conns[rip + "|" + std::to_string(rport) + "|" + std::to_string(lport) +
+                                   "|" + lip];
+        if (c.ip.empty()) { c.ip = rip; c.rport = rport; c.lport = lport; c.lip = lip; }
         if (t >= 0) { if (c.firstTime < 0) c.firstTime = t; c.lastTime = t; }
         bool S = flagHas(p.flags, 'S'), A = flagHas(p.flags, '.');
         bool repeat = false;   // повтор уже отправленных/принятых данных (для «заморозки»)
@@ -743,7 +748,7 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
             bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
             if (!sLoc || dLoc) continue;
             auto it = tt.conns.find(p.dstIp + "|" + std::to_string(p.dstPort) + "|" +
-                                    std::to_string(p.srcPort));
+                                    std::to_string(p.srcPort) + "|" + p.srcIp);
             if (it != tt.conns.end()) it->second.lowTtlOut++;
         }
     }

@@ -32,6 +32,7 @@ struct FlowRec {
 // ------------------------------------------------------------------
 struct TcpConnState {
     std::string ip; int rport = 0, lport = 0;
+    std::string lip;                  // локальный конец: абонент или другое устройство LAN
     // SNI настоящего ClientHello: у обходчика DPI перед ним уходят фейки с чужим
     // SNI — их не берём (см. buildTcpConnTable)
     std::string sni;
@@ -96,7 +97,7 @@ struct TcpConnState {
     long long finOutTime = -1, finInTime = -1;   // первый FIN абонента / сервера
 };
 struct TcpConnTable {
-    std::map<std::string, TcpConnState> conns;   // ключ "rip|rport|lport"
+    std::map<std::string, TcpConnState> conns;   // ключ "rip|rport|lport|lip"
     long long tEnd = -1;              // время последнего пакета захвата
     bool anyInboundTcp = false;       // нет входящих — дамп однонаправленный, о дропах молчим
     int outTtlTypical = -1;           // медианный TTL исходящих пакетов абонента

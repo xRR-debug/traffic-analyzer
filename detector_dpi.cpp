@@ -420,7 +420,10 @@ std::vector<std::string> detectDpiInjection(const TcpConnTable& tt) {
     for (const auto& kv : tt.conns) {
         const TcpConnState& c = kv.second;
         std::string who = c.ip + ":" + std::to_string(c.rport) +
-                          " (лок. порт " + std::to_string(c.lport) + ")";
+                          " (лок. порт " + std::to_string(c.lport);
+        // другое устройство LAN, не абонент: с тем же портом бывает и соединение абонента
+        if (!c.lip.empty() && strcmp(localRoleLabel(c.lip), "LocalIP") == 0) who += ", устройство " + c.lip;
+        who += ")";
         // настоящий ECH (внешнее имя провайдера) — ТСПУ режет его как класс
         bool realEch = c.ech && isEchPublicName(c.sni);
         const char* echNote = realEch
