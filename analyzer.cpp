@@ -518,7 +518,12 @@ std::string wsFilter(const std::string& ip, int port /*= -1*/, const char* l4 /*
 }
 
 // время каждого пакета в мкс с поправкой на переход через полночь
-// (tsToMicros считает от начала суток); -1 — время не разобрано
+// (tsToMicros считает от начала суток); -1 — время не разобрано.
+// Скачок назад больше чем на полсуток — новые сутки; вперёд больше чем на
+// полсуток после перехода — запоздавший пакет прежних суток (pcapng с двумя
+// интерфейсами, «-i any»: штампы у полуночи идут не по порядку). Отсчёт ведём
+// от самого позднего: запоздавший пакет уводил prev на сутки вперёд, следующий
+// «переходил полночь» ещё раз, и весь хвост дампа уезжал на +24 ч.
 std::vector<long long> absTimes(const std::vector<Packet>& packets) {
     const long long DAY = 86400LL * 1000000;
     std::vector<long long> absT(packets.size(), -1);
@@ -527,8 +532,11 @@ std::vector<long long> absTimes(const std::vector<Packet>& packets) {
         long long t = tsToMicros(packets[i].ts);
         if (t < 0) continue;
         t += dayOff;
-        if (prev >= 0 && t < prev - DAY / 2) { dayOff += DAY; t += DAY; }
-        absT[i] = t; prev = t;
+        if (prev >= 0) {
+            if (t < prev - DAY / 2) { dayOff += DAY; t += DAY; }
+            else if (dayOff > 0 && t > prev + DAY / 2) t -= DAY;
+        }
+        absT[i] = t; prev = std::max(prev, t);
     }
     return absT;
 }

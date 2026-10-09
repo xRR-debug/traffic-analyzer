@@ -2648,8 +2648,12 @@ bool loadDumpSet(const std::vector<std::string>& paths,
                 t = std::max(0LL, prevT[fo]);
             } else {
                 t += dayOff[fo];
-                if (prevT[fo] >= 0 && t < prevT[fo] - DAY / 2) { dayOff[fo] += DAY; t += DAY; }
-                prevT[fo] = t;
+                if (prevT[fo] >= 0) {
+                    if (t < prevT[fo] - DAY / 2) { dayOff[fo] += DAY; t += DAY; }
+                    // запоздавший пакет прежних суток — как в absTimes
+                    else if (dayOff[fo] > 0 && t > prevT[fo] + DAY / 2) t -= DAY;
+                }
+                prevT[fo] = std::max(prevT[fo], t);
                 if (tMin[fo] < 0 || t < tMin[fo]) tMin[fo] = t;
                 if (t > tMax[fo])                 tMax[fo] = t;
             }
