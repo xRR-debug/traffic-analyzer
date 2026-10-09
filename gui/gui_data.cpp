@@ -435,6 +435,15 @@ void buildFlows(Dataset& ds) {
     for (auto& kv : hostByIp) ds.ipName[kv.first] = kv.second;
     for (auto& kv : sniByIp) ds.ipName[kv.first] = kv.second;
     for (size_t i = 0; i < rows.size(); i++) wfFinish(rows[i], wb[i]);
+    // сервер, обслуживший пустой сертификат клиента (clientCertServed), проверяет
+    // его необязательно — его соседние соединения без Alert проблемой не считаем
+    // (как в collectBlockReasons: по адресу и по имени)
+    std::set<std::string> certServed;
+    for (const FlowRow& r : rows)
+        if (clientCertServed(r.certReq, r.clientCert, r.tlsAlertIn, r.inAppBytes)) {
+            certServed.insert(r.remoteIp);
+            if (!r.sni.empty()) certServed.insert(r.sni);
+        }
 
     const long long durUs = (t0 >= 0 && t1 > t0) ? t1 - t0 : 0;
     const long long tail = cfg().tailUs;
@@ -512,7 +521,10 @@ void buildFlows(Dataset& ds) {
         if (!r.httpBlockMark.empty()) r.problem = true;   // страница-заглушка о блокировке
         // сервер требует сертификат клиента (TLS_CLIENT_CERT) — не блокировка, но
         // приложение с ним не работает
-        r.certProblem = clientCertProblem(r.certReq, r.clientCert, r.tlsAlertIn, r.inAppBytes);
+        r.certProblem = clientCertProblem(r.certReq, r.clientCert, r.tlsAlertIn, r.inAppBytes,
+                                          r.mtlsReqUs >= 0) &&
+                        (tlsAlertCertReject(r.tlsAlertIn) ||
+                         (!certServed.count(r.remoteIp) && !certServed.count(r.sni)));
         if (r.certProblem) r.problem = true;
 
         r.search = lowerAscii(r.proto + " " + r.localIp + ":" + std::to_string(r.localPort) +

@@ -301,14 +301,24 @@ inline bool tlsAlertCertReject(int a) {
 // mTLS без сертификата: сервер запросил сертификат клиента, а абонент прислал
 // пустой (clientCert 0) или предъявленный (1) сервер отверг открытым Alert.
 // Пустой сертификат при необязательной проверке сервер принимает и отдаёт
-// данные как обычно — поэтому без Alert проблема, только если сервер после
-// рукопожатия прислал немного (страница/код ошибки, а не содержимое).
+// данные как обычно — поэтому без Alert проблема, только если после рукопожатия
+// абонент отправил запрос (reqSeen: простаивающий preconnect ответа и не ждёт),
+// а сервер прислал немного (страница/код ошибки, а не содержимое). Сервер,
+// обслуживший пустой сертификат на другом соединении (clientCertServed), —
+// тоже не проблема: это вызывающие сверяют по всем соединениям сами.
 // inAppBytes — байт данных от сервера после его ChangeCipherSpec.
 // Общее для причины TLS_CLIENT_CERT и таблицы соединений GUI.
-inline bool clientCertProblem(bool certReq, int clientCert, int alertIn, long long inAppBytes) {
+inline bool clientCertProblem(bool certReq, int clientCert, int alertIn, long long inAppBytes,
+                              bool reqSeen) {
     if (!certReq || clientCert < 0) return false;
     if (tlsAlertCertReject(alertIn)) return true;
-    return clientCert == 0 && inAppBytes <= 8192;
+    return clientCert == 0 && reqSeen && inAppBytes <= 8192;
+}
+// Сервер принял пустой сертификат и отдал больше 8 КБ — проверка у него
+// необязательная. Тогда и соседние соединения к тому же имени или адресу без
+// Alert (короткий ответ, простаивающий HTTP/2-сокет) — не отказ
+inline bool clientCertServed(bool certReq, int clientCert, int alertIn, long long inAppBytes) {
+    return certReq && clientCert == 0 && !tlsAlertCertReject(alertIn) && inAppBytes > 8192;
 }
 
 // IP ID отправителя — счётчик (Linux, Windows): у каждого следующего пакета на

@@ -1717,6 +1717,7 @@ std::vector<BlockReason> collectBlockReasons(
     struct FrzAgg { std::vector<const TcpConnState*> c; long long silence = 0; };
     std::map<std::string, FrzAgg> frz;
     std::map<std::string, std::vector<const TcpConnState*>> mtls;   // имя -> соединения mTLS без сертификата
+    std::set<std::string> certServed, certServedIp;   // имя / адрес, где сервер обслужил пустой сертификат
 
     for (const auto& kv : tt.conns) {
         const TcpConnState& c = kv.second;
@@ -1771,14 +1772,24 @@ std::vector<BlockReason> collectBlockReasons(
         if (c.serverBytes >= 200 && fz < 0 && c.httpBlockMark.empty() && !forged) {
             worked.insert(name); workedIp.insert(c.ip);
         }
-        if (clientCertProblem(c.certReq, c.clientCert, c.tlsAlertIn, c.inAppBytes))
+        if (clientCertProblem(c.certReq, c.clientCert, c.tlsAlertIn, c.inAppBytes, c.reqTime >= 0))
             mtls[name].push_back(&c);
+        if (clientCertServed(c.certReq, c.clientCert, c.tlsAlertIn, c.inAppBytes)) {
+            certServed.insert(name); certServedIp.insert(c.ip);
+        }
     }
     // mTLS: сервер требует сертификат клиента, устройство его не предъявило.
     // Сеть при этом работает (рукопожатие прошло, сервер подтверждает запрос
     // сразу), поэтому в детали — за сколько сервер подтвердил и за сколько ответил
     for (const auto& kv : mtls) {
-        const auto& v = kv.second;
+        // сервер, обслуживший пустой сертификат на другом соединении (по имени или
+        // адресу), проверяет его необязательно: без Alert его соединения — не отказ
+        std::vector<const TcpConnState*> v;
+        for (const TcpConnState* c : kv.second)
+            if (tlsAlertCertReject(c->tlsAlertIn) ||
+                (!certServed.count(kv.first) && !certServedIp.count(c->ip)))
+                v.push_back(c);
+        if (v.empty()) continue;
         int empty = 0, req = 0, answered = 0, acked = 0, clientFin = 0, alert = -1;
         double rMin = -1, rMax = -1, ackMax = -1;
         for (const TcpConnState* c : v) {
