@@ -1717,9 +1717,11 @@ void runGeoRttMode() {
 // ------------------------------------------------------------------
 
 // Печатает результаты TCP-ping по зондам. Возвращает число зондов, open —
-// сколько из них получили ответ (порт принимает соединения).
-static int globalpingPrintTcpPing(const std::string& resp, int& open) {
-    int probes = 0; open = 0;
+// сколько из них получили ответ (порт принимает соединения), failed — сколько
+// не смогли выполнить проверку (домен не резолвится, зонд offline): порт они
+// не проверяли, и в вердикт их не берём.
+static int globalpingPrintTcpPing(const std::string& resp, int& open, int& failed) {
+    int probes = 0; open = 0; failed = 0;
     printf("  %-40s %-10s %s\n", "ЗОНД", "RTT", "ПОРТ");
     size_t pos = 0;
     while (probes < 8) {
@@ -1749,6 +1751,7 @@ static int globalpingPrintTcpPing(const std::string& resp, int& open) {
             std::string raw = jsonStrFull(res, "rawOutput");
             size_t nl = raw.find('\n');
             if (nl != std::string::npos) raw.resize(nl);
+            failed++;
             printf("  %-40s %-10s %sзонд не смог проверить%s %s\n", loc.c_str(), "—",
                    C::YEL, C::RST, raw.c_str());
         } else if (atoi(rcv.c_str()) > 0) {
@@ -1814,15 +1817,23 @@ void runPortCheckMode() {
         printf("%sРезультат не получен: %s%s\n", C::YEL, err.c_str(), C::RST);
         return;
     }
-    int open = 0;
-    int probes = globalpingPrintTcpPing(resp, open);
+    int open = 0, failed = 0;
+    int probes = globalpingPrintTcpPing(resp, open, failed);
     if (probes == 0) {
         printf("%sНе удалось разобрать ответ. Сырой ответ (начало):%s\n", C::GRY, C::RST);
         printf("%.1200s\n", resp.c_str());
         return;
     }
     printf("\n");
-    if (open == probes)
+    // вердикт — только по зондам, которые порт реально проверили: упавший зонд
+    // (опечатка в домене, нет A-записи, зонд offline) раньше шёл в знаменатель,
+    // и выходило ложное «порт закрыт / за NAT» или «доступен частично»
+    const int checked = probes - failed;
+    if (checked == 0)
+        printf("%sНи один зонд не смог выполнить проверку (причины — в строках выше): о порте %lld\n"
+               "ничего не известно. Проверьте адрес или домен и повторите позже.%s\n",
+               C::YEL, port, C::RST);
+    else if (open == checked)
         printf("%sПорт %lld доступен извне со всех зондов.%s\n", C::GRN, port, C::RST);
     else if (open == 0)
         printf("%sПорт %lld извне недоступен ни с одного зонда: закрыт, фильтруется\n"
@@ -1830,7 +1841,10 @@ void runPortCheckMode() {
                C::RED, port, C::RST);
     else
         printf("%sПорт %lld доступен частично (%d из %d зондов): потери на пути или\n"
-               "фильтрация по стране/сети источника.%s\n", C::YEL, port, open, probes, C::RST);
+               "фильтрация по стране/сети источника.%s\n", C::YEL, port, open, checked, C::RST);
+    if (checked > 0 && failed > 0)
+        printf("%s(%d зонд(ов) не смогли выполнить проверку — в вердикте не учтены.)%s\n",
+               C::GRY, failed, C::RST);
 }
 
 // ------------------------------------------------------------------
