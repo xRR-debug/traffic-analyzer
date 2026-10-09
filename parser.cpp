@@ -2464,6 +2464,38 @@ static void fixFirstAbsoluteSeq(std::vector<Packet>& pk) {
     }
 }
 
+// tcpdump 4.99+ на Linux с «-i any» (SLL2) печатает перед «IP» интерфейс и
+// направление кадра: «12:00:00.000001 eth0  Out IP …», «… wlan0 In  IP …» (имя
+// дополнено пробелами до 5 знаков, направление — до 3). parseLine ждёт «IP»
+// вторым словом, и такой дамп отбрасывался целиком. Префикс снимаем до fixPad,
+// пока пробелы на месте: тот выкидывает прогоны из 2+ пробелов, и «eth0  In  IP»
+// склеилось бы в «eth0InIP». dir — 0 (In), 1 (Out), иначе -1, как Packet::dir
+// у pcap с SLL2 (B/M/P — широковещательный, групповой, чужой кадр).
+static std::string stripAnyIfPrefix(const std::string& line, int& dir) {
+    dir = -1;
+    const size_t t0 = line.find_first_not_of(" \t");
+    if (t0 == std::string::npos || !isdigit((unsigned char)line[t0])) return line;
+    const size_t t1 = line.find(' ', t0);                  // конец штампа времени
+    if (t1 == std::string::npos || line.find(':', t0) > t1 ||
+        t1 + 1 >= line.size() || line[t1 + 1] == ' ')
+        return line;
+    const size_t i1 = line.find(' ', t1 + 1);              // конец имени интерфейса
+    if (i1 == std::string::npos || i1 - (t1 + 1) > 15) return line;
+    const size_t d0 = line.find_first_not_of(' ', i1);
+    const size_t d1 = (d0 == std::string::npos) ? d0 : line.find(' ', d0);
+    if (d1 == std::string::npos) return line;
+    const std::string dw = line.substr(d0, d1 - d0);
+    if (dw != "In" && dw != "Out" && dw != "B" && dw != "M" && dw != "P" && dw != "?")
+        return line;
+    const size_t p0 = line.find_first_not_of(' ', d1);
+    if (p0 == std::string::npos) return line;
+    const size_t p1 = std::min(line.find_first_of(" ,", p0), line.size());
+    const std::string pw = line.substr(p0, p1 - p0);
+    if (pw != "IP" && pw != "IP6" && pw != "ARP") return line;
+    if (dw == "In") dir = 0; else if (dw == "Out") dir = 1;
+    return line.substr(0, t1 + 1) + line.substr(p0);
+}
+
 // Загрузка ОДНОГО файла дампа: бинарный pcap либо текстовый вывод tcpdump.
 // fmt — распознанный формат (для печати). false + err — файл прочитать не вышло.
 // warn — предупреждение о содержимом (файл прочитан, но не всё разобрано).
@@ -2522,35 +2554,41 @@ static bool loadDumpFile(const std::string& path, std::vector<Packet>& out,
                s.find("dropped by interface") != std::string::npos;
     };
 
-    std::vector<std::string> records;
+    // запись пакета и направление кадра из префикса «-i any» (-1 — нет)
+    std::vector<std::pair<std::string, int>> records;
     std::string raw, cur;
+    int curDir = -1;
     while (std::getline(f, raw)) {
         if (!raw.empty() && raw.back() == '\r') raw.pop_back();
-        raw = fixPad(raw);
+        int dir = -1;
+        raw = fixPad(stripAnyIfPrefix(raw, dir));
         std::string t = trim(raw);
         if (t.empty()) continue;
         if (isTcpdumpTrailer(t)) {        // дошли до сводки tcpdump — пакеты кончились
-            if (!cur.empty()) { records.push_back(cur); cur.clear(); }
+            if (!cur.empty()) { records.emplace_back(cur, curDir); cur.clear(); }
             continue;
         }
         if (startsWithTime(t)) {
-            if (!cur.empty()) records.push_back(cur);
+            if (!cur.empty()) records.emplace_back(cur, curDir);
             cur = t;
+            curDir = dir;
         } else if (!cur.empty()) {
             // настоящее продолжение пакета — приклеиваем через пробел
             cur += " " + t;
         }
     }
-    if (!cur.empty()) records.push_back(cur);
+    if (!cur.empty()) records.emplace_back(cur, curDir);
 
     out.reserve(records.size());
     long long hostNamed = 0, portNamed = 0;   // следы дампа без -n
     for (auto& r : records) {
         int named = 0;
-        Packet p = parseLine(r, &named);
+        Packet p = parseLine(r.first, &named);
         if (named & 1) hostNamed++;
         else if (named & 2) portNamed++;
-        if (p.valid) out.push_back(std::move(p));
+        if (!p.valid) continue;
+        p.dir = r.second;
+        out.push_back(std::move(p));
     }
     // Без -n tcpdump пишет имена вместо адресов и портов: молча это давало
     // порт 0 у DNS, HTTPS и VPN-портов — говорим, что разобрано не всё
