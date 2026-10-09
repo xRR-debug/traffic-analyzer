@@ -386,7 +386,13 @@ void actPickWallpaper() {
     ofn.lpstrFile = file;
     ofn.nMaxFile = MAX_PATH;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    if (!GetOpenFileNameW(&ofn)) return;
+    // текущий каталог возвращаем сами, как в pickDumpFiles: для GetOpenFileName
+    // OFN_NOCHANGEDIR не действует, а по каталогу ищется analyzer.ini
+    wchar_t cwd[MAX_PATH * 4];
+    const DWORD cwdLen = GetCurrentDirectoryW((DWORD)(sizeof(cwd) / sizeof(cwd[0])), cwd);
+    const BOOL picked = GetOpenFileNameW(&ofn);
+    if (cwdLen > 0 && cwdLen < sizeof(cwd) / sizeof(cwd[0])) SetCurrentDirectoryW(cwd);
+    if (!picked) return;
     s_wpPending = file;              // загрузим в начале кадра (см. wallpaperLoad)
     s_wpPendingSet = true;
 #endif

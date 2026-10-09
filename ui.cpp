@@ -312,10 +312,20 @@ std::vector<std::string> pickDumpFiles(HWND owner) {
     ofn.nFilterIndex = 1;
     ofn.lpstrTitle = L"Выберите дамп (можно два сразу: _in и _out)";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER |
-                OFN_ALLOWMULTISELECT;
+                OFN_ALLOWMULTISELECT | OFN_NOCHANGEDIR;
+
+    // Диалог переводит текущий каталог процесса в папку выбранного файла, а
+    // OFN_NOCHANGEDIR для GetOpenFileName, по документации, не действует —
+    // возвращаем каталог сами. Иначе analyzer.ini («Перечитать» и инструменты
+    // --tool, которые наследуют каталог) искался бы в папке с дампом абонента,
+    // а ini из каталога запуска больше не находился.
+    wchar_t cwd[MAX_PATH * 4];
+    const DWORD cwdLen = GetCurrentDirectoryW((DWORD)(sizeof(cwd) / sizeof(cwd[0])), cwd);
+    const BOOL picked = GetOpenFileNameW(&ofn);
+    if (cwdLen > 0 && cwdLen < sizeof(cwd) / sizeof(cwd[0])) SetCurrentDirectoryW(cwd);
 
     std::vector<std::string> out;
-    if (!GetOpenFileNameW(&ofn)) return out;
+    if (!picked) return out;
 
     auto toUtf8 = [](const wchar_t* w) {
         int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
