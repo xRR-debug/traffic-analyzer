@@ -326,6 +326,8 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
         // повторы ACK — по направлениям: дубли от сервера говорят о потере НАШИХ
         // сегментов, наши — о потере входящих; общий счётчик сбивался при чередовании
         long long lastAck[2] = { -1, -1 }; int ackRepeat[2] = { 0, 0 };   // [0] от абонента, [1] от сервера
+        long long lastAckWin[2] = { -1, -1 };     // окно в последнем чистом ACK направления
+        bool peerData[2] = { false, false };      // с того ACK другая сторона слала данные (> 1 байта)
         bool sawData = false;
         // RTT: ждём ACK на отправленный seq
         // ключ = ожидаемый ack (seq + length), значение = время отправки
@@ -501,6 +503,8 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             c.sawData = true;
             c.dataPkts++;
             if (p.length > c.maxPayload) c.maxPayload = p.length;
+            // данные — повод для дубликата ACK с другой стороны (1 байт — keep-alive)
+            if (p.length > 1) c.peerData[sLoc ? 1 : 0] = true;
             // Ретрансмиссия = ПОВТОРНАЯ отправка ТОГО ЖЕ сегмента: совпадает
             // направление, начальный seq И длина payload, и повтор пришёл спустя
             // время (адаптивный порог по RTT — решаем позже). Проверка длины и
@@ -568,8 +572,21 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
         } else {
             if (p.ack >= 0) {
                 const int d = sLoc ? 0 : 1;
-                if (p.ack == c.lastAck[d]) { c.ackRepeat[d]++; if (c.ackRepeat[d] >= 2) { c.dupAck++; totalDupAck++; } }
-                else { c.lastAck[d] = p.ack; c.ackRepeat[d] = 0; }
+                // Дубликат ACK — ответ на ДАННЫЕ другой стороны, пришедшие после
+                // дыры (как tcp.analysis.duplicate_ack в Wireshark): без SYN/FIN/RST,
+                // окно прежнее, и с прошлого ACK другая сторона что-то прислала.
+                // Ответ на keep-alive (Chromium — раз в 45 с), window update и
+                // повторный FIN несут тот же ack, но данных между ними нет:
+                // простаивающий браузер за 10 минут давал десятки «дубликатов» и
+                // «умеренные потери» в ВЫВОДе. Направление не определено — стороны
+                // лежат в разных записях conns, их данных тут не видно: не проверяем.
+                const bool plain = !S && !R && !flagHas(p.flags, 'F');
+                if (p.ack != c.lastAck[d]) { c.lastAck[d] = p.ack; c.ackRepeat[d] = 0; }
+                else if (plain && (c.peerData[d] || !dirKnown) && p.win == c.lastAckWin[d]) {
+                    c.ackRepeat[d]++;
+                    if (c.ackRepeat[d] >= 2) { c.dupAck++; totalDupAck++; }
+                }
+                c.lastAckWin[d] = p.win; c.peerData[d] = false;
             }
         }
         // ACK с удалённой стороны: сопоставляем с ожидаемым ack для RTT
