@@ -158,6 +158,8 @@ bool isOwnIspOrg(const std::string& org, const std::string& asn);
 // UDP 500/4500: IPsec-VPN точно, VoWiFi (звонки по Wi-Fi) точно или не ясно
 enum IpsecClass { IPSEC_NONE, IPSEC_VPN, IPSEC_VOWIFI, IPSEC_UNSURE };
 IpsecClass ipsecClass(const Packet& p, int remotePort, const IpInfo* remote);
+// WG/AmneziaWG-листенер абонента по локальному порту (не к служебному порту); nullptr — нет
+const char* udpLocalVpnListener(const Packet& p, int remotePort, int localPort);
 std::string guessKind(const Packet& p, const IpInfo& srcI, const IpInfo& dstI);
 std::string sideLabel(const std::string& ip, const IpInfo& info);
 bool flagHas(const std::string& f, char c);

@@ -493,11 +493,11 @@ static const char* udpTunnelKind(const Packet& p, int rport, int lport,
         const IpsecClass ic = ipsecClass(p, rport, ii);
         return (ic == IPSEC_NONE || ic == IPSEC_VPN) ? v : nullptr;
     }
-    // листенер на нашей стороне — абонент сам держит WG/AmneziaWG-сервер
-    if (lport == 51820 || lport == 51821 || lport == 55555) {
+    // листенер на нашей стороне — абонент сам держит WG/AmneziaWG-сервер (DNS и
+    // QUIC со случайного порта 51820 — не он, см. udpLocalVpnListener)
+    if (const char* v = udpLocalVpnListener(p, rport, lport)) {
         *port = lport;
-        const char* v = vpnPortName(lport, "UDP");
-        return v ? v : "WireGuard";
+        return v;
     }
     return nullptr;
 }

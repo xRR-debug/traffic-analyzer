@@ -96,6 +96,22 @@ IpsecClass ipsecClass(const Packet& p, int remotePort, const IpInfo* remote) {
     return IPSEC_UNSURE;
 }
 
+// Абонент сам держит WG/AmneziaWG-листенер: характерный порт 51820/51821/55555
+// на ЛОКАЛЬНОЙ стороне. Эти порты — в эфемерном диапазоне любой ОС (Windows/macOS
+// 49152–65535, Linux 32768–60999), с них случайно уходят DNS, QUIC, звонки.
+// Поэтому листенер — только если удалённый порт не служебный (≥1024: не DNS,
+// NTP, QUIC/443, DoT) и поток не опознан как другой протокол (QUIC, STUN, DHT);
+// к листенеру клиенты ходят со своих случайных портов. Сигнатура WireGuard
+// (wgType) — отдельно, на любом порту. Одно правило для guessKind, UDP-таблицы,
+// TSPU?-пометки и причин блокировок. nullptr — не листенер.
+const char* udpLocalVpnListener(const Packet& p, int remotePort, int localPort) {
+    if (p.proto != "UDP" || (localPort != 51820 && localPort != 51821 && localPort != 55555))
+        return nullptr;
+    if (remotePort < 1024 || p.quic || p.l7 == L7_STUN || p.l7 == L7_BT_DHT) return nullptr;
+    const char* v = vpnPortName(localPort, "UDP");
+    return v ? v : "WireGuard";
+}
+
 // Справочные подписи сервисов по портам (НЕ влияют на VPN-вердикт —
 // только поясняют, что обычно слушает порт). Нейтральные сервисы тоже здесь.
 struct PortHint { int port; const char* svc; const char* proto; };
@@ -372,13 +388,10 @@ std::string guessKind(const Packet& p, const IpInfo& srcI, const IpInfo& dstI) {
                 return std::string("(VPN: ") + v + ")";
             if (const char* px = proxyPortName(remotePort))
                 return std::string("(proxy: ") + px + ")";
-            // абонент сам держит VPN-листенер: характерный WG/AmneziaWG-порт
-            // на ЛОКАЛЬНОЙ стороне (фикс. порт сервера, не эфемерный).
-            if (p.proto == "UDP" &&
-                (localPort == 51820 || localPort == 51821 || localPort == 55555)) {
-                const char* v = vpnPortName(localPort, p.proto);
-                return std::string("(VPN-сервер у абонента: ") + (v ? v : "WireGuard") + ")";
-            }
+            // абонент сам держит VPN-листенер: характерный WG/AmneziaWG-порт на
+            // ЛОКАЛЬНОЙ стороне — только не к служебному порту (udpLocalVpnListener)
+            if (const char* v = udpLocalVpnListener(p, remotePort, localPort))
+                return std::string("(VPN-сервер у абонента: ") + v + ")";
         }
     }
 
