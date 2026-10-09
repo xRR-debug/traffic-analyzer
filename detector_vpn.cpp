@@ -33,8 +33,10 @@ void analyzeJa4(const std::vector<Packet>& packets,
             auto it = ipCache->find(p.dstIp);
             if (it != ipCache->end()) {
                 const IpInfo& ii = it->second;
-                if ((ii.hosting || looksHostingOrg(ii.org, ii.asn)) && !looksCdnOrg(ii.org) &&
-                    !ii.vpnWhite)
+                // сеть своего оператора — не хостинг, как в вердикте (flowVpnEvidence):
+                // geo-API бывает метит её hosting, а TV-приставка на TLS 1.2 к
+                // lk.<оператор>.ru — не «прокси/VPN-клиент»
+                if (isHostingNonCdn(&ii) && !ii.vpnWhite)
                     a.hostingSrv.insert(p.dstIp);
             }
         }
