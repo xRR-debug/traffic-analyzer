@@ -2787,13 +2787,20 @@ static bool parseDnsResp(const unsigned char* b, int n, uint16_t id, DnsAns& r) 
 // UDP-запрос к серверу server:53. После первого ответа ещё ~400 мс слушаем
 // сокет: если придёт второй ответ с тем же id, но другим содержимым — ответ
 // вбрасывается «по пути» (DPI успевает раньше настоящего резолвера).
+// Пока ответа нет, запрос повторяется каждые 800 мс (до 3 отправок в пределах
+// timeoutMs), как у системного резолвера: одна потерянная датаграмма на линии
+// с потерями давала «нет ответа — дропается» и могла перевернуть ИТОГ. У повтора
+// свой id: ответы на разные отправки законно различаются (разные узлы anycast-
+// резолвера, CDN), поэтому «два разных ответа» ищем только в пределах одного id.
 static DnsProbe udpDnsQuery(const std::string& server, const std::string& name,
                             uint16_t qtype, int timeoutMs) {
     static std::atomic<unsigned> ctr{(unsigned)GetTickCount()};
+    auto newId = [] { return (uint16_t)((ctr.fetch_add(1) * 2654435761u) >> 16); };
     DnsProbe r;
     unsigned char q[512];
-    uint16_t id = (uint16_t)((ctr.fetch_add(1) * 2654435761u) >> 16);
-    int len = buildDnsQueryFor(q, sizeof(q), name, id, qtype);
+    const int kMaxSends = 3;
+    uint16_t ids[kMaxSends] = { newId(), 0, 0 };
+    int len = buildDnsQueryFor(q, sizeof(q), name, ids[0], qtype);
     if (!len) return r;
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) return r;
@@ -2801,27 +2808,47 @@ static DnsProbe udpDnsQuery(const std::string& server, const std::string& name,
     inet_pton(AF_INET, server.c_str(), &addr.sin_addr);
     auto t0 = std::chrono::steady_clock::now();
     sendto(s, (const char*)q, len, 0, (sockaddr*)&addr, sizeof(addr));
+    int sent = 1;
+    const auto kResend = std::chrono::milliseconds(800);
+    auto resendAt = t0 + kResend;
     auto deadline = t0 + std::chrono::milliseconds(timeoutMs);
     bool haveFirst = false;
+    uint16_t firstId = 0;
     for (;;) {
-        long long left = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             deadline - std::chrono::steady_clock::now()).count();
-        if (left <= 0) break;
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) break;
+        if (!haveFirst && sent < kMaxSends && now >= resendAt) {
+            ids[sent] = newId();
+            q[0] = (unsigned char)(ids[sent] >> 8); q[1] = (unsigned char)(ids[sent] & 0xFF);
+            sendto(s, (const char*)q, len, 0, (sockaddr*)&addr, sizeof(addr));
+            sent++;
+            resendAt += kResend;
+        }
+        auto until = (!haveFirst && sent < kMaxSends && resendAt < deadline) ? resendAt : deadline;
+        long long left = std::chrono::duration_cast<std::chrono::milliseconds>(until - now).count() + 1;
+        if (left < 1) left = 1;
         fd_set rf; FD_ZERO(&rf); FD_SET(s, &rf);
         timeval tv; tv.tv_sec = (long)(left / 1000); tv.tv_usec = (long)((left % 1000) * 1000);
-        if (select((int)s + 1, &rf, nullptr, nullptr, &tv) <= 0) break;
+        int sel = select((int)s + 1, &rf, nullptr, nullptr, &tv);
+        if (sel < 0) break;
+        if (sel == 0) continue;            // дедлайн или пора повторить — решает начало цикла
         unsigned char buf[4096]; sockaddr_in from{}; socklen_t fl = sizeof(from);
         int n = recvfrom(s, (char*)buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
         if (n <= 0) break;
+        if (n < 12) continue;
+        const uint16_t rid = (uint16_t)((buf[0] << 8) | buf[1]);
+        bool ours = false;
+        for (int k = 0; k < sent; k++) ours = ours || ids[k] == rid;
         DnsAns a;
-        if (!parseDnsResp(buf, n, id, a)) continue;
+        if (!ours || !parseDnsResp(buf, n, rid, a)) continue;
         if (!haveFirst) {
             haveFirst = true;
+            firstId = rid;
             r.first = a;
             r.ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
                        std::chrono::steady_clock::now() - t0).count();
             deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
-        } else if (a.rcode != r.first.rcode || a.a != r.first.a) {
+        } else if (rid == firstId && (a.rcode != r.first.rcode || a.a != r.first.a)) {
             r.second = a; r.twoDifferent = true;
             break;
         }
@@ -3244,6 +3271,11 @@ void runDnsHonestyMode() {
         printf("%sДаже контрольные домены отвечают неверно — проблема с DNS/сетью в целом, "
                "а не блокировка отдельных сайтов. Проверьте настройки DNS у клиента, "
                "роутер, доступность резолвера.%s\n", C::YEL, C::RST);
+        // подмену по тестовым доменам не прячем: заглушка или NXDOMAIN при живом
+        // DoH говорят о блокировке и сами по себе
+        if (bad > badCtl)
+            printf("%sКроме того, неверно отвечают %d тестовых домен(ов) — заглушки/подмену "
+                   "по ним смотрите в строках выше.%s\n", C::YEL, bad - badCtl, C::RST);
     } else if (bad > 0) {
         printf("%sDNS врёт по %d домен(ам): заглушки/подмена/дроп/отказ.%s\n", C::RED, bad, C::RST);
         printf("Что сказать/сделать: блокировка на уровне DNS (реестр РКН / ТСПУ). "
