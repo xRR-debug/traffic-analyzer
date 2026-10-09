@@ -1268,7 +1268,12 @@ void drawNet(const RknState& st) {
         kv("Тип цели", ck["target_type"].str());
         if (ips.size() <= kInline) kv("IP-адреса", ips.size() ? joinList(ips) : "нет");
         else kv("IP-адреса", fmtCount((long long)ips.size()) + " — список ниже");
-        if (filled(ck["subnet_size"])) kv("Размер подсети", fmtCount(ck["subnet_size"].num(0)) + " адресов");
+        // сервис отдаёт размер и строкой в сокращённой записи («65.5K», «79228162.5Z»):
+        // её — как есть (как в reportText), число через num() обрезалось бы до «65»
+        const JVal& ssz = ck["subnet_size"];
+        if (filled(ssz))
+            kv("Размер подсети", (ssz.t == JVal::NUM && ssz.n >= 0 && ssz.n < 1e15
+                                      ? fmtCount((long long)ssz.n) : brief(ssz)) + " адресов");
         if (geo.t == JVal::OBJ) {
             kv("AS", asnText(geo["asn"]));
             kv("Организация", geo["organisation"].str());
