@@ -2201,6 +2201,24 @@ static int buildHysteria2Quic(unsigned char* b) {
     return 1200;
 }
 
+// Список портов «22,443,8000-8100»: числа и диапазоны a-b через запятую.
+// Раньше atoi превращал «8000-8100» внутри списка в один порт 8000, а «8o» —
+// в 8, молча. Теперь токен, который целиком не число и не диапазон 1..65535, —
+// ошибка: false, в bad — сам токен.
+static bool parsePortList(const std::string& s, std::vector<int>& ports, std::string& bad) {
+    std::stringstream ss(s); std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        tok = trim(tok);
+        if (tok.empty()) continue;
+        char* e = nullptr;
+        long a = strtol(tok.c_str(), &e, 10), b = a;
+        if (e != tok.c_str() && *e == '-') b = strtol(e + 1, &e, 10);
+        if (e == tok.c_str() || *e || a < 1 || b > 65535 || a > b) { bad = tok; return false; }
+        for (long p = a; p <= b; p++) ports.push_back((int)p);
+    }
+    return true;
+}
+
 void runPortScanMode() {
     ensureWsa();
 
@@ -2218,7 +2236,7 @@ void runPortScanMode() {
 
     std::cout << "Диапазон портов: 'full' (1-65535), 'top' (частые),\n"
               << "  'service' (22,80,443,SSH/HTTP/почта/БД...), 'vpn' (VPN-порты),\n"
-              << "  диапазон 1-1024 или список 80,443,8080: " << std::flush;
+              << "  диапазон 1-1024 или список 80,443,8000-8100: " << std::flush;
     std::string rng; readLine(rng);
     rng = trim(rng);
 
@@ -2245,10 +2263,10 @@ void runPortScanMode() {
         else { std::cout << "Пустой диапазон.\n"; return; }
         modeLabel = "диапазон " + rng;
     } else {
-        std::stringstream ss(rng); std::string tok;
-        while (std::getline(ss, tok, ',')) {
-            int p = atoi(tok.c_str());
-            if (p>=1 && p<=65535) ports.push_back(p);
+        std::string bad;
+        if (!parsePortList(rng, ports, bad)) {
+            std::cout << "Неверный порт или диапазон: «" << bad << "».\n";
+            return;
         }
         modeLabel = "список";
     }
@@ -2649,7 +2667,8 @@ void runUdpProbeMode() {
         } else { std::cout << "Неверный IP/домен.\n"; return; }
     }
 
-    std::cout << "Порты (список 51820,500,1194,53 или 'vpn' для типичных VPN): " << std::flush;
+    std::cout << "Порты (список 51820,500,1194,53, можно с диапазоном 51820-51830, "
+                 "или 'vpn' для типичных VPN): " << std::flush;
     std::string rng; readLine(rng);
     rng = trim(rng);
 
@@ -2658,10 +2677,11 @@ void runUdpProbeMode() {
         int vpn[] = {51820,51821,55555,2408,1637,500,4500,1194,1195,36712,1935,443,53};
         for (int p : vpn) ports.push_back(p);
     } else {
-        std::stringstream ss(rng); std::string tok;
-        while (std::getline(ss, tok, ',')) {
-            int p = atoi(tok.c_str());
-            if (p>=1 && p<=65535) ports.push_back(p);
+        // как в скане портов: диапазоны внутри списка, ошибка — не молча
+        std::string bad;
+        if (!parsePortList(rng, ports, bad)) {
+            std::cout << "Неверный порт или диапазон: «" << bad << "».\n";
+            return;
         }
     }
     if (ports.empty()) { std::cout << "Порты не заданы.\n"; return; }
