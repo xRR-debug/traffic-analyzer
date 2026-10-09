@@ -662,6 +662,29 @@ static bool jsonTrue(const std::string& obj, const std::string& key) {
 }
 
 // ------------------------------------------------------------------
+// Лимит /batch ip-api.com — 15 запросов в минуту. Когда ip-api ответил X-Rl = 0,
+// до сброса окна (X-Ttl секунд) его не трогаем ни из resolveIps, ни из asnOf
+// (трассировка), ни из режима 13: запрос в закрытое окно — снова 429, а за
+// систематическое превышение ip-api банит адрес на час. Окно общее на процесс.
+// ------------------------------------------------------------------
+static std::atomic<long long> g_ipApiBatchNotBefore{0};   // steady_clock, мс
+
+static long long steadyNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+// Запоминает окно по заголовкам ответа (rlRemain/rlTtl из httpPost).
+static void ipApiNoteLimit(int rlRemain, int rlTtl) {
+    if (rlRemain == 0)
+        g_ipApiBatchNotBefore = steadyNowMs() + (long long)((rlTtl > 0 ? rlTtl : 60) + 1) * 1000;
+}
+// Сколько мс ещё ждать открытия окна (0 — можно спрашивать).
+static long long ipApiWaitMs() {
+    const long long w = g_ipApiBatchNotBefore.load() - steadyNowMs();
+    return w > 0 ? w : 0;
+}
+
+// ------------------------------------------------------------------
 // Своя сеть: AS провайдера по собственному внешнему адресу
 // ------------------------------------------------------------------
 // Только по кнопке «Определить» в настройках — сама программа в сеть за этим
@@ -728,10 +751,19 @@ void resolveIps(const std::vector<std::string>& ipsIn,
         // до 3 попыток к ip-api.com; печатаем номер попытки, при таймауте сообщаем
         std::string resp;
         int rlRemain = -1, rlTtl = -1;
+        // Окно лимита закрыто (X-Rl = 0 — здесь, в трассировке или режиме 13):
+        // ждём сброса, как между батчами. Раньше после 429 батч уходил в ipwho.is,
+        // а следующий тут же снова стучался в закрытое окно.
+        if (long long w = ipApiWaitMs()) {
+            std::cout << "  ip-api.com: исчерпан лимит запросов, жду " << (w + 999) / 1000
+                      << " с ...\n" << std::flush;
+            Sleep((DWORD)w);
+        }
         for (int attempt = 1; attempt <= 3; attempt++) {
             std::cout << "  ip-api.com: запрос " << (i / BATCH + 1)
                       << ", попытка " << attempt << "/3 ..." << std::flush;
             resp = httpPost(L"ip-api.com", L"/batch", body, &rlRemain, &rlTtl);
+            ipApiNoteLimit(rlRemain, rlTtl);
             // поле query запрошено в fields — без него это не ответ батча
             // (страница провайдера/прокси, обрезанный ответ): не разбираем в пустоту
             if (resp.find("\"query\"") == std::string::npos) resp.clear();
@@ -769,12 +801,22 @@ void resolveIps(const std::vector<std::string>& ipsIn,
             continue; // следующий батч
         }
 
-        // делим массив на объекты по верхнеуровневым {...}
+        // делим массив на объекты по верхнеуровневым {...}. Скобки внутри строк
+        // не считаем: org/isp/as — свободный текст WHOIS, и одна непарная «}» или
+        // «{» в имени сети раньше теряла весь остаток батча (до 99 адресов).
         int depth = 0; size_t objStart = std::string::npos;
+        bool inStr = false;
         for (size_t k = 0; k < resp.size(); k++) {
             char ch = resp[k];
-            if (ch == '{') { if (depth == 0) objStart = k; depth++; }
+            if (inStr) {
+                if (ch == '\\') k++;                    // \" и \\ строку не закрывают
+                else if (ch == '"') inStr = false;
+                continue;
+            }
+            if (ch == '"') inStr = true;
+            else if (ch == '{') { if (depth == 0) objStart = k; depth++; }
             else if (ch == '}') {
+                if (depth == 0) continue;               // лишняя «}» — в минус не уходим
                 depth--;
                 if (depth == 0 && objStart != std::string::npos) {
                     std::string obj = resp.substr(objStart, k - objStart + 1);
@@ -816,18 +858,26 @@ void resolveIps(const std::vector<std::string>& ipsIn,
         }
         // Лимит batch-эндпойнта ip-api — 15 запросов в минуту. Раньше после
         // КАЖДОГО батча (и после последнего тоже) стояла пауза 1,5 с. Теперь
-        // ждём, только если есть следующий батч, и только когда ip-api сам
-        // сообщил, что окно исчерпано (X-Rl = 0) — ровно X-Ttl секунд.
+        // ждём, только когда ip-api сам сообщил, что окно исчерпано (X-Rl = 0),
+        // — ровно X-Ttl секунд, в начале следующего батча (ipApiWaitMs).
         bool more = end < ips.size();
-        if (more && rlRemain == 0) {
-            int waitS = (rlTtl > 0 ? rlTtl : 60) + 1;
-            std::cout << "  ip-api.com: исчерпан лимит запросов, жду " << waitS << " с ...\n";
-            Sleep((DWORD)waitS * 1000);
-        } else if (more && rlRemain < 0) {
+        if (more && rlRemain < 0) {
             Sleep(1500);   // заголовков нет — прежняя осторожная пауза
         }
     }
 }
+
+// ipapi.is с 1 сентября 2026 без ключа API отвечает урезанно: страна, ASN,
+// компания — а флагов is_vpn/is_proxy/is_tor/is_datacenter в ответе нет.
+// Нет флага — это не «false»: такой ответ о VPN ничего не говорит, и считать
+// адрес проверенным («чисто») нельзя.
+static bool ipapiHasFlags(const std::string& resp) {
+    return resp.find("\"is_datacenter\"") != std::string::npos ||
+           resp.find("\"is_vpn\"") != std::string::npos;
+}
+// Урезанный ответ уже видели — до конца работы программы ipapi.is не спрашиваем:
+// адреса туда уходили бы впустую.
+static std::atomic<bool> g_ipapiNoFlags{false};
 
 // Вторичная проверка хостинга/VPN через ipapi.is (по одному IP, HTTPS GET).
 // Запускаем ТОЛЬКО для адресов, которые ip-api не отметил как hosting и которые
@@ -856,14 +906,37 @@ void resolveHostingSecondary(std::unordered_map<std::string, IpInfo>& cache,
         paths.push_back(L"/?q=" + std::wstring(ip.begin(), ip.end()));
     }
     if (todo.empty()) return;
-    // 2) спрашиваем параллельно (раньше — по одному с паузой 400 мс)
+    // printf, а не cout: предупреждение должно попасть и в отчёт рядом с вердиктом
+    auto warnNoFlags = [] {
+        printf("  %sipapi.is: без ключа API сервис больше не отдаёт флаги VPN/прокси/Tor/"
+               "датацентр — вторичная проверка недоступна. Адреса ею НЕ проверены (это не "
+               "«чисто»): хостинг/VPN видны только по ip-api и базе IP2Proxy (если подключена).%s\n",
+               C::YEL, C::RST);
+    };
+    if (g_ipapiNoFlags) { warnNoFlags(); return; }
+    // 2) первый адрес — отдельно: урезанный ответ без ключа виден сразу, и
+    // остальной бюджет на пустые ответы не тратится
     std::cout << "  ipapi.is: проверка " << todo.size() << " адрес(ов) ...\n" << std::flush;
-    std::vector<std::string> answers = httpsGetMany(L"api.ipapi.is", paths, 6);
+    std::vector<std::string> answers(todo.size());
+    answers[0] = httpsGet(L"api.ipapi.is", paths[0]);
+    if (!answers[0].empty() && !ipapiHasFlags(answers[0])) {
+        g_ipapiNoFlags = true;
+        warnNoFlags();
+        return;
+    }
+    // остальные — параллельно (раньше — по одному с паузой 400 мс)
+    if (todo.size() > 1) {
+        std::vector<std::wstring> rest(paths.begin() + 1, paths.end());
+        std::vector<std::string> more = httpsGetMany(L"api.ipapi.is", rest, 6);
+        for (size_t n = 0; n < more.size(); n++) answers[n + 1] = std::move(more[n]);
+    }
     // 3) разбираем ответы
+    size_t noFlags = 0;
     for (size_t n = 0; n < todo.size(); n++) {
         IpInfo& info = *todo[n];
         const std::string& resp = answers[n];
         if (resp.empty()) continue;
+        if (!ipapiHasFlags(resp)) { noFlags++; continue; }   // флагов нет — адрес не проверен
         auto isTrue = [&](const char* key) {
             std::string k = std::string("\"") + key + "\"";
             size_t p = resp.find(k);
@@ -883,6 +956,11 @@ void resolveHostingSecondary(std::unordered_map<std::string, IpInfo>& cache,
         info.isVpn = info.isVpn || fVpn; info.isProxy = info.isProxy || fProxy; info.isTor = info.isTor || fTor;
         if (fVpn || fProxy || fTor)
             info.flagSrc = info.flagSrc.empty() ? "ipapi.is" : info.flagSrc + " + ipapi.is";
+    }
+    // первый адрес не ответил, а остальные пришли урезанными — то же самое
+    if (noFlags) {
+        g_ipapiNoFlags = true;
+        warnNoFlags();
     }
 }
 
@@ -928,8 +1006,15 @@ static std::string reverseDns(const std::string& ip) {
 
 // ASN/организация одного IP через ip-api.com (одиночный запрос).
 static std::string asnOf(const std::string& ip) {
+    // Частные/служебные хопы (роутер 192.168.x, 10.x и 100.64 оператора) ip-api
+    // не знает («private range»), а квоту /batch (15 в минуту) они тратили — как
+    // и в resolveIps, наружу их не шлём. В закрытое окно лимита тоже не стучимся
+    // (ipApiWaitMs): хоп останется «no info», зато не будет 429 и бана на час.
+    if (isPrivateIp(ip) || ipApiWaitMs() > 0) return "";
+    int rlRemain = -1, rlTtl = -1;
     std::string resp = httpPost(L"ip-api.com", L"/batch",
-        std::string("[\"") + ip + "\"]"); // используем batch для единообразия
+        std::string("[\"") + ip + "\"]", &rlRemain, &rlTtl); // используем batch для единообразия
+    ipApiNoteLimit(rlRemain, rlTtl);
     if (resp.empty()) return "";
     // ВАЖНО: имена ASN часто содержат запятые («REG.RU, Ltd», «..., Inc»).
     // jsonStr режет на запятой -> jsonText (до закрывающей кавычки, с \uXXXX).
@@ -1147,8 +1232,8 @@ void runTraceMode() {
     ensureWsa();
 
     std::cout << "Укажите цель трассировки (IP или домен).\nЦель: " << std::flush;
-    std::string s; std::getline(std::cin, s);
-    s = trim(s);
+    std::string s; readLine(s);
+    s = idnToAscii(trim(s));   // мвд.рф — в punycode
     if (s.empty()) { std::cout << "Цель не указана.\n"; return; }
 
     std::string targetIp, targetName;
@@ -1350,7 +1435,7 @@ void runTraceMode() {
     // --- встречная трассировка с внешних зондов (Globalping) ---
     std::cout << "\nСделать трассировку с внешних зондов (Globalping, из-за рубежа)? "
               << "Сравнить маршрут со стороны [y/N]: " << std::flush;
-    std::string yn; std::getline(std::cin, yn);
+    std::string yn; readLine(yn);
     if (isYesAnswer(yn)) {
         printf("\n=== ТРАССИРОВКА С ВНЕШНИХ ЗОНДОВ (Globalping) ===\n");
         std::string tgt = !targetName.empty() ? targetName : targetIp;
@@ -1439,8 +1524,8 @@ void runGeoRttMode() {
 
     std::cout << "Укажите цель (IP или домен).\n"
               << "Пример: 8.8.8.8   или   youtube.com\nЦель: " << std::flush;
-    std::string s; std::getline(std::cin, s);
-    s = trim(s);
+    std::string s; readLine(s);
+    s = idnToAscii(trim(s));
     if (s.empty()) { std::cout << "Цель не указана.\n"; return; }
 
     std::string targetIp, targetName;
@@ -1461,6 +1546,7 @@ void runGeoRttMode() {
     double minRtt = -1; int got = 0;
 #ifndef _WIN32
     printf("Пингую (5 проб)... ");
+    fflush(stdout);     // stdout полностью буферизован (ui.cpp) — иначе экран пуст до конца проб
     for (int i = 0; i < 5; i++) {
         IcmpReply ir = icmpEcho(targetIp, 0, 2000, "maryno-geo");
         if (ir.noSocket) { printf("Не удалось открыть ICMP-сокет.\n"); return; }
@@ -1476,6 +1562,7 @@ void runGeoRttMode() {
     if (hIcmp == INVALID_HANDLE_VALUE) { printf("Не удалось создать ICMP-хендл.\n"); return; }
     char sendData[32] = "maryno-geo";
     printf("Пингую (5 проб)... ");
+    fflush(stdout);     // stdout полностью буферизован (ui.cpp) — иначе экран пуст до конца проб
     for (int i = 0; i < 5; i++) {
         char replyBuf[sizeof(ICMP_ECHO_REPLY)+64] = {0};
         LARGE_INTEGER f,a,b; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&a);
@@ -1501,6 +1588,7 @@ void runGeoRttMode() {
         return;
     }
     printf("готово. Минимальный RTT: %s%.2f мс%s\n", C::BWHT, minRtt, C::RST);
+    fflush(stdout);     // дальше — несколько сетевых запросов к геобазам
 
     // 2) GeoIP через ip-api
     std::string resp = httpPost(L"ip-api.com", L"/batch",
@@ -1511,7 +1599,8 @@ void runGeoRttMode() {
 
     // --- сверка по нескольким GeoIP-источникам с полной инфой + security-флаги ---
     // Опрашиваем ip-api, ipwho.is, iplocate.io, ipapi.is. Для каждого показываем
-    // страну/город/ASN; ipapi.is даёт флаги is_vpn/proxy/tor/datacenter/abuser.
+    // страну/город/ASN; ipapi.is даёт флаги is_vpn/proxy/tor/datacenter/abuser
+    // (с сентября 2026 — только с ключом API, см. ipapiHasFlags).
     std::string cc2, cc3;
     std::string city1 = jsonStr(resp, "city");
     std::wstring wip(targetIp.begin(), targetIp.end());
@@ -1543,9 +1632,11 @@ void runGeoRttMode() {
     // security-флаги от ipapi.is
     std::string ccSec, citySec, orgSec;
     bool fVpn=false, fProxy=false, fTor=false, fDc=false, fAbuser=false;
+    int secState = 0;   // 0 — нет ответа, 1 — ответ без флагов (нет ключа API), 2 — флаги есть
     {
         std::string rs = httpsGet(L"api.ipapi.is", L"/?q=" + wip);
         if (!rs.empty()) {
+            secState = ipapiHasFlags(rs) ? 2 : 1;
             ccSec = jsonStr(rs, "country_code");
             citySec = jsonStr(rs, "city");
             auto bf = [&](const char* k){ return jsonStr(rs, k) == "true"; };
@@ -1598,8 +1689,14 @@ void runGeoRttMode() {
         if (fDc)     printf("%sDATACENTER%s ", C::YEL, C::RST);
         if (fAbuser) printf("%sABUSER%s ", C::RED, C::RST);
         printf("\n");
-    } else {
+    } else if (secState == 2) {
         printf("  %sФлаги (ipapi.is): чисто (не VPN/proxy/tor/datacenter)%s\n", C::GRY, C::RST);
+    } else if (secState == 1) {
+        // без флага — не «чисто»: урезанный ответ без ключа о VPN ничего не говорит
+        printf("  %sФлаги (ipapi.is): недоступны — без ключа API сервис их больше не отдаёт "
+               "(это не «чисто»)%s\n", C::YEL, C::RST);
+    } else {
+        printf("  %sФлаги (ipapi.is): нет ответа — проверка не выполнена%s\n", C::YEL, C::RST);
     }
 
     int floorRtt = minPlausibleRttForCountry(cc);
@@ -1668,9 +1765,11 @@ void runGeoRttMode() {
 // ------------------------------------------------------------------
 
 // Печатает результаты TCP-ping по зондам. Возвращает число зондов, open —
-// сколько из них получили ответ (порт принимает соединения).
-static int globalpingPrintTcpPing(const std::string& resp, int& open) {
-    int probes = 0; open = 0;
+// сколько из них получили ответ (порт принимает соединения), failed — сколько
+// не смогли выполнить проверку (домен не резолвится, зонд offline): порт они
+// не проверяли, и в вердикт их не берём.
+static int globalpingPrintTcpPing(const std::string& resp, int& open, int& failed) {
+    int probes = 0; open = 0; failed = 0;
     printf("  %-40s %-10s %s\n", "ЗОНД", "RTT", "ПОРТ");
     size_t pos = 0;
     while (probes < 8) {
@@ -1700,6 +1799,7 @@ static int globalpingPrintTcpPing(const std::string& resp, int& open) {
             std::string raw = jsonStrFull(res, "rawOutput");
             size_t nl = raw.find('\n');
             if (nl != std::string::npos) raw.resize(nl);
+            failed++;
             printf("  %-40s %-10s %sзонд не смог проверить%s %s\n", loc.c_str(), "—",
                    C::YEL, C::RST, raw.c_str());
         } else if (atoi(rcv.c_str()) > 0) {
@@ -1720,8 +1820,8 @@ void runPortCheckMode() {
     ensureWsa();
     std::cout << "Проверка доступности TCP-порта ИЗВНЕ (зонды Globalping на разных континентах).\n";
     std::cout << "Цель (IP или домен): " << std::flush;
-    std::string host; std::getline(std::cin, host);
-    host = trim(host);
+    std::string host; readLine(host);
+    host = idnToAscii(trim(host));
     if (host.empty()) { std::cout << "Цель не указана.\n"; return; }
     for (auto& ch : host) ch = (char)tolower((unsigned char)ch);
     if (!isValidIpv4Str(host) && !looksLikeDomainStr(host)) {
@@ -1735,7 +1835,7 @@ void runPortCheckMode() {
     }
 
     std::cout << "Порт (Enter — 443): " << std::flush;
-    std::string portStr; std::getline(std::cin, portStr);
+    std::string portStr; readLine(portStr);
     portStr = trim(portStr);
     long long port = 443;
     if (!portStr.empty()) {
@@ -1765,15 +1865,23 @@ void runPortCheckMode() {
         printf("%sРезультат не получен: %s%s\n", C::YEL, err.c_str(), C::RST);
         return;
     }
-    int open = 0;
-    int probes = globalpingPrintTcpPing(resp, open);
+    int open = 0, failed = 0;
+    int probes = globalpingPrintTcpPing(resp, open, failed);
     if (probes == 0) {
         printf("%sНе удалось разобрать ответ. Сырой ответ (начало):%s\n", C::GRY, C::RST);
         printf("%.1200s\n", resp.c_str());
         return;
     }
     printf("\n");
-    if (open == probes)
+    // вердикт — только по зондам, которые порт реально проверили: упавший зонд
+    // (опечатка в домене, нет A-записи, зонд offline) раньше шёл в знаменатель,
+    // и выходило ложное «порт закрыт / за NAT» или «доступен частично»
+    const int checked = probes - failed;
+    if (checked == 0)
+        printf("%sНи один зонд не смог выполнить проверку (причины — в строках выше): о порте %lld\n"
+               "ничего не известно. Проверьте адрес или домен и повторите позже.%s\n",
+               C::YEL, port, C::RST);
+    else if (open == checked)
         printf("%sПорт %lld доступен извне со всех зондов.%s\n", C::GRN, port, C::RST);
     else if (open == 0)
         printf("%sПорт %lld извне недоступен ни с одного зонда: закрыт, фильтруется\n"
@@ -1781,7 +1889,10 @@ void runPortCheckMode() {
                C::RED, port, C::RST);
     else
         printf("%sПорт %lld доступен частично (%d из %d зондов): потери на пути или\n"
-               "фильтрация по стране/сети источника.%s\n", C::YEL, port, open, probes, C::RST);
+               "фильтрация по стране/сети источника.%s\n", C::YEL, port, open, checked, C::RST);
+    if (checked > 0 && failed > 0)
+        printf("%s(%d зонд(ов) не смогли выполнить проверку — в вердикте не учтены.)%s\n",
+               C::GRY, failed, C::RST);
 }
 
 // ------------------------------------------------------------------
@@ -1862,12 +1973,43 @@ static std::string parseServiceVersion(const std::string& banner, int port) {
     return "";
 }
 
+#ifdef _WIN32
+// Windows, получив RST в ответ на SYN, отдаёт WSAECONNREFUSED не сразу: ещё
+// дважды повторяет SYN с паузой ~0,5 с (MS KB175523), и отказ приходит позже
+// таймаута скана (800 мс). Закрытые порты выходили «filtered», а :65000 —
+// «drop — фаервол». На macOS RST сразу даёт ECONNREFUSED.
+// SIO_TCP_INITIAL_RTO (<mstcpip.h>: _WSAIOW(IOC_VENDOR,17)) убирает повторы SYN.
+// TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS (0xFE) понимают с Windows 10 1709
+// (сборка 16299); на более старых то же значение — 254 повтора, там ставим 1
+// (один повтор через ~0,5 с — отказ всё равно успевает до таймаута).
+static void tcpNoSynRetries(SOCKET s) {
+    static const UCHAR maxSyn = [] {
+        // GetVersionEx без манифеста занижает версию — спрашиваем ntdll
+        typedef LONG (WINAPI* RtlGetVersionFn)(OSVERSIONINFOW*);
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        auto fn = nt ? reinterpret_cast<RtlGetVersionFn>(GetProcAddress(nt, "RtlGetVersion")) : nullptr;
+        OSVERSIONINFOW v{}; v.dwOSVersionInfoSize = sizeof(v);
+        if (fn && fn(&v) == 0 &&
+            (v.dwMajorVersion > 10 || (v.dwMajorVersion == 10 && v.dwBuildNumber >= 16299)))
+            return (UCHAR)0xFE;
+        return (UCHAR)1;
+    }();
+    // как TCP_INITIAL_RTO_PARAMETERS; Rtt = 0xFFFF (UNSPECIFIED) — начальный RTO системный
+    struct { USHORT Rtt; UCHAR MaxSynRetransmissions; } p{ (USHORT)0xFFFF, maxSyn };
+    DWORD ret = 0;
+    WSAIoctl(s, _WSAIOW(IOC_VENDOR, 17), &p, (DWORD)sizeof(p), nullptr, 0, &ret, nullptr, nullptr);
+}
+#endif
+
 // TCP connect + опциональный баннер-граб. result: 1=open(+banner), 0=refused, -1=filtered.
 static int tcpProbeBanner(const std::string& ip, int port, int timeoutMs,
                           long long* connectMs, std::string* banner) {
     auto t0 = std::chrono::steady_clock::now();
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return -1;
+#ifdef _WIN32
+    tcpNoSynRetries(s);             // до connect: иначе RST ждёт повторов SYN
+#endif
     u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
     sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons((u_short)port);
     inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
@@ -2062,12 +2204,30 @@ static int buildHysteria2Quic(unsigned char* b) {
     return 1200;
 }
 
+// Список портов «22,443,8000-8100»: числа и диапазоны a-b через запятую.
+// Раньше atoi превращал «8000-8100» внутри списка в один порт 8000, а «8o» —
+// в 8, молча. Теперь токен, который целиком не число и не диапазон 1..65535, —
+// ошибка: false, в bad — сам токен.
+static bool parsePortList(const std::string& s, std::vector<int>& ports, std::string& bad) {
+    std::stringstream ss(s); std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        tok = trim(tok);
+        if (tok.empty()) continue;
+        char* e = nullptr;
+        long a = strtol(tok.c_str(), &e, 10), b = a;
+        if (e != tok.c_str() && *e == '-') b = strtol(e + 1, &e, 10);
+        if (e == tok.c_str() || *e || a < 1 || b > 65535 || a > b) { bad = tok; return false; }
+        for (long p = a; p <= b; p++) ports.push_back((int)p);
+    }
+    return true;
+}
+
 void runPortScanMode() {
     ensureWsa();
 
     std::cout << "Скан портов с нашей машины.\nIP цели: " << std::flush;
-    std::string ip; std::getline(std::cin, ip);
-    ip = trim(ip);
+    std::string ip; readLine(ip);
+    ip = idnToAscii(trim(ip));
     if (!isValidIpv4Str(ip)) {
         // допускаем домен — резолвим
         if (looksLikeDomainStr(ip)) {
@@ -2079,8 +2239,8 @@ void runPortScanMode() {
 
     std::cout << "Диапазон портов: 'full' (1-65535), 'top' (частые),\n"
               << "  'service' (22,80,443,SSH/HTTP/почта/БД...), 'vpn' (VPN-порты),\n"
-              << "  диапазон 1-1024 или список 80,443,8080: " << std::flush;
-    std::string rng; std::getline(std::cin, rng);
+              << "  диапазон 1-1024 или список 80,443,8000-8100: " << std::flush;
+    std::string rng; readLine(rng);
     rng = trim(rng);
 
     // парсим режим портов
@@ -2106,10 +2266,10 @@ void runPortScanMode() {
         else { std::cout << "Пустой диапазон.\n"; return; }
         modeLabel = "диапазон " + rng;
     } else {
-        std::stringstream ss(rng); std::string tok;
-        while (std::getline(ss, tok, ',')) {
-            int p = atoi(tok.c_str());
-            if (p>=1 && p<=65535) ports.push_back(p);
+        std::string bad;
+        if (!parsePortList(rng, ports, bad)) {
+            std::cout << "Неверный порт или диапазон: «" << bad << "».\n";
+            return;
         }
         modeLabel = "список";
     }
@@ -2213,7 +2373,8 @@ void runPortScanMode() {
             printf("\n%sTCP fingerprint (распределение рукопожатия)%s\n", C::BOLD, C::RST);
             printf("  handshake медиана=%lldms мин=%lldms макс=%lldms разброс=%.1fms (%d проб, порт %d)\n",
                    med, mn, mx2, sd, (int)hs.size(), fpPort);
-            int closedBehavior = tcpProbe(ip, 65000, 600);
+            // таймаут — как у скана: на старых Windows отказ приходит через ~0,5 с
+            int closedBehavior = tcpProbe(ip, 65000, TCP_TO);
             printf("  закрытый порт :65000 — %s\n",
                    closedBehavior==0 ? "RST (refused, обычный стек)"
                    : closedBehavior<0 ? "молчит (drop — фаервол/фильтр)" : "открыт?!");
@@ -2319,15 +2480,28 @@ void runDpiLocatorMode() {
 
     std::cout << "TSPU DPI Locator — поиск хопа, где режется по SNI.\n";
     std::cout << "Заблокированный домен (SNI), напр. rutracker.org: " << std::flush;
-    std::string host; std::getline(std::cin, host);
+    std::string host; readLine(host);
     host = trim(host);
+    // Домен из жалобы часто вставляют ссылкой («https://rutracker.org/forum/»):
+    // в SNI она ушла бы как есть, не совпала бы с правилами ТСПУ, и вышло бы
+    // ложное «блокировки нет». Берём только хост, без порта и точки в конце —
+    // как в режиме 13; кириллицу — в punycode, как её шлёт в SNI браузер.
+    for (const char* sch : { "http://", "https://", "HTTP://", "HTTPS://" })
+        if (host.compare(0, strlen(sch), sch) == 0) { host = host.substr(strlen(sch)); break; }
+    host = host.substr(0, host.find_first_of("/?#:"));
+    while (!host.empty() && host.back() == '.') host.pop_back();
+    host = idnToAscii(host);   // SNI — только ASCII (punycode), нижний регистр
     if (host.empty()) { std::cout << "Домен не задан.\n"; return; }
+    if (!looksLikeDomainStr(host)) {
+        std::cout << "Это не похоже на доменное имя. Отмена.\n";
+        return;
+    }
     // имя длиннее 253 символов невалидно и не влезло бы в буфер ClientHello ниже
     if (host.size() > 253) { std::cout << "Слишком длинный домен.\n"; return; }
 
     // целевой IP: можно ввести явно (IP сервера домена) или разрешить домен
     std::cout << "IP сервера (Enter — разрешить домен через DNS): " << std::flush;
-    std::string ip; std::getline(std::cin, ip);
+    std::string ip; readLine(ip);
     ip = trim(ip);
     if (ip.empty()) {
         ip = resolveHostToIp(host);
@@ -2349,7 +2523,7 @@ void runDpiLocatorMode() {
                "сервера вручную или отключите перехват DNS.%s\n",
                C::YEL, ip.c_str(), C::RST);
         std::cout << "Продолжить всё равно? [y/N]: " << std::flush;
-        std::string yn; std::getline(std::cin, yn);
+        std::string yn; readLine(yn);
         if (!isYesAnswer(yn)) return;
     }
 
@@ -2361,6 +2535,9 @@ void runDpiLocatorMode() {
            "  TTL. Пока CH не доходит до фильтра — тишина; первый TTL, на котором\n"
            "  приходит RST, — участок фильтра.%s\n", C::GRY, C::RST);
     printf("  %s(Ctrl+C — прервать)%s\n\n", C::GRY, C::RST);
+    // stdout полностью буферизован (ui.cpp): без fflush шапка, контроль и строки
+    // по TTL копились до конца замера — минутами пустой экран, похоже на зависание
+    fflush(stdout);
     g_traceAbort = false;
 
     unsigned char ch[1024], chCtl[1024];
@@ -2382,6 +2559,7 @@ void runDpiLocatorMode() {
     // 1) контроль: TCP и TLS до сервера вообще работают (нейтральный SNI, обычный TTL)
     DpiProbe ctl = dpiTlsProbe(ip, PORT, chCtl, chCtlLen, 0, 3000);
     printf("  Контроль, SNI example.com, полный TTL: %s\n", probeName(ctl));
+    fflush(stdout);
     if (ctl == DpiProbe::NoTcp) {
         printf("\n%sTCP до %s:%d не устанавливается — сервер недоступен или блокировка\n"
                "по IP (режется SYN). SNI-локатор тут неприменим — нужна трассировка.%s\n",
@@ -2398,6 +2576,7 @@ void runDpiLocatorMode() {
     // 2) базовая проба: заблокированный SNI с обычным TTL — есть ли блокировка вообще
     DpiProbe base = dpiTlsProbe(ip, PORT, ch, chLen, 0, 3000);
     printf("  SNI %s, полный TTL: %s\n\n", host.c_str(), probeName(base));
+    fflush(stdout);
     if (base == DpiProbe::Reply) {
         printf("=================== ВЫВОД ===================\n");
         printf("%sClientHello с SNI «%s» дошёл до сервера — блокировки по SNI "
@@ -2427,6 +2606,7 @@ void runDpiLocatorMode() {
     int noTcpStreak = 0;
 
     printf("  %-4s %-16s %-22s %s\n", "TTL", "ХОП (ICMP)", "TLS-РЕАКЦИЯ", "ВЕРДИКТ");
+    fflush(stdout);
     for (int ttl = 1; ttl <= kMaxTtl && !g_traceAbort; ttl++) {
         std::string hopIp = icmpHopAtTtl(ip, ttl);
         DpiProbe r = dpiTlsProbe(ip, PORT, ch, chLen, ttl, PROBE_TO);
@@ -2447,6 +2627,7 @@ void runDpiLocatorMode() {
         printf("  %-4d %s%-16s%s %-22s %s%s%s\n",
                ttl, C::CYN, hopIp.empty()?"*":hopIp.c_str(), C::RST,
                probeName(r), vcol, verdict, C::RST);
+        fflush(stdout);             // строка на каждый TTL — сразу, как в трассировке
 
         if (blockTtl > 0 || reachedServer || noTcpStreak >= 3) break;
         // ICMP уже дошёл до самого сервера — CH с этим TTL тоже до него доставал,
@@ -2499,8 +2680,8 @@ void runUdpProbeMode() {
     ensureWsa();
 
     std::cout << "UDP handshake-пробы.\nIP цели: " << std::flush;
-    std::string ip; std::getline(std::cin, ip);
-    ip = trim(ip);
+    std::string ip; readLine(ip);
+    ip = idnToAscii(trim(ip));
     if (!isValidIpv4Str(ip)) {
         if (looksLikeDomainStr(ip)) {
             std::string r = resolveHostToIp(ip);
@@ -2509,8 +2690,9 @@ void runUdpProbeMode() {
         } else { std::cout << "Неверный IP/домен.\n"; return; }
     }
 
-    std::cout << "Порты (список 51820,500,1194,53 или 'vpn' для типичных VPN): " << std::flush;
-    std::string rng; std::getline(std::cin, rng);
+    std::cout << "Порты (список 51820,500,1194,53, можно с диапазоном 51820-51830, "
+                 "или 'vpn' для типичных VPN): " << std::flush;
+    std::string rng; readLine(rng);
     rng = trim(rng);
 
     std::vector<int> ports;
@@ -2518,10 +2700,11 @@ void runUdpProbeMode() {
         int vpn[] = {51820,51821,55555,2408,1637,500,4500,1194,1195,36712,1935,443,53};
         for (int p : vpn) ports.push_back(p);
     } else {
-        std::stringstream ss(rng); std::string tok;
-        while (std::getline(ss, tok, ',')) {
-            int p = atoi(tok.c_str());
-            if (p>=1 && p<=65535) ports.push_back(p);
+        // как в скане портов: диапазоны внутри списка, ошибка — не молча
+        std::string bad;
+        if (!parsePortList(rng, ports, bad)) {
+            std::cout << "Неверный порт или диапазон: «" << bad << "».\n";
+            return;
         }
     }
     if (ports.empty()) { std::cout << "Порты не заданы.\n"; return; }
@@ -2529,6 +2712,7 @@ void runUdpProbeMode() {
     printf("\n=================== UDP HANDSHAKE-ПРОБЫ ===================\n");
     printf("Цель: %s\n", ip.c_str());
     printf("  %s(Ctrl+C — прервать)%s\n\n", C::GRY, C::RST);
+    fflush(stdout);     // как в DPI-локаторе: stdout буферизован, проба — до 1,2 с на порт
 
     g_traceAbort = false;
     unsigned char buf[1300];
@@ -2570,6 +2754,7 @@ void runUdpProbeMode() {
                 printf("  UDP:%-6d %-16s %sтихо (no-reply / filtered)%s\n",
                        p, kind, C::GRY, C::RST);
             }
+            fflush(stdout);
         }
     }
 
@@ -2706,13 +2891,20 @@ static bool parseDnsResp(const unsigned char* b, int n, uint16_t id, DnsAns& r) 
 // UDP-запрос к серверу server:53. После первого ответа ещё ~400 мс слушаем
 // сокет: если придёт второй ответ с тем же id, но другим содержимым — ответ
 // вбрасывается «по пути» (DPI успевает раньше настоящего резолвера).
+// Пока ответа нет, запрос повторяется каждые 800 мс (до 3 отправок в пределах
+// timeoutMs), как у системного резолвера: одна потерянная датаграмма на линии
+// с потерями давала «нет ответа — дропается» и могла перевернуть ИТОГ. У повтора
+// свой id: ответы на разные отправки законно различаются (разные узлы anycast-
+// резолвера, CDN), поэтому «два разных ответа» ищем только в пределах одного id.
 static DnsProbe udpDnsQuery(const std::string& server, const std::string& name,
                             uint16_t qtype, int timeoutMs) {
     static std::atomic<unsigned> ctr{(unsigned)GetTickCount()};
+    auto newId = [] { return (uint16_t)((ctr.fetch_add(1) * 2654435761u) >> 16); };
     DnsProbe r;
     unsigned char q[512];
-    uint16_t id = (uint16_t)((ctr.fetch_add(1) * 2654435761u) >> 16);
-    int len = buildDnsQueryFor(q, sizeof(q), name, id, qtype);
+    const int kMaxSends = 3;
+    uint16_t ids[kMaxSends] = { newId(), 0, 0 };
+    int len = buildDnsQueryFor(q, sizeof(q), name, ids[0], qtype);
     if (!len) return r;
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) return r;
@@ -2720,27 +2912,47 @@ static DnsProbe udpDnsQuery(const std::string& server, const std::string& name,
     inet_pton(AF_INET, server.c_str(), &addr.sin_addr);
     auto t0 = std::chrono::steady_clock::now();
     sendto(s, (const char*)q, len, 0, (sockaddr*)&addr, sizeof(addr));
+    int sent = 1;
+    const auto kResend = std::chrono::milliseconds(800);
+    auto resendAt = t0 + kResend;
     auto deadline = t0 + std::chrono::milliseconds(timeoutMs);
     bool haveFirst = false;
+    uint16_t firstId = 0;
     for (;;) {
-        long long left = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             deadline - std::chrono::steady_clock::now()).count();
-        if (left <= 0) break;
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) break;
+        if (!haveFirst && sent < kMaxSends && now >= resendAt) {
+            ids[sent] = newId();
+            q[0] = (unsigned char)(ids[sent] >> 8); q[1] = (unsigned char)(ids[sent] & 0xFF);
+            sendto(s, (const char*)q, len, 0, (sockaddr*)&addr, sizeof(addr));
+            sent++;
+            resendAt += kResend;
+        }
+        auto until = (!haveFirst && sent < kMaxSends && resendAt < deadline) ? resendAt : deadline;
+        long long left = std::chrono::duration_cast<std::chrono::milliseconds>(until - now).count() + 1;
+        if (left < 1) left = 1;
         fd_set rf; FD_ZERO(&rf); FD_SET(s, &rf);
         timeval tv; tv.tv_sec = (long)(left / 1000); tv.tv_usec = (long)((left % 1000) * 1000);
-        if (select((int)s + 1, &rf, nullptr, nullptr, &tv) <= 0) break;
+        int sel = select((int)s + 1, &rf, nullptr, nullptr, &tv);
+        if (sel < 0) break;
+        if (sel == 0) continue;            // дедлайн или пора повторить — решает начало цикла
         unsigned char buf[4096]; sockaddr_in from{}; socklen_t fl = sizeof(from);
         int n = recvfrom(s, (char*)buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
         if (n <= 0) break;
+        if (n < 12) continue;
+        const uint16_t rid = (uint16_t)((buf[0] << 8) | buf[1]);
+        bool ours = false;
+        for (int k = 0; k < sent; k++) ours = ours || ids[k] == rid;
         DnsAns a;
-        if (!parseDnsResp(buf, n, id, a)) continue;
+        if (!ours || !parseDnsResp(buf, n, rid, a)) continue;
         if (!haveFirst) {
             haveFirst = true;
+            firstId = rid;
             r.first = a;
             r.ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
                        std::chrono::steady_clock::now() - t0).count();
             deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
-        } else if (a.rcode != r.first.rcode || a.a != r.first.a) {
+        } else if (rid == firstId && (a.rcode != r.first.rcode || a.a != r.first.a)) {
             r.second = a; r.twoDifferent = true;
             break;
         }
@@ -2838,6 +3050,15 @@ static bool isStubAddr(const std::string& ip) {
     return ip.rfind("0.", 0) == 0 || ip.rfind("127.", 0) == 0 || isPrivateIp(ip);
 }
 
+static std::string rcodeName(int rc) {
+    switch (rc) {
+    case 2: return "SERVFAIL";
+    case 3: return "NXDOMAIN";
+    case 5: return "REFUSED";
+    default: return "код " + std::to_string(rc);
+    }
+}
+
 // Ответ одного резолвера на один домен + вердикт.
 struct DnsResolverAns {
     std::string label;              // «система», «DNS 10.0.0.1», «8.8.8.8 (UDP)» ...
@@ -2868,7 +3089,7 @@ void runDnsHonestyMode() {
     std::cout << "Проверка честности DNS.\n"
                  "Домены через запятую (Enter — стандартный набор: контрольные + "
                  "часто блокируемые): " << std::flush;
-    std::string line; std::getline(std::cin, line);
+    std::string line; readLine(line);
     line = trim(line);
 
     std::vector<DnsDomainRes> doms;
@@ -2879,7 +3100,7 @@ void runDnsHonestyMode() {
         // контрольный домен нужен, чтобы отличить «DNS врёт» от «DNS не работает»
         DnsDomainRes c; c.name = "example.com"; c.control = true; doms.push_back(c);
         for (auto& d : splitInput(line)) {
-            std::string n = d;
+            std::string n = idnToAscii(d);
             for (auto& ch : n) ch = (char)tolower((unsigned char)ch);
             if (!looksLikeDomainStr(n)) { printf("  %sпропуск «%s» — не домен%s\n", C::GRY, d.c_str(), C::RST); continue; }
             if (n == "example.com") continue;
@@ -3014,6 +3235,17 @@ void runDnsHonestyMode() {
                 r.sev = 2; r.verdict = "NXDOMAIN, хотя домен существует — подмена ответа";
             } else if (noAns && (!d.ref.empty() || d.refNx)) {
                 r.sev = 2; r.verdict = "нет ответа — запрос/ответ дропается";
+            } else if (r.viaUdp && r.probe.first.got && r.probe.first.rcode != 0 &&
+                       r.probe.first.rcode != 3) {
+                // REFUSED / SERVFAIL — так блокируют AdGuard Home, Unbound (refuse),
+                // RPZ. Раньше такой ответ без адресов проходил как «ок»; правило — как
+                // в режиме 13 (runIpOwnerFor)
+                r.sev = d.ref.empty() ? 1 : 2;
+                r.verdict = "ошибка сервера " + rcodeName(r.probe.first.rcode) +
+                    (d.ref.empty() ? std::string() : ", а DoH видит адреса — отказ / блокировка");
+            } else if (r.viaUdp && r.probe.first.got && r.ips.empty() && !d.ref.empty()) {
+                // NOERROR без A-записей (RPZ NODATA) при живом эталоне — тоже подмена
+                r.sev = 2; r.verdict = "пустой ответ (нет A-записей), хотя домен существует — подмена / блок";
             } else if (!shared.empty() && !d.ref.empty() && !overlap) {
                 r.sev = 2; r.verdict = "ЗАГЛУШКА — " + shared + " выдаётся для разных сайтов";
             } else if (!r.ips.empty() && !d.ref.empty() && !overlap) {
@@ -3087,7 +3319,7 @@ void runDnsHonestyMode() {
             if (r.viaUdp) {
                 if (!r.probe.first.got) val = "—";
                 else if (r.probe.first.rcode == 3) val = "NXDOMAIN";
-                else if (r.probe.first.rcode != 0) val = "rcode " + std::to_string(r.probe.first.rcode);
+                else if (r.probe.first.rcode != 0) val = rcodeName(r.probe.first.rcode);
                 else val = r.ips.empty() ? "(пусто)" : joinIps(r.ips);
                 if (r.probe.ms >= 0) val += "  " + std::to_string(r.probe.ms) + " мс";
             } else {
@@ -3143,8 +3375,13 @@ void runDnsHonestyMode() {
         printf("%sДаже контрольные домены отвечают неверно — проблема с DNS/сетью в целом, "
                "а не блокировка отдельных сайтов. Проверьте настройки DNS у клиента, "
                "роутер, доступность резолвера.%s\n", C::YEL, C::RST);
+        // подмену по тестовым доменам не прячем: заглушка или NXDOMAIN при живом
+        // DoH говорят о блокировке и сами по себе
+        if (bad > badCtl)
+            printf("%sКроме того, неверно отвечают %d тестовых домен(ов) — заглушки/подмену "
+                   "по ним смотрите в строках выше.%s\n", C::YEL, bad - badCtl, C::RST);
     } else if (bad > 0) {
-        printf("%sDNS врёт по %d домен(ам): заглушки/подмена/дроп.%s\n", C::RED, bad, C::RST);
+        printf("%sDNS врёт по %d домен(ам): заглушки/подмена/дроп/отказ.%s\n", C::RED, bad, C::RST);
         printf("Что сказать/сделать: блокировка на уровне DNS (реестр РКН / ТСПУ). "
                "Смена DNS в системе на 8.8.8.8/1.1.1.1 поможет, только если UDP:53 не "
                "перехватывается (см. блок «Перехват»); надёжно — DoH/DoT в браузере или ОС. "
@@ -3405,7 +3642,7 @@ void runTcp16Mode() {
     std::cout << "Тест «16 КБ» по зарубежным хостингам.\n"
                  "Свои URL через запятую (добавятся к стандартным; Enter — только стандартные): "
               << std::flush;
-    std::string line; std::getline(std::cin, line);
+    std::string line; readLine(line);
     for (auto& u : splitInput(trim(line))) {
         std::string url = u;
         if (url.find("://") == std::string::npos) url = "https://" + url;
@@ -3425,7 +3662,9 @@ void runTcp16Mode() {
         for (auto& t : th) t.join();
     }
 
-    int frozen = 0, okHost = 0, ctlOk = 0, ctlBad = 0, testedHost = 0;
+    // failHost — зарубежные, где «другая беда» (cls 3: TCP/TLS не установились,
+    // обрыв): они «проверены», но ни заморозки, ни нормальной закачки не дали
+    int frozen = 0, okHost = 0, failHost = 0, ctlOk = 0, ctlBad = 0, testedHost = 0;
     printf("  %s %s %s %s  %s\n", u8pad("Сервер", 24).c_str(), u8pad("IP", 16).c_str(),
            u8pad("Получено", 10).c_str(), u8pad("Время", 8).c_str(), "Итог");
     for (size_t i = 0; i < tg.size(); i++) {
@@ -3437,6 +3676,7 @@ void runTcp16Mode() {
             if (cls != 1) testedHost++;
             if (cls == 2) frozen++;
             if (cls == 0) okHost++;
+            if (cls == 3) failHost++;
         }
         const char* col = cls == 0 ? C::GRN : cls == 1 ? C::GRY : cls == 2 ? C::RED : C::YEL;
         char got[32], tm[32];
@@ -3469,9 +3709,25 @@ void runTcp16Mode() {
     } else if (testedHost == 0) {
         printf("%sНи один зарубежный сервер не дал пригодного ответа — URL-ы, возможно, "
                "устарели. Добавьте свои (большой файл по HTTPS).%s\n", C::YEL, C::RST);
+    } else if (okHost == 0) {
+        // Раньше сюда шёл зелёный «заморозки не видно (0 из N…)»: ни один зарубежный
+        // не скачался, но и 16 КБ не было. Так выглядят «белые списки» мобильных
+        // сетей и блокировка хостингов по IP/TLS при живых российских контролях.
+        printf("%sНи один зарубежный сервер не скачался (%d из %d — ошибка соединения или обрыв, "
+               "см. таблицу) при рабочих контрольных. Это не «16 КБ»: зарубежные хостинги "
+               "недоступны совсем — блокировка по IP/TLS или «белые списки».%s\n",
+               C::RED, failHost, testedHost, C::RST);
+        printf("Если в таблице «домен не резолвится» или «неверный URL» — скорее устарели "
+               "URL-ы: добавьте свои (большой файл по HTTPS) и повторите.\n");
+        if (ctlBad > 0)
+            printf("%sЧасть контрольных тоже с ошибками — перепроверьте позже.%s\n", C::YEL, C::RST);
     } else {
         printf("%sЗаморозки на 16 КБ не видно (%d из %d зарубежных серверов качаются нормально).%s\n",
                C::GRN, okHost, testedHost, C::RST);
+        if (failHost > 0)
+            printf("%sНо %d зарубежных не скачались совсем (ошибка соединения/обрыв, см. таблицу) — "
+                   "это не 16 КБ, а недоступность этих хостингов (блокировка по IP или сбой).%s\n",
+                   C::YEL, failHost, C::RST);
     }
 }
 
@@ -3513,7 +3769,8 @@ static std::string jsonTopField(const std::string& s, const std::string& key) {
 
 // Все адреса домена: сначала IPv4, потом IPv6.
 // 0 = адреса есть, 1 = NXDOMAIN / нет записей, 2 = ошибка резолва.
-static int resolveAllAddrs(const std::string& name, std::vector<std::string>& out) {
+int resolveAllAddrs(const std::string& name, std::vector<std::string>& out) {
+    ensureWsa();                           // зовётся и из режима 2 (report.cpp)
     addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
     int rc = getaddrinfo(name.c_str(), nullptr, &hints, &res);
@@ -3614,19 +3871,10 @@ static void queryResolver(ResolverAns& a, const std::string& name) {
     }
 }
 
-static std::string rcodeName(int rc) {
-    switch (rc) {
-    case 2: return "SERVFAIL";
-    case 3: return "NXDOMAIN";
-    case 5: return "REFUSED";
-    default: return "код " + std::to_string(rc);
-    }
-}
-
 void runIpOwnerMode() {
     std::cout << "Кому принадлежит IP / домен.\n"
                  "IP или домен (можно несколько через запятую или пробел): " << std::flush;
-    std::string line; std::getline(std::cin, line);
+    std::string line; readLine(line);
     runIpOwnerFor(line);
 }
 
@@ -3637,12 +3885,17 @@ void runIpOwnerFor(const std::string& input) {
     if (line.empty()) { std::cout << "Ничего не введено.\n"; return; }
 
     const size_t kMaxIps = 40;
+    // Эталонные адреса (DoH) лимит kMaxIps не режет: раньше они шли последними,
+    // и у 3–5 CDN-доменов в проверку не попадали — без их ASN обычный ответ CDN
+    // выглядел «ДРУГИЕ адреса: ?». Предел для них — 100: столько держит один
+    // батч ip-api.
+    const size_t kMaxRefIps = 100;
     std::vector<OwnerRes> res;
     std::vector<std::string> privateIps;
     bool truncated = false;
     const size_t kMaxDomains = 5;          // сравнение резолверов — не больше 5 доменов
     std::vector<DomainResolvers> domains;
-    auto addIp = [&](const std::string& ip, const std::string& host) {
+    auto addIp = [&](const std::string& ip, const std::string& host, bool ref = false) {
         if (isPrivateIp(ip)) {
             if (std::find(privateIps.begin(), privateIps.end(), ip) == privateIps.end())
                 privateIps.push_back(ip);
@@ -3654,7 +3907,7 @@ void runIpOwnerFor(const std::string& input) {
                     r.hosts.push_back(host);
                 return;
             }
-        if (res.size() >= kMaxIps) { truncated = true; return; }
+        if (res.size() >= (ref ? kMaxRefIps : kMaxIps)) { truncated = true; return; }
         OwnerRes r; r.ip = ip;
         if (!host.empty()) r.hosts.push_back(host);
         res.push_back(r);
@@ -3685,6 +3938,7 @@ void runIpOwnerFor(const std::string& input) {
             addIp(b, "");
             continue;
         }
+        t = idnToAscii(t);                                      // мвд.рф — в punycode
         if (!looksLikeDomainStr(t)) {
             printf("  %sпропуск «%s» — не IP и не домен%s\n", C::GRY, tok.c_str(), C::RST);
             continue;
@@ -3750,7 +4004,12 @@ void runIpOwnerFor(const std::string& input) {
                 th.emplace_back([&a, &d]() { queryResolver(a, d.name); });
         for (auto& x : th) x.join();
         // адреса от резолверов тоже проверяем на владельца (заглушки — нет:
-        // они и так помечены в таблице)
+        // они и так помечены в таблице). Сначала эталон (DoH) всех доменов —
+        // с ним сверяются остальные резолверы, — потом прочие ответы.
+        for (auto& d : domains)
+            for (auto& a : d.rs)
+                if (a.kind >= 2 && a.ok)
+                    for (auto& ip : a.ips) if (!isStubAddr(ip)) addIp(ip, d.name, true);
         for (auto& d : domains)
             for (auto& a : d.rs) {
                 for (auto& ip : a.ips)  if (!isStubAddr(ip)) addIp(ip, d.name);
@@ -3762,8 +4021,9 @@ void runIpOwnerFor(const std::string& input) {
         printf("  %s%s — частный / служебный адрес (LAN, CGNAT, loopback): во внешних базах "
                "владельца нет, это адрес внутри чьей-то сети%s\n", C::GRY, ip.c_str(), C::RST);
     if (res.empty() && domains.empty()) { std::cout << "Нет публичных адресов для проверки.\n"; return; }
-    if (truncated)
-        printf("  %sпроверяю первые %zu адресов%s\n", C::GRY, kMaxIps, C::RST);
+    if (truncated)   // эталонные адреса сверх kMaxIps тоже в res — число берём фактическое
+        printf("  %sадресов больше лимита — проверяю %zu, остальные пропущены%s\n",
+               C::GRY, res.size(), C::RST);
 
     if (!res.empty())
         printf("%s\nЗапрашиваю геобазу и реестры (RDAP) для %zu адрес(ов)...%s\n",
@@ -3782,17 +4042,32 @@ void runIpOwnerFor(const std::string& input) {
     const std::wstring path = L"/batch?lang=ru&fields=status,message,country,countryCode,"
                               L"regionName,city,isp,org,as,asname,reverse,mobile,proxy,hosting,query";
     std::string resp;
-    for (int attempt = 1; attempt <= 2 && resp.empty() && !res.empty(); attempt++) {
-        resp = httpPost(L"ip-api.com", path, body);
+    // в закрытое окно лимита /batch не стучимся (ipApiWaitMs) — сразу запасной;
+    // после 429 второй попытки тоже нет: она снова попала бы в закрытое окно
+    const bool ipApiLimited = ipApiWaitMs() > 0;
+    for (int attempt = 1; attempt <= 2 && resp.empty() && !res.empty() && !ipApiLimited; attempt++) {
+        int rlRemain = -1, rlTtl = -1;
+        resp = httpPost(L"ip-api.com", path, body, &rlRemain, &rlTtl);
+        ipApiNoteLimit(rlRemain, rlTtl);
         if (resp.find("\"query\"") == std::string::npos) resp.clear();
+        if (resp.empty() && rlRemain == 0) break;
         if (resp.empty() && attempt < 2) Sleep(1000);
     }
     if (!resp.empty()) {
+        // объекты батча — как в resolveIps: скобки внутри строк не считаются
         int depth = 0; size_t objStart = std::string::npos;
+        bool inStr = false;
         for (size_t k = 0; k < resp.size(); k++) {
             char ch = resp[k];
-            if (ch == '{') { if (depth == 0) objStart = k; depth++; }
+            if (inStr) {
+                if (ch == '\\') k++;                    // \" и \\ строку не закрывают
+                else if (ch == '"') inStr = false;
+                continue;
+            }
+            if (ch == '"') inStr = true;
+            else if (ch == '{') { if (depth == 0) objStart = k; depth++; }
             else if (ch == '}') {
+                if (depth == 0) continue;               // лишняя «}» — в минус не уходим
                 depth--;
                 if (depth != 0 || objStart == std::string::npos) continue;
                 std::string obj = resp.substr(objStart, k - objStart + 1);
@@ -3823,7 +4098,9 @@ void runIpOwnerFor(const std::string& input) {
         }
     } else if (!res.empty()) {
         // запасной сервис: ipwho.is (по одному адресу, в несколько потоков)
-        std::cout << "  ip-api.com недоступен — запасной сервис ipwho.is\n";
+        std::cout << (ipApiWaitMs() > 0 ? "  ip-api.com: исчерпан лимит запросов"
+                                        : "  ip-api.com недоступен")
+                  << " — запасной сервис ipwho.is\n";
         std::vector<std::wstring> paths;
         for (auto& r : res) paths.push_back(L"/" + std::wstring(r.ip.begin(), r.ip.end()) + L"?lang=ru");
         std::vector<std::string> answers = httpsGetMany(L"ipwho.is", paths, 4);
@@ -3933,6 +4210,11 @@ void runIpOwnerFor(const std::string& input) {
             } else if (a.rcode != 0 && a.rcode != 3) {
                 verdict = "ошибка сервера: " + rcodeName(a.rcode);
                 col = C::YEL;
+                // а DoH адреса видит — отказ именно по этому домену (как в режиме 11)
+                if (a.kind == 1 && !ref.empty()) {
+                    verdict += ", а DoH видит адреса — отказ / блок";
+                    col = C::RED; anyBadDns = true;
+                }
             } else if (a.ips.empty()) {
                 std::string what = a.rcode == 3 ? "NXDOMAIN" : "нет A-записей";
                 if (!ref.empty()) { verdict = what + ", а DoH видит адреса — подмена / блок"; col = C::RED; anyBadDns = true; }
@@ -3944,13 +4226,21 @@ void runIpOwnerFor(const std::string& input) {
                 bool same = false;
                 for (auto& ip : a.ips) same = same || std::find(ref.begin(), ref.end(), ip) != ref.end();
                 bool sameNet = !refAsn.empty();
+                bool otherNet = false;      // есть адрес с известным ASN не из сети эталона
                 for (auto& ip : a.ips) {
                     std::string n = asnOfRes(ip);
                     sameNet = sameNet && !n.empty() && refAsn.count(n);
+                    otherNet = otherNet || (!refAsn.empty() && !n.empty() && !refAsn.count(n));
                 }
                 std::string asn = asnOfRes(a.ips[0]), who = ispOfRes(a.ips[0]);
                 if (same)         { verdict = "как у DoH"; col = C::GRN; }
                 else if (sameNet) { verdict = "другой узел той же сети (" + asn + ")"; col = C::GRN; }
+                else if (!otherNet) {
+                    // ASN нет у эталона или у этих адресов (сверх лимита, геобаза не
+                    // ответила) — сравнивать нечем; раньше тут было «ДРУГИЕ адреса: ?»
+                    verdict = "другие адреса, чем у DoH; сеть сравнить нечем — нет данных геобазы";
+                    col = C::GRY;
+                }
                 else {
                     verdict = "ДРУГИЕ адреса: " + (who.empty() ? std::string("?") : who) +
                               (asn.empty() ? std::string() : " (" + asn + ")");

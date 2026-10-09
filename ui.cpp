@@ -312,10 +312,20 @@ std::vector<std::string> pickDumpFiles(HWND owner) {
     ofn.nFilterIndex = 1;
     ofn.lpstrTitle = L"Выберите дамп (можно два сразу: _in и _out)";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER |
-                OFN_ALLOWMULTISELECT;
+                OFN_ALLOWMULTISELECT | OFN_NOCHANGEDIR;
+
+    // Диалог переводит текущий каталог процесса в папку выбранного файла, а
+    // OFN_NOCHANGEDIR для GetOpenFileName, по документации, не действует —
+    // возвращаем каталог сами. Иначе analyzer.ini («Перечитать» и инструменты
+    // --tool, которые наследуют каталог) искался бы в папке с дампом абонента,
+    // а ini из каталога запуска больше не находился.
+    wchar_t cwd[MAX_PATH * 4];
+    const DWORD cwdLen = GetCurrentDirectoryW((DWORD)(sizeof(cwd) / sizeof(cwd[0])), cwd);
+    const BOOL picked = GetOpenFileNameW(&ofn);
+    if (cwdLen > 0 && cwdLen < sizeof(cwd) / sizeof(cwd[0])) SetCurrentDirectoryW(cwd);
 
     std::vector<std::string> out;
-    if (!GetOpenFileNameW(&ofn)) return out;
+    if (!picked) return out;
 
     auto toUtf8 = [](const wchar_t* w) {
         int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
@@ -369,8 +379,22 @@ bool isYesAnswer(const std::string& s) {
     return s.rfind("д", 0) == 0 || s.rfind("Д", 0) == 0;   // /utf-8: литералы в UTF-8
 }
 
-// Спрашивает у пользователя цель диагностики: IP или домен.
-// Если домен — резолвит в IPv4. Возвращает IP-строку или пустую при отмене.
+// Строка, введённая в консоли, — для всех запросов вместо std::getline(std::cin, …).
+// На Windows Ctrl+C обрывает ожидающий ReadConsole, CRT отдаёт конец ввода, и у
+// std::cin взводятся eofbit|failbit: без clear() все следующие getline сразу
+// возвращали пустую строку (окно --tool закрывалось, меню стирало отчёт).
+// Состояние сбрасываем, прерванный ввод — пустая строка, как отмена.
+// false — строки нет (Ctrl+C или конец ввода).
+bool readLine(std::string& s) {
+    s.clear();
+    if (std::getline(std::cin, s)) return true;
+    std::cin.clear();
+    clearerr(stdin);
+    return false;
+}
+
+// Спрашивает у пользователя цель диагностики: IP или домен (askTargetIp).
+// Возвращает IP-строку, домен или пустую строку при отмене.
 // Строгая проверка IPv4: ровно 4 октета 0..255 и ничего лишнего. Вручную, без
 // sscanf: "%d" пропускал «+1.2.3.4», « 1.2.3.4» и «01.2.3.4» (ведущий ноль
 // ping и часть утилит читают как восьмеричное — адрес был бы другим).
@@ -389,7 +413,8 @@ bool isValidIpv4Str(const std::string& str) {
     }
     return *s == '\0';
 }
-// Похоже ли на доменное имя: есть точка, только допустимые символы, TLD >=2 букв.
+// Похоже ли на доменное имя: есть точка, только допустимые символы, TLD >=2 букв
+// или в punycode («xn--p1ai» — .рф). Кириллицу сначала переводит idnToAscii.
 bool looksLikeDomainStr(const std::string& str) {
     if (str.size() < 4) return false;
     if (str.find('.') == std::string::npos) return false;
@@ -401,8 +426,93 @@ bool looksLikeDomainStr(const std::string& str) {
     size_t dot = str.rfind('.');
     std::string tld = str.substr(dot+1);
     if (tld.size() < 2) return false;
-    for (char ch : tld) if (!isalpha((unsigned char)ch)) return false;
+    std::string pre = tld.substr(0, 4);
+    for (auto& ch : pre) ch = (char)tolower((unsigned char)ch);
+    const bool puny = tld.size() > 4 && pre == "xn--";
+    for (char ch : tld)
+        if (!isalpha((unsigned char)ch) && !(puny && (isdigit((unsigned char)ch) || ch == '-')))
+            return false;
     return hasAlpha;
+}
+
+// Метка с не-ASCII символами (кодовые точки) → «xn--…» по RFC 3492.
+static std::string punycodeLabel(const std::vector<uint32_t>& cp) {
+    const uint32_t base = 36, tmin = 1, tmax = 26, skew = 38, damp = 700;
+    auto digit = [](uint64_t d) { return (char)(d < 26 ? 'a' + d : '0' + (d - 26)); };
+    std::string out = "xn--";
+    size_t h = 0;
+    for (uint32_t c : cp) if (c < 0x80) { out += (char)c; h++; }
+    const size_t b = h;                       // базовые (ASCII) символы — как есть
+    if (b > 0) out += '-';
+    uint32_t n = 0x80, bias = 72;
+    uint64_t delta = 0;
+    while (h < cp.size()) {
+        uint32_t m = 0xFFFFFFFF;              // наименьший ещё не закодированный символ
+        for (uint32_t c : cp) if (c >= n && c < m) m = c;
+        delta += (uint64_t)(m - n) * (h + 1);
+        n = m;
+        for (uint32_t c : cp) {
+            if (c < n) delta++;
+            if (c != n) continue;
+            uint64_t q = delta;               // delta — числом переменной длины
+            for (uint32_t k = base; ; k += base) {
+                const uint32_t t = k <= bias ? tmin : k >= bias + tmax ? tmax : k - bias;
+                if (q < t) break;
+                out += digit(t + (q - t) % (base - t));
+                q = (q - t) / (base - t);
+            }
+            out += digit(q);
+            uint64_t d = h == b ? delta / damp : delta / 2;   // adapt: новое смещение
+            d += d / (h + 1);
+            uint32_t k = 0;
+            while (d > ((base - tmin) * tmax) / 2) { d /= base - tmin; k += base; }
+            bias = k + (uint32_t)(((base - tmin + 1) * d) / (d + skew));
+            delta = 0;
+            h++;
+        }
+        delta++; n++;
+    }
+    return out;
+}
+
+// Домен для DNS и SNI: getaddrinfo и ClientHello кириллицу не принимают, поэтому
+// метки не латиницей — в punycode («мвд.рф» → «xn--b1aew.xn--p1ai»), регистр
+// латиницы и кириллицы — нижний. Не UTF-8 или метка длиннее 63 символов — строка
+// как есть (её отвергнет looksLikeDomainStr). IP-адрес не меняется.
+std::string idnToAscii(const std::string& s) {
+    std::string out;
+    std::vector<uint32_t> label;
+    bool wide = false;                        // в метке есть не-ASCII
+    auto put = [&] {
+        if (wide) out += punycodeLabel(label);
+        else for (uint32_t c : label) out += (char)c;
+        label.clear(); wide = false;
+    };
+    for (size_t i = 0; i < s.size(); ) {
+        const unsigned char c0 = (unsigned char)s[i];
+        uint32_t c; size_t len;
+        if (c0 < 0x80)                { c = c0;        len = 1; }
+        else if ((c0 & 0xE0) == 0xC0) { c = c0 & 0x1F; len = 2; }
+        else if ((c0 & 0xF0) == 0xE0) { c = c0 & 0x0F; len = 3; }
+        else if ((c0 & 0xF8) == 0xF0) { c = c0 & 0x07; len = 4; }
+        else return s;
+        if (len > s.size() - i) return s;
+        for (size_t k = 1; k < len; k++) {
+            const unsigned char cc = (unsigned char)s[i + k];
+            if ((cc & 0xC0) != 0x80) return s;
+            c = (c << 6) | (cc & 0x3F);
+        }
+        i += len;
+        if (c >= 'A' && c <= 'Z') c += 0x20;              // латиница
+        else if (c >= 0x410 && c <= 0x42F) c += 0x20;     // А–Я
+        else if (c >= 0x400 && c <= 0x40F) c += 0x50;     // Ѐ–Џ (в т.ч. Ё)
+        if (c == '.') { put(); out += '.'; continue; }
+        if (c >= 0x80) wide = true;
+        label.push_back(c);
+        if (label.size() > 63) return s;
+    }
+    put();
+    return out;
 }
 
 std::string askTargetIp() {
@@ -410,7 +520,7 @@ std::string askTargetIp() {
               << "Пример: 31.56.27.51   или   youtube.com\n"
               << "Цель: " << std::flush;
     std::string s;
-    std::getline(std::cin, s);
+    readLine(s);
     while (!s.empty() && (s.back() == ' ' || s.back() == '\r' || s.back() == '\n')) s.pop_back();
     while (!s.empty() && (s.front() == ' '))  s.erase(s.begin());
     if (s.empty()) return "";
@@ -430,19 +540,14 @@ std::string askTargetIp() {
             return norm;
     }
 
+    s = idnToAscii(s);                          // мвд.рф — в punycode, как в дампе
     if (!looksLikeDomainStr(s)) {               // ни IP, ни домен
         std::cout << "Это не похоже на IP-адрес или доменное имя — пропускаю фильтр.\n";
         return "";
     }
-    // резолвим домен
-    std::cout << "Резолвлю домен " << s << " ..." << std::flush;
-    std::string ip = resolveHostToIp(s);
-    if (ip.empty() || !isValidIpv4Str(ip)) {
-        std::cout << " не удалось — домен не существует или нет ответа DNS.\n";
-        return "";
-    }
-    std::cout << " -> " << ip << "\n";
-    return ip;
+    // домен — как есть: все его адреса режим 2 ищет в самом дампе (targetAddrs
+    // в report.cpp), а не берёт один IPv4 от резолвера этого ПК
+    return s;
 }
 
 // ------------------------------------------------------------------
@@ -619,7 +724,14 @@ static int menuKey() {
 static void waitEnter(const char* msg) {
     std::cout << "\n" << C::GRY << msg << C::RST;
     std::cout.flush(); fflush(stdout);
-    std::string dummy; std::getline(std::cin, dummy);
+    std::string dummy;
+    // Ctrl+C обрывает ожидание (см. readLine) — ждём Enter дальше. Флаг ставит
+    // обработчик в своём потоке, иногда чуть позже, чем вернулся ввод
+    while (!readLine(dummy)) {
+        Sleep(50);
+        if (!g_traceAbort) break;      // настоящий конец ввода — не ждём вечно
+        g_traceAbort = false;
+    }
 }
 
 // Режимы 3..13 — интерактивные инструменты: цель и параметры спрашивают сами.
@@ -694,7 +806,7 @@ static int consoleMain(std::vector<std::string> files, int tool) {
             // меню сразу очищает экран — без паузы предупреждения никто не увидит
             printf("Enter — продолжить...");
             fflush(stdout);
-            std::string dummy; std::getline(std::cin, dummy);
+            std::string dummy; readLine(dummy);
         }
     }
 

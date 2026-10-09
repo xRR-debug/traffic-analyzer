@@ -352,6 +352,9 @@ std::wstring s_wpPath;           // своя картинка; пусто — в
 std::wstring s_wpPending;        // загрузить в начале следующего кадра
 bool s_wpPendingSet = false;
 bool s_wpTried = false;          // сохранённую уже пробовали загрузить (не повторять каждый кадр)
+// что сейчас грузится: картинка читается в своём потоке, итог — wallpaperPoll
+enum { WPL_NONE = 0, WPL_PICKED, WPL_SAVED, WPL_BUILTIN };
+int s_wpLoad = WPL_NONE;
 float s_wpVis = 0;               // насколько видна сейчас, 0..1 (плавно)
 ImVec2 s_wpPar(0, 0);            // сглаженный параллакс от мыши
 ImVec4 s_panelBg;                // «стекло» карточек, журнала, таблицы
@@ -383,47 +386,63 @@ void actPickWallpaper() {
     ofn.lpstrFile = file;
     ofn.nMaxFile = MAX_PATH;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    if (!GetOpenFileNameW(&ofn)) return;
+    // текущий каталог возвращаем сами, как в pickDumpFiles: для GetOpenFileName
+    // OFN_NOCHANGEDIR не действует, а по каталогу ищется analyzer.ini
+    wchar_t cwd[MAX_PATH * 4];
+    const DWORD cwdLen = GetCurrentDirectoryW((DWORD)(sizeof(cwd) / sizeof(cwd[0])), cwd);
+    const BOOL picked = GetOpenFileNameW(&ofn);
+    if (cwdLen > 0 && cwdLen < sizeof(cwd) / sizeof(cwd[0])) SetCurrentDirectoryW(cwd);
+    if (!picked) return;
     s_wpPending = file;              // загрузим в начале кадра (см. wallpaperLoad)
     s_wpPendingSet = true;
 #endif
 }
 
 // Начало кадра: загрузка (отложенная из настроек или первая), плавность.
+// Картинка читается в своём потоке — сохранённый путь в недоступной сетевой
+// папке не подвешивает окно; пока картинки нет, интерфейс просто без фона.
 void updateWallpaper() {
     if (s_wpPendingSet) {
         s_wpPendingSet = false;
         s_wpTried = true;
-        const std::string name = s_wpPending.empty() ? std::string("встроенная") : wideName(s_wpPending);
-        std::string err;
-        if (wallpaperLoad(s_wpPending, err)) {
-            s_wpPath = s_wpPending;
-            regSetString(L"WallpaperPath", s_wpPath);
-            // выбрали свою картинку, а в этой теме она не показывается — показать
-            if (!s_wpPath.empty() && !wallpaperWanted()) {
-                s_wpMode = WP_ALWAYS;
-                regSetDword(L"WallpaperMode", (DWORD)s_wpMode);
-            }
-            logLine(C::GRN, "Картинка на фоне: " + name);
-        } else {
-            logLine(C::YEL, "Картинка «" + name + "» не загружена: " + err);
-        }
+        wallpaperLoad(s_wpPending);
+        s_wpLoad = WPL_PICKED;
     }
 
     bool want = wallpaperWanted();
     if (want && !wallpaperTex().tex && !s_wpTried) {
         s_wpTried = true;
-        std::string err;
-        if (!wallpaperLoad(s_wpPath, err)) {
-            if (s_wpPath.empty()) {
-                logLine(C::YEL, "Картинка на фоне: " + err);
+        wallpaperLoad(s_wpPath);
+        s_wpLoad = WPL_SAVED;
+    }
+
+    std::string err;
+    const int got = wallpaperPoll(err);
+    if (got != 0) {
+        const int what = s_wpLoad;
+        s_wpLoad = WPL_NONE;
+        if (what == WPL_PICKED) {
+            const std::string name = s_wpPending.empty() ? std::string("встроенная") : wideName(s_wpPending);
+            if (got > 0) {
+                s_wpPath = s_wpPending;
+                regSetString(L"WallpaperPath", s_wpPath);
+                // выбрали свою картинку, а в этой теме она не показывается — показать
+                if (!s_wpPath.empty() && !wallpaperWanted()) {
+                    s_wpMode = WP_ALWAYS;
+                    regSetDword(L"WallpaperMode", (DWORD)s_wpMode);
+                }
+                logLine(C::GRN, "Картинка на фоне: " + name);
             } else {
-                // файл переехал/удалён — путь в реестре не трогаем (может быть
-                // временно недоступная сетевая папка), показываем встроенную
-                logLine(C::YEL, "Картинка «" + wideName(s_wpPath) + "»: " + err + " — показываю встроенную");
-                std::string err2;
-                if (!wallpaperLoad(L"", err2)) logLine(C::YEL, "Встроенная картинка: " + err2);
+                logLine(C::YEL, "Картинка «" + name + "» не загружена: " + err);
             }
+        } else if (got < 0 && what == WPL_SAVED && !s_wpPath.empty()) {
+            // файл переехал/удалён — путь в реестре не трогаем (может быть
+            // временно недоступная сетевая папка), показываем встроенную
+            logLine(C::YEL, "Картинка «" + wideName(s_wpPath) + "»: " + err + " — показываю встроенную");
+            wallpaperLoad(L"");
+            s_wpLoad = WPL_BUILTIN;
+        } else if (got < 0) {
+            logLine(C::YEL, (what == WPL_BUILTIN ? "Встроенная картинка: " : "Картинка на фоне: ") + err);
         }
     }
     if (!wallpaperTex().tex) want = false;
@@ -624,6 +643,9 @@ char s_target[256] = "";
 
 // таблица соединений
 char s_flowFilter[256] = "";
+// «Показать только этот адрес»: удалённый адрес сравнивается точно, пока в строке
+// фильтра он сам (правка строки возвращает обычный поиск подстроки)
+std::string s_flowIp;
 int s_proto = 0;                 // 0 все, 1 TCP, 2 UDP, 3 прочие
 bool s_onlyProblems = false;
 std::vector<int> s_order;        // индексы ds->flows после фильтра и сортировки
@@ -653,8 +675,12 @@ std::string fmtDur(double sec) {
     char b[64];
     if (sec < 1) snprintf(b, sizeof(b), "%.0f мс", sec * 1000);
     else if (sec < 120) snprintf(b, sizeof(b), "%.1f с", sec);
-    else if (sec < 7200) snprintf(b, sizeof(b), "%d мин %02d с", (int)sec / 60, (int)sec % 60);
-    else snprintf(b, sizeof(b), "%d ч %02d мин", (int)sec / 3600, ((int)sec % 3600) / 60);
+    else {
+        // в long long: испорченные метки времени дают миллиарды секунд — в int не влезают (UB)
+        const long long s = (long long)std::min(sec, 9.0e15);
+        if (s < 7200) snprintf(b, sizeof(b), "%lld мин %02lld с", s / 60, s % 60);
+        else snprintf(b, sizeof(b), "%lld ч %02lld мин", s / 3600, (s % 3600) / 60);
+    }
     return b;
 }
 
@@ -708,7 +734,7 @@ ImVec4 stateColor(const FlowRow& r) {
     case FS_OK:        return kGood;
     case FS_NO_ANSWER: return r.problem ? kBad : kDim;
     case FS_RST:       return r.problem ? kBad : kWarn;
-    case FS_ONE_WAY:   return kWarn;
+    case FS_ONE_WAY:   return r.problem ? kWarn : kDim;
     default:           return r.problem ? kWarn : kDim;
     }
 }
@@ -1265,6 +1291,10 @@ void filterOrder(const View& v) {
     for (size_t i = 0; i < ds.flows.size(); i++) s_geo[i] = geoOf(v.ipCache.get(), ds.flows[i].remoteIp);
 
     const std::string f = lowerAscii(s_flowFilter);
+    // точно, а не подстрокой: «192.168.0.1» иначе находил и «192.168.0.100:…» —
+    // все соединения абонента, а «1.1.1.1» — и 11.1.1.1, 1.1.1.10…
+    const bool exactIp = !s_flowIp.empty() && s_flowIp == s_flowFilter;
+    if (!exactIp) s_flowIp.clear();
     s_order.clear();
     for (size_t i = 0; i < ds.flows.size(); i++) {
         const FlowRow& r = ds.flows[i];
@@ -1272,8 +1302,9 @@ void filterOrder(const View& v) {
         if (s_proto == 2 && r.proto != "UDP") continue;
         if (s_proto == 3 && (r.proto == "TCP" || r.proto == "UDP")) continue;
         if (s_onlyProblems && !r.problem && !isBlocked(s, r)) continue;
-        if (!f.empty() && r.search.find(f) == std::string::npos &&
-            lowerAscii(s_geo[i]).find(f) == std::string::npos) continue;
+        if (exactIp) { if (r.remoteIp != s_flowIp) continue; }
+        else if (!f.empty() && r.search.find(f) == std::string::npos &&
+                 lowerAscii(s_geo[i]).find(f) == std::string::npos) continue;
         s_order.push_back((int)i);
     }
 }
@@ -1345,6 +1376,11 @@ void flowTooltip(const FlowRow& r, bool blocked) {
         ImGui::Text("SYN %d / SYN-ACK %d   (входящих: SYN %d / SYN-ACK %d)",
                     r.synOut, r.synAckIn, r.synIn, r.synAckOut);
         ImGui::Text("RST от сервера %d, от абонента %d;  FIN %d / %d", r.rstIn, r.rstOut, r.finIn, r.finOut);
+        if (r.state == FS_ONE_WAY)
+            ImGui::TextColored(r.problem ? kWarn : kDim, "%s", r.problem
+                ? "Абонент отправлял данные, а сервер не прислал ни байта (ни RST, ни FIN): запрос до сервера "
+                  "не дошёл или ответ отброшен по пути."
+                : "Абонент отправил данные в самом конце записи — ответ сервера мог в неё не попасть.");
     }
     if (!r.dnsCname.empty()) ImGui::Text("DNS: %s", r.dnsCname.c_str());
     if (!r.app.empty())
@@ -1509,8 +1545,11 @@ void drawFlows(const View& v) {
                 if (ImGui::MenuItem("Копировать фильтр Wireshark"))
                     ImGui::SetClipboardText(wiresharkFilter(r).c_str());
                 ImGui::Separator();
-                if (ImGui::MenuItem("Показать только этот адрес"))
+                if (ImGui::MenuItem("Показать только этот адрес")) {
                     snprintf(s_flowFilter, sizeof(s_flowFilter), "%s", r.remoteIp.c_str());
+                    s_flowIp = r.remoteIp;
+                    s_needRefilter = true;   // строка могла не измениться (тот же адрес вписан руками)
+                }
                 if (ImGui::MenuItem("Анализ блокировок по этому адресу", nullptr, false, !jobBusy())) {
                     snprintf(s_target, sizeof(s_target), "%s", r.remoteIp.c_str());
                     startConnAnalysis(r.remoteIp);
@@ -2000,18 +2039,18 @@ void drawWaterfall(const View& v) {
         }
         if (!s.empty()) ImGui::TextUnformatted(s.c_str());
     }
-    // «заморозка ~16 КБ»: принято freeze_min..max КБ, затем тишина — та же
-    // картина, что ищет режим 2 (здесь только подсказка, без вердикта)
-    for (const auto& g : w.gaps) {
-        if (g.second - g.first < cfg().freezeSilenceUs) continue;
-        long long got = 0;
-        for (const FlowEvent& e : r.wf)
-            if (!e.out && e.kind == FE_DATA && e.endUs <= g.first) got += e.bytes;
-        if (got >= cfg().freezeMinBytes && got <= cfg().freezeMaxBytes)
-            ImGui::TextColored(kWarn, "Принято %s, затем тишина %s — так выглядит «заморозка ~16 КБ» "
-                                      "(ТСПУ к зарубежному хостингу).",
-                               fmtBytes(got).c_str(), fmtUs(g.second - g.first).c_str());
-        break;
+    // «заморозка ~16 КБ» — по правилам connFreeze16k режима 2 (счётчики — в
+    // buildFlows): ClientHello или порт 443, от сервера ни RST, ни FIN, принято
+    // freeze_min..max КБ, после — тишина до конца записи, а повторы без ответа ещё
+    // идут. Здесь только подсказка, без вердикта (хостинг не проверяется)
+    {
+        const AppConfig& k = cfg();
+        if ((!r.sni.empty() || r.remotePort == 443) && r.rstIn == 0 && r.finIn == 0 &&
+            r.frzBytes >= k.freezeMinBytes && r.frzBytes <= k.freezeMaxBytes &&
+            r.frzSilenceUs >= k.freezeSilenceUs && r.frzLater >= k.freezeLaterPkts)
+            ImGui::TextColored(kWarn, "Принято %s, затем до конца записи тишина %s, а повторы без ответа "
+                                      "идут — так выглядит «заморозка ~16 КБ» (ТСПУ к зарубежному хостингу).",
+                               fmtBytes(r.frzBytes).c_str(), fmtUs(r.frzSilenceUs).c_str());
     }
     for (size_t i = 0; i < r.wf.size(); i++)
         if (wfRstForged(r, i, w, nullptr) >= 2) {
@@ -2374,7 +2413,8 @@ void drawSettings() {
     if (ImGui::Button("Встроенная")) { s_wpPending.clear(); s_wpPendingSet = true; }
     ImGui::EndDisabled();
     ImGui::SameLine();
-    const std::string cur = !wp.tex ? std::string("ещё не загружалась")
+    const std::string cur = s_wpLoad != WPL_NONE ? std::string("загружается…")
+                          : !wp.tex ? std::string("ещё не загружалась")
                           : wp.builtin ? std::string("встроенная") : wideName(s_wpPath);
     ImGui::TextColored(kDim, "сейчас: %s", cur.c_str());
     if (!s_anim && wallpaperWanted())
@@ -2573,6 +2613,7 @@ void guiFrame() {
         if (v.ds) s_selectTab = TAB_OVERVIEW;
         s_lastDs = v.ds;
         s_flowFilter[0] = 0;
+        s_flowIp.clear();
         s_onlyProblems = false;
         s_order.clear();
         s_geo.clear();

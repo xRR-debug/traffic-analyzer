@@ -205,6 +205,18 @@ bool lookupLocked(const std::string& ipStr, Ip2ProxyRec& r) {
 
 bool ip2proxyEnabled() { return !cfg().ip2proxyDb.empty(); }
 
+// Базу по тому же пути ensureOpenLocked не переоткрывает: файл, положенный после
+// ошибки «не открывается», или база, обновлённая раз в месяц под тем же именем,
+// не подхватывались до перезапуска. loadConfig («Перечитать analyzer.ini») её
+// закрывает — следующий запрос откроет заново.
+void ip2proxyReset() {
+    std::lock_guard<std::mutex> lk(g_mx);
+    closeLocked();
+    g_openedPath.clear();
+    g_err.clear();
+    g_errShown = false;
+}
+
 bool ip2proxyLookup(const std::string& ip, Ip2ProxyRec& r) {
     std::lock_guard<std::mutex> lk(g_mx);
     if (!ensureOpenLocked()) return false;

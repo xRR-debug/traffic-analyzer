@@ -237,12 +237,39 @@ void analyzeDnsAnomalies(const std::vector<Packet>& packets) {
     // заглушка на ПУБЛИЧНОМ IP: разные несвязанные домены резолвятся в один
     // адрес, и среди них — заведомо ограниченные в РФ. Без ограниченных порог
     // выше: общий адрес бывает и у CDN/хостинга с виртуальными хостами.
+    // Родственные домены одного сервиса честно делят адрес фронтенда или узла
+    // CDN (twitter.com и x.com, connect.facebook.net и static.xx.fbcdn.net,
+    // ytimg.com и ggpht.com на узле GGC) — считаем их одним сервисом, как живой
+    // тест DNS не считает такие домены несвязанными.
+    auto service = [](std::string s) {
+        for (auto& ch : s) ch = (char)tolower((unsigned char)ch);
+        struct F { const char* sld; const char* svc; };
+        static const F kSvc[] = {
+            {"twitter.com", "*x"}, {"x.com", "*x"}, {"twimg.com", "*x"}, {"t.co", "*x"},
+            {"facebook.com", "*meta"}, {"facebook.net", "*meta"}, {"fbcdn.net", "*meta"},
+            {"fb.com", "*meta"}, {"fbsbx.com", "*meta"}, {"instagram.com", "*meta"},
+            {"cdninstagram.com", "*meta"}, {"messenger.com", "*meta"},
+            {"whatsapp.com", "*meta"}, {"whatsapp.net", "*meta"},
+            {"youtube.com", "*google"}, {"googlevideo.com", "*google"}, {"ytimg.com", "*google"},
+            {"ggpht.com", "*google"}, {"youtu.be", "*google"}, {"google.com", "*google"},
+            {"googleapis.com", "*google"}, {"gstatic.com", "*google"},
+            {"googleusercontent.com", "*google"},
+            {"discord.com", "*discord"}, {"discordapp.com", "*discord"},
+            {"discordapp.net", "*discord"}, {"discord.gg", "*discord"}, {"discord.media", "*discord"},
+            {"tiktok.com", "*tiktok"}, {"tiktokcdn.com", "*tiktok"}, {"tiktokv.com", "*tiktok"},
+            {"linkedin.com", "*linkedin"}, {"licdn.com", "*linkedin"},
+        };
+        for (const F& f : kSvc) if (s == f.sld) return std::string(f.svc);
+        return s;
+    };
     std::vector<std::string> stubs;
     for (const auto& kv : ipDomains) {
+        std::set<std::string> svcs;              // сервисы за адресом (родственные SLD — один)
+        for (const auto& d : kv.second) svcs.insert(service(d));
         bool anyBlocked = false;
         for (const auto& d : ipFull[kv.first]) if (isCommonlyBlockedDomain(d)) { anyBlocked = true; break; }
-        bool strong = anyBlocked && kv.second.size() >= 2;
-        bool weak = kv.second.size() >= 5;
+        bool strong = anyBlocked && svcs.size() >= 2;
+        bool weak = svcs.size() >= 5;
         if (!strong && !weak) continue;
         std::string s = kv.first + " <- ";
         int n = 0;
@@ -420,7 +447,10 @@ std::vector<std::string> detectDpiInjection(const TcpConnTable& tt) {
     for (const auto& kv : tt.conns) {
         const TcpConnState& c = kv.second;
         std::string who = c.ip + ":" + std::to_string(c.rport) +
-                          " (лок. порт " + std::to_string(c.lport) + ")";
+                          " (лок. порт " + std::to_string(c.lport);
+        // другое устройство LAN, не абонент: с тем же портом бывает и соединение абонента
+        if (!c.lip.empty() && strcmp(localRoleLabel(c.lip), "LocalIP") == 0) who += ", устройство " + c.lip;
+        who += ")";
         // настоящий ECH (внешнее имя провайдера) — ТСПУ режет его как класс
         bool realEch = c.ech && isEchPublicName(c.sni);
         const char* echNote = realEch
@@ -490,11 +520,11 @@ static const char* udpTunnelKind(const Packet& p, int rport, int lport,
         const IpsecClass ic = ipsecClass(p, rport, ii);
         return (ic == IPSEC_NONE || ic == IPSEC_VPN) ? v : nullptr;
     }
-    // листенер на нашей стороне — абонент сам держит WG/AmneziaWG-сервер
-    if (lport == 51820 || lport == 51821 || lport == 55555) {
+    // листенер на нашей стороне — абонент сам держит WG/AmneziaWG-сервер (DNS и
+    // QUIC со случайного порта 51820 — не он, см. udpLocalVpnListener)
+    if (const char* v = udpLocalVpnListener(p, rport, lport)) {
         *port = lport;
-        const char* v = vpnPortName(lport, "UDP");
-        return v ? v : "WireGuard";
+        return v;
     }
     return nullptr;
 }
@@ -725,7 +755,7 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
     for (size_t i = 0; i < packets.size(); i++) {
         const Packet& p = packets[i];
         if (p.proto != "UDP") continue;
-        if (!targetIp.empty() && p.srcIp != targetIp && p.dstIp != targetIp) continue;
+        if (!targetIp.empty() && !isTargetIp(targetIp, p.srcIp) && !isTargetIp(targetIp, p.dstIp)) continue;
         bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
         if (sLoc == dLoc) continue;
         matched++;
@@ -987,7 +1017,7 @@ void analyzeQuic(const std::vector<Packet>& packets,
             continue;
         }
         if (p.proto != "UDP") continue;
-        if (!targetIp.empty() && p.srcIp != targetIp && p.dstIp != targetIp) continue;
+        if (!targetIp.empty() && !isTargetIp(targetIp, p.srcIp) && !isTargetIp(targetIp, p.dstIp)) continue;
         std::string rip = sLoc ? p.dstIp : p.srcIp;
         int rport = sLoc ? p.dstPort : p.srcPort, lport = sLoc ? p.srcPort : p.dstPort;
         std::string key = rip + "|" + std::to_string(rport) + "|" + std::to_string(lport);
@@ -1660,7 +1690,7 @@ bool blockReasonIsBlock(const std::string& code) {
     return !d || d->block;
 }
 
-// onlyIp — ограничиться одним удалённым адресом (режим 2 с целью).
+// onlyIp — ограничиться адресами цели (режим 2 с целью, см. isTargetIp).
 std::vector<BlockReason> collectBlockReasons(
         const std::vector<Packet>& packets, const TcpConnTable& tt,
         const std::unordered_map<std::string, IpInfo>* ipCache,
@@ -1717,10 +1747,11 @@ std::vector<BlockReason> collectBlockReasons(
     struct FrzAgg { std::vector<const TcpConnState*> c; long long silence = 0; };
     std::map<std::string, FrzAgg> frz;
     std::map<std::string, std::vector<const TcpConnState*>> mtls;   // имя -> соединения mTLS без сертификата
+    std::set<std::string> certServed, certServedIp;   // имя / адрес, где сервер обслужил пустой сертификат
 
     for (const auto& kv : tt.conns) {
         const TcpConnState& c = kv.second;
-        if (!onlyIp.empty() && c.ip != onlyIp) continue;
+        if (!onlyIp.empty() && !isTargetIp(onlyIp, c.ip)) continue;
         if (c.synack > 0) ipWithSynAck.insert(c.ip);
         std::string name = connName(c);
         long long fz = -1;
@@ -1771,14 +1802,24 @@ std::vector<BlockReason> collectBlockReasons(
         if (c.serverBytes >= 200 && fz < 0 && c.httpBlockMark.empty() && !forged) {
             worked.insert(name); workedIp.insert(c.ip);
         }
-        if (clientCertProblem(c.certReq, c.clientCert, c.tlsAlertIn, c.inAppBytes))
+        if (clientCertProblem(c.certReq, c.clientCert, c.tlsAlertIn, c.inAppBytes, c.reqTime >= 0))
             mtls[name].push_back(&c);
+        if (clientCertServed(c.certReq, c.clientCert, c.tlsAlertIn, c.inAppBytes)) {
+            certServed.insert(name); certServedIp.insert(c.ip);
+        }
     }
     // mTLS: сервер требует сертификат клиента, устройство его не предъявило.
     // Сеть при этом работает (рукопожатие прошло, сервер подтверждает запрос
     // сразу), поэтому в детали — за сколько сервер подтвердил и за сколько ответил
     for (const auto& kv : mtls) {
-        const auto& v = kv.second;
+        // сервер, обслуживший пустой сертификат на другом соединении (по имени или
+        // адресу), проверяет его необязательно: без Alert его соединения — не отказ
+        std::vector<const TcpConnState*> v;
+        for (const TcpConnState* c : kv.second)
+            if (tlsAlertCertReject(c->tlsAlertIn) ||
+                (!certServed.count(kv.first) && !certServedIp.count(c->ip)))
+                v.push_back(c);
+        if (v.empty()) continue;
         int empty = 0, req = 0, answered = 0, acked = 0, clientFin = 0, alert = -1;
         double rMin = -1, rMax = -1, ackMax = -1;
         for (const TcpConnState* c : v) {
@@ -1870,7 +1911,7 @@ std::vector<BlockReason> collectBlockReasons(
         if (!sLoc && absT[i] > lastInAny) lastInAny = absT[i];
         if (p.proto != "UDP") continue;
         std::string ip = sLoc ? p.dstIp : p.srcIp;
-        if (!onlyIp.empty() && ip != onlyIp) continue;
+        if (!onlyIp.empty() && !isTargetIp(onlyIp, ip)) continue;
         if (p.srcPort == 53 || p.dstPort == 53) continue;
         int rport = sLoc ? p.dstPort : p.srcPort;
         int lport = sLoc ? p.srcPort : p.dstPort;
@@ -1886,6 +1927,7 @@ std::vector<BlockReason> collectBlockReasons(
         if (p.quic || rport == 443) u.quic = true;
         if (u.sni.empty() && !p.sni.empty()) u.sni = p.sni;
     }
+    std::set<std::string> tunnelDrop;       // имена с UDP_DROP туннеля (не QUIC)
     if (inbound) {
         for (const auto& kv : uc) {
             const U& u = kv.second;
@@ -1899,6 +1941,7 @@ std::vector<BlockReason> collectBlockReasons(
                     snprintf(b, sizeof(b), "%s: %lld пакетов за %.0f с, ответов %lld",
                              u.kind, u.out, (u.t1 - u.t0) / 1e6, u.in);
                 put(name, kv.first, "UDP_DROP", b);
+                tunnelDrop.insert(name);
             } else if (u.in == 0 && u.quic && !u.kind && u.out >= 3 && tt.tEnd - u.t0 >= cfg().tailUs &&
                        !worked.count(name)) {
                 snprintf(b, sizeof(b), "QUIC: %lld датаграмм, ответов 0 (по TCP не открылось)", u.out);
@@ -1936,9 +1979,13 @@ std::vector<BlockReason> collectBlockReasons(
         // соседний домен открывается, а заблокированный по SNI — нет
         // Не-блокировки (blockReasonIsBlock) — тоже: TCP к тому же серверу (вход
         // в игру) работает, а игровой UDP глохнет; при mTLS сервер отвечает, но
-        // без сертификата клиента не обслуживает
+        // без сертификата клиента не обслуживает.
+        // UDP_DROP туннеля рабочий TCP к тому же серверу (SSH, панель, VLESS на том
+        // же VPS) не гасит: режется протокол, а не адрес — как «ТСПУ?» в таблице
+        // (collectTspuBlockedIps) и журнал UDP. Гасится только QUIC: браузер ушёл на TCP
+        const bool tunnel = a.code == "UDP_DROP" && tunnelDrop.count(kv.first);
         const bool ipLevel = a.code == "SYN_DROP" || a.code == "UDP_DROP";
-        if ((worked.count(kv.first) || (ipLevel && workedIp.count(a.ip))) &&
+        if (!tunnel && (worked.count(kv.first) || (ipLevel && workedIp.count(a.ip))) &&
             a.code != "HTTP_STUB" && a.code != "TCP16" && blockReasonIsBlock(a.code))
             continue;
         BlockReason r; r.target = kv.first; r.ip = a.ip; r.code = a.code; r.detail = a.detail; r.conns = a.n;

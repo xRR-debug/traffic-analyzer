@@ -62,9 +62,9 @@ void logLine(const char* ansiColor, const std::string& text);
 // ------------------------------------------------------------------
 enum FlowState {
     FS_OK = 0,        // рукопожатие есть, данные в обе стороны
-    FS_NO_ANSWER,     // SYN без SYN-ACK
+    FS_NO_ANSWER,     // SYN без ответа: ни SYN-ACK, ни RST, ни данных сервера
     FS_RST,           // удалённая сторона (или кто-то за неё) прислала RST
-    FS_ONE_WAY,       // данные только в одну сторону
+    FS_ONE_WAY,       // абонент шлёт данные, сервер — ни байта (без RST и FIN)
     FS_MIDSTREAM,     // начало соединения не попало в дамп
     FS_UDP,           // UDP/ICMP — без состояния
     FS_IN_REFUSED,    // входящий SYN, абонент не принял (RST или молчание) — чаще сканер
@@ -106,6 +106,7 @@ struct FlowRow {
     int localPort = -1, remotePort = -1;
     long long pktsOut = 0, pktsIn = 0, bytesOut = 0, bytesIn = 0;
     long long firstUs = -1, lastUs = -1;       // от начала дампа
+    long long firstOutDataUs = -1;             // первые данные абонента (>1 байта), от начала дампа
     std::string sni, ja4, tlsClient, dnsName, app;
     std::string dnsCname;                      // "fl.yoomoney.ru → fp-back.facct.ru" или пусто
     int ja4Kind = 0;
@@ -131,6 +132,11 @@ struct FlowRow {
     bool certProblem = false;                  // clientCertProblem — сертификат не предъявлен/отвергнут
     std::vector<FlowEvent> wf;                 // временной профиль (только TCP), по времени
     int wfDropped = 0;                         // событий сверх лимита — не записаны
+    // «заморозка ~16 КБ», как inUniqBytes / laterPkts в buildTcpConnTable: новых байт от
+    // сервера, тишина после последних из них до конца записи (-1 — данных не было) и
+    // повторов без ответа спустя ≥1 с после них
+    long long frzBytes = 0, frzSilenceUs = -1;
+    int frzLater = 0;
     int state = FS_OK;
     bool problem = false;                      // стоит показать в «только проблемные»
     std::string search;                        // строка для фильтра (нижний регистр)
@@ -240,7 +246,12 @@ struct WallpaperTex {
     int w = 0, h = 0;
     bool builtin = false;        // встроенная (из ресурса exe)
 };
-// path пустой — встроенная. При ошибке прежняя картинка остаётся, err — причина.
-// Звать в начале кадра, до отрисовки фона (старая текстура освобождается сразу).
-bool wallpaperLoad(const std::wstring& path, std::string& err);
+// Загрузить картинку: path пустой — встроенная. Файл читается и декодируется в
+// своём потоке (недоступная сетевая папка не подвешивает окно); новый запрос
+// заменяет прежний — итог прежнего уже не нужен.
+void wallpaperLoad(const std::wstring& path);
+// Итог последнего wallpaperLoad: 0 — ещё идёт (или запроса нет), 1 — картинка на
+// месте, -1 — не загрузилась (прежняя остаётся, err — причина). Звать в начале
+// кадра, до отрисовки фона (старая текстура освобождается сразу).
+int wallpaperPoll(std::string& err);
 const WallpaperTex& wallpaperTex();

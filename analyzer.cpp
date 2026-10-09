@@ -96,6 +96,22 @@ IpsecClass ipsecClass(const Packet& p, int remotePort, const IpInfo* remote) {
     return IPSEC_UNSURE;
 }
 
+// Абонент сам держит WG/AmneziaWG-листенер: характерный порт 51820/51821/55555
+// на ЛОКАЛЬНОЙ стороне. Эти порты — в эфемерном диапазоне любой ОС (Windows/macOS
+// 49152–65535, Linux 32768–60999), с них случайно уходят DNS, QUIC, звонки.
+// Поэтому листенер — только если удалённый порт не служебный (≥1024: не DNS,
+// NTP, QUIC/443, DoT) и поток не опознан как другой протокол (QUIC, STUN, DHT);
+// к листенеру клиенты ходят со своих случайных портов. Сигнатура WireGuard
+// (wgType) — отдельно, на любом порту. Одно правило для guessKind, UDP-таблицы,
+// TSPU?-пометки и причин блокировок. nullptr — не листенер.
+const char* udpLocalVpnListener(const Packet& p, int remotePort, int localPort) {
+    if (p.proto != "UDP" || (localPort != 51820 && localPort != 51821 && localPort != 55555))
+        return nullptr;
+    if (remotePort < 1024 || p.quic || p.l7 == L7_STUN || p.l7 == L7_BT_DHT) return nullptr;
+    const char* v = vpnPortName(localPort, "UDP");
+    return v ? v : "WireGuard";
+}
+
 // Справочные подписи сервисов по портам (НЕ влияют на VPN-вердикт —
 // только поясняют, что обычно слушает порт). Нейтральные сервисы тоже здесь.
 struct PortHint { int port; const char* svc; const char* proto; };
@@ -351,6 +367,9 @@ std::string guessKind(const Packet& p, const IpInfo& srcI, const IpInfo& dstI) {
     if (l7IsProxy(p.l7))    return std::string("(proxy: ") + l7Name(p.l7) + ")";
     if (p.l7 == L7_SSH)     return "(ssh session)";
     if (p.l7 == L7_BITTORRENT || p.l7 == L7_BT_DHT) return "(torrent)";
+    // STUN в потоке — WebRTC-звонок к пиру с эфемерным портом (бывает и 51820),
+    // не VPN-порт (computeVpnVerdict его тоже не считает)
+    if (p.l7 == L7_STUN)    return "(stun/webrtc)";
 
     // явные VPN-порты — только если порт на удалённой (серверной) стороне.
     // локальный эфемерный порт может случайно совпасть (напр. 1194) — это не VPN.
@@ -369,13 +388,10 @@ std::string guessKind(const Packet& p, const IpInfo& srcI, const IpInfo& dstI) {
                 return std::string("(VPN: ") + v + ")";
             if (const char* px = proxyPortName(remotePort))
                 return std::string("(proxy: ") + px + ")";
-            // абонент сам держит VPN-листенер: характерный WG/AmneziaWG-порт
-            // на ЛОКАЛЬНОЙ стороне (фикс. порт сервера, не эфемерный).
-            if (p.proto == "UDP" &&
-                (localPort == 51820 || localPort == 51821 || localPort == 55555)) {
-                const char* v = vpnPortName(localPort, p.proto);
-                return std::string("(VPN-сервер у абонента: ") + (v ? v : "WireGuard") + ")";
-            }
+            // абонент сам держит VPN-листенер: характерный WG/AmneziaWG-порт на
+            // ЛОКАЛЬНОЙ стороне — только не к служебному порту (udpLocalVpnListener)
+            if (const char* v = udpLocalVpnListener(p, remotePort, localPort))
+                return std::string("(VPN-сервер у абонента: ") + v + ")";
         }
     }
 
@@ -515,7 +531,12 @@ std::string wsFilter(const std::string& ip, int port /*= -1*/, const char* l4 /*
 }
 
 // время каждого пакета в мкс с поправкой на переход через полночь
-// (tsToMicros считает от начала суток); -1 — время не разобрано
+// (tsToMicros считает от начала суток); -1 — время не разобрано.
+// Скачок назад больше чем на полсуток — новые сутки; вперёд больше чем на
+// полсуток после перехода — запоздавший пакет прежних суток (pcapng с двумя
+// интерфейсами, «-i any»: штампы у полуночи идут не по порядку). Отсчёт ведём
+// от самого позднего: запоздавший пакет уводил prev на сутки вперёд, следующий
+// «переходил полночь» ещё раз, и весь хвост дампа уезжал на +24 ч.
 std::vector<long long> absTimes(const std::vector<Packet>& packets) {
     const long long DAY = 86400LL * 1000000;
     std::vector<long long> absT(packets.size(), -1);
@@ -524,8 +545,11 @@ std::vector<long long> absTimes(const std::vector<Packet>& packets) {
         long long t = tsToMicros(packets[i].ts);
         if (t < 0) continue;
         t += dayOff;
-        if (prev >= 0 && t < prev - DAY / 2) { dayOff += DAY; t += DAY; }
-        absT[i] = t; prev = t;
+        if (prev >= 0) {
+            if (t < prev - DAY / 2) { dayOff += DAY; t += DAY; }
+            else if (dayOff > 0 && t > prev + DAY / 2) t -= DAY;
+        }
+        absT[i] = t; prev = std::max(prev, t);
     }
     return absT;
 }
@@ -586,10 +610,15 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
         bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
         if (sLoc == dLoc) continue;
         std::string rip = sLoc ? p.dstIp : p.srcIp;
+        const std::string& lip = sLoc ? p.srcIp : p.dstIp;
         int rport = sLoc ? p.dstPort : p.srcPort;
         int lport = sLoc ? p.srcPort : p.dstPort;
-        TcpConnState& c = tt.conns[rip + "|" + std::to_string(rport) + "|" + std::to_string(lport)];
-        if (c.ip.empty()) { c.ip = rip; c.rport = rport; c.lport = lport; }
+        // локальный адрес — в ключе: в дампе сегмента LAN (или «-i any» на роутере
+        // с NAT, сохраняющим порт) два устройства с одним портом к одному серверу
+        // сливались — RST одного и данные другого давали «поддельный RST»
+        TcpConnState& c = tt.conns[rip + "|" + std::to_string(rport) + "|" + std::to_string(lport) +
+                                   "|" + lip];
+        if (c.ip.empty()) { c.ip = rip; c.rport = rport; c.lport = lport; c.lip = lip; }
         if (t >= 0) { if (c.firstTime < 0) c.firstTime = t; c.lastTime = t; }
         bool S = flagHas(p.flags, 'S'), A = flagHas(p.flags, '.');
         bool repeat = false;   // повтор уже отправленных/принятых данных (для «заморозки»)
@@ -732,7 +761,7 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
             bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
             if (!sLoc || dLoc) continue;
             auto it = tt.conns.find(p.dstIp + "|" + std::to_string(p.dstPort) + "|" +
-                                    std::to_string(p.srcPort));
+                                    std::to_string(p.srcPort) + "|" + p.srcIp);
             if (it != tt.conns.end()) it->second.lowTtlOut++;
         }
     }
@@ -770,6 +799,18 @@ bool domainEndsWith(const std::string& d, const std::string& suffix) {
     if (d.compare(d.size() - suffix.size(), suffix.size(), suffix) != 0) return false;
     if (d.size() == suffix.size()) return true;
     return d[d.size() - suffix.size() - 1] == '.';
+}
+
+bool isTargetIp(const std::string& target, const std::string& ip) {
+    if (target.empty() || ip.empty()) return false;
+    if (target.size() == ip.size()) return target == ip;   // один адрес
+    for (size_t pos = 0; pos < target.size(); ) {
+        size_t e = target.find(", ", pos);
+        if (e == std::string::npos) e = target.size();
+        if (e - pos == ip.size() && target.compare(pos, e - pos, ip) == 0) return true;
+        pos = e + 2;
+    }
+    return false;
 }
 
 // Проверка «домен относится к ресурсу, ограниченному в РФ» (по точной границе).

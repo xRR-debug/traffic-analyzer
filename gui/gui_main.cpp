@@ -192,10 +192,11 @@ WallpaperTex g_wp;
 
 template <class T> void release(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
-// Декодирует в RGBA 8 бит. Картинку крупнее монитора уменьшает заранее
+// Декодирует в RGBA 8 бит. Картинку крупнее монитора (monW×monH) уменьшает заранее
 // (сэмплер ImGui без мип-уровней — при сильном уменьшении на лету была бы рябь).
-bool decodeImage(const std::wstring& path, std::vector<unsigned char>& px, UINT& w, UINT& h,
-                 std::string& err) {
+// Зовётся из потока загрузки (см. WpJob): COM в нём уже инициализирован.
+bool decodeImage(const std::wstring& path, double monW, double monH,
+                 std::vector<unsigned char>& px, UINT& w, UINT& h, std::string& err) {
     IWICImagingFactory* fac = nullptr;
     IWICStream* stream = nullptr;
     IWICBitmapDecoder* dec = nullptr;
@@ -233,10 +234,6 @@ bool decodeImage(const std::wstring& path, std::vector<unsigned char>& px, UINT&
         frame->GetSize(&sw, &sh);
         if (!sw || !sh) { err = "пустое изображение"; break; }
 
-        MONITORINFO mi{ sizeof(mi) };
-        GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
-        const double monW = std::max(640L, mi.rcMonitor.right - mi.rcMonitor.left);
-        const double monH = std::max(480L, mi.rcMonitor.bottom - mi.rcMonitor.top);
         // «cover» на весь монитор с запасом 10% на движение
         const double k = std::max(monW / sw, monH / sh) * 1.1;
         IWICBitmapSource* src = frame;
@@ -267,6 +264,55 @@ bool decodeImage(const std::wstring& path, std::vector<unsigned char>& px, UINT&
     } while (false);
     release(conv); release(scaler); release(frame); release(dec); release(stream); release(fac);
     return ok;
+}
+
+// Загрузка картинки — в своём потоке: файл из недоступной сетевой папки WIC ждёт
+// до таймаута SMB (десятки секунд), и окно всё это время «не отвечало» бы — при
+// каждом запуске, раз путь сохранён. Поток отвязан: зависшее чтение не держит ни
+// окно, ни выход из программы. Текстуру из готовых пикселей создаёт поток окна
+// (wallpaperPoll).
+struct WpJob {
+    std::wstring path;
+    double monW = 0, monH = 0;           // монитор — узнаём в потоке окна
+    std::atomic<bool> done{false};       // поля ниже готовы
+    bool ok = false;
+    std::vector<unsigned char> px;
+    UINT w = 0, h = 0;
+    std::string err;
+};
+std::shared_ptr<WpJob> g_wpJob;          // последний запрос; прежние, если ещё идут, забыты
+std::wstring g_wpShown;                  // картинка текущей текстуры (пусто — встроенная)
+
+// ------------------------------------------------------------------
+// Потеря устройства D3D11: обновился или упал драйвер видеокарты (TDR), сменился
+// GPU. Present/ResizeBuffers возвращают DXGI_ERROR_DEVICE_REMOVED/RESET, и старое
+// устройство больше ничего не рисует — окно застыло бы до перезапуска. Создаём
+// новое вместе с бэкендом ImGui, картинку фона загружаем заново.
+// ------------------------------------------------------------------
+bool g_devLost = false;
+bool g_wpReload = false;                 // текстура фона пропала вместе с устройством
+
+bool deviceLost(HRESULT hr) { return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET; }
+
+void dropDevice() {
+    ImGui_ImplDX11_Shutdown();
+    g_wpReload = g_wp.tex != 0;
+    release(g_wpSrv);
+    g_wp = WallpaperTex{};
+    cleanupDevice();
+    g_devLost = true;
+    logLine(C::YEL, "Видеодрайвер сбросил Direct3D (обновление драйвера или сбой) — окно пересоздаёт устройство.");
+}
+
+// false — устройство пока не создаётся (драйвер ещё ставится): повторить позже
+bool restoreDevice() {
+    if (!createDevice(g_hwnd)) { cleanupDevice(); return false; }
+    ImGui_ImplDX11_Init(g_dev, g_ctx);
+    g_devLost = false;
+    // картинку фона — заново, если её как раз не грузят (тогда текстура и так будет)
+    if (g_wpReload && !g_wpJob) wallpaperLoad(g_wpShown);
+    g_wpReload = false;
+    return true;
 }
 
 std::wstring fontsDir() {
@@ -317,11 +363,35 @@ void guiSetCaptionArea(float left, float right, float height) {
     g_capL = left; g_capR = right; g_capH = height;
 }
 
-bool wallpaperLoad(const std::wstring& path, std::string& err) {
-    if (!g_dev) { err = "Direct3D не готов"; return false; }
-    std::vector<unsigned char> px;
-    UINT w = 0, h = 0;
-    if (!decodeImage(path, px, w, h, err)) return false;
+void wallpaperLoad(const std::wstring& path) {
+    auto job = std::make_shared<WpJob>();
+    job->path = path;
+    MONITORINFO mi{ sizeof(mi) };
+    GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+    job->monW = std::max(640L, mi.rcMonitor.right - mi.rcMonitor.left);
+    job->monH = std::max(480L, mi.rcMonitor.bottom - mi.rcMonitor.top);
+    g_wpJob = job;
+    try {
+        std::thread([job] {
+            // WIC — это COM: у потока своя инициализация
+            const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            job->ok = decodeImage(job->path, job->monW, job->monH, job->px, job->w, job->h, job->err);
+            if (SUCCEEDED(co)) CoUninitialize();
+            job->done = true;
+        }).detach();
+    } catch (const std::exception&) {
+        job->err = "не удалось запустить загрузку";
+        job->done = true;
+    }
+}
+
+int wallpaperPoll(std::string& err) {
+    if (!g_wpJob || !g_wpJob->done) return 0;
+    const std::shared_ptr<WpJob> job = std::move(g_wpJob);
+    if (!job->ok) { err = job->err; return -1; }
+    if (!g_dev) { err = "Direct3D не готов"; return -1; }
+    const std::vector<unsigned char>& px = job->px;
+    const UINT w = job->w, h = job->h;
 
     D3D11_TEXTURE2D_DESC td{};
     td.Width = w;
@@ -336,22 +406,23 @@ bool wallpaperLoad(const std::wstring& path, std::string& err) {
     ID3D11Texture2D* tex = nullptr;
     if (FAILED(g_dev->CreateTexture2D(&td, &sd, &tex)) || !tex) {
         err = "видеокарта не приняла текстуру " + std::to_string(w) + "×" + std::to_string(h);
-        return false;
+        return -1;
     }
     ID3D11ShaderResourceView* srv = nullptr;
     const HRESULT hr = g_dev->CreateShaderResourceView(tex, nullptr, &srv);
     tex->Release();
-    if (FAILED(hr) || !srv) { err = "не удалось создать текстуру"; return false; }
+    if (FAILED(hr) || !srv) { err = "не удалось создать текстуру"; return -1; }
 
-    // Прежнюю освобождаем сразу: gui.cpp зовёт загрузку в начале кадра, до
+    // Прежнюю освобождаем сразу: gui.cpp зовёт wallpaperPoll в начале кадра, до
     // того как старая текстура попала в списки отрисовки этого кадра.
     release(g_wpSrv);
     g_wpSrv = srv;
     g_wp.tex = (ImTextureID)(intptr_t)srv;
     g_wp.w = (int)w;
     g_wp.h = (int)h;
-    g_wp.builtin = path.empty();
-    return true;
+    g_wp.builtin = job->path.empty();
+    g_wpShown = job->path;
+    return 1;
 }
 
 const WallpaperTex& wallpaperTex() { return g_wp; }
@@ -450,6 +521,12 @@ int RunGuiMain(const std::vector<std::string>& files) {
         }
         if (done) break;
 
+        // устройство потеряно — пересоздаём; не вышло (драйвер ещё ставится) — ждём
+        if (g_devLost && !restoreDevice()) {
+            Sleep(500);
+            continue;
+        }
+
         if (g_occluded && g_swap->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED) {
             Sleep(10);
             continue;
@@ -458,8 +535,10 @@ int RunGuiMain(const std::vector<std::string>& files) {
 
         if (g_resizeW != 0 && g_resizeH != 0) {
             cleanupRenderTarget();
-            g_swap->ResizeBuffers(0, g_resizeW, g_resizeH, DXGI_FORMAT_UNKNOWN, 0);
+            const HRESULT hr = g_swap->ResizeBuffers(0, g_resizeW, g_resizeH, DXGI_FORMAT_UNKNOWN, 0);
             g_resizeW = g_resizeH = 0;
+            // новая цепочка обмена всё равно возьмёт текущий размер окна
+            if (deviceLost(hr)) { dropDevice(); continue; }
             createRenderTarget();
         }
 
@@ -485,12 +564,17 @@ int RunGuiMain(const std::vector<std::string>& files) {
 
         const ImVec4 clear = guiClearColor();
         const float cc[4] = { clear.x, clear.y, clear.z, clear.w };
-        g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
-        g_ctx->ClearRenderTargetView(g_rtv, cc);
+        // цели рисования нет (не создалась после смены размера) — не очищаем:
+        // ClearRenderTargetView(nullptr) недопустим
+        if (g_rtv) {
+            g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
+            g_ctx->ClearRenderTargetView(g_rtv, cc);
+        }
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
         HRESULT hr = g_swap->Present(1, 0);
         g_occluded = (hr == DXGI_STATUS_OCCLUDED);
+        if (deviceLost(hr)) dropDevice();
     }
 
     // Задача ещё идёт (резолв/анализ может занять минуты) — ждать её при
@@ -504,7 +588,7 @@ int RunGuiMain(const std::vector<std::string>& files) {
     std::cout.rdbuf(oldOut);
     std::cerr.rdbuf(oldErr);
 
-    ImGui_ImplDX11_Shutdown();
+    if (!g_devLost) ImGui_ImplDX11_Shutdown();   // при потере устройства — уже в dropDevice
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     release(g_wpSrv);

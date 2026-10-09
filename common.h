@@ -301,14 +301,24 @@ inline bool tlsAlertCertReject(int a) {
 // mTLS без сертификата: сервер запросил сертификат клиента, а абонент прислал
 // пустой (clientCert 0) или предъявленный (1) сервер отверг открытым Alert.
 // Пустой сертификат при необязательной проверке сервер принимает и отдаёт
-// данные как обычно — поэтому без Alert проблема, только если сервер после
-// рукопожатия прислал немного (страница/код ошибки, а не содержимое).
+// данные как обычно — поэтому без Alert проблема, только если после рукопожатия
+// абонент отправил запрос (reqSeen: простаивающий preconnect ответа и не ждёт),
+// а сервер прислал немного (страница/код ошибки, а не содержимое). Сервер,
+// обслуживший пустой сертификат на другом соединении (clientCertServed), —
+// тоже не проблема: это вызывающие сверяют по всем соединениям сами.
 // inAppBytes — байт данных от сервера после его ChangeCipherSpec.
 // Общее для причины TLS_CLIENT_CERT и таблицы соединений GUI.
-inline bool clientCertProblem(bool certReq, int clientCert, int alertIn, long long inAppBytes) {
+inline bool clientCertProblem(bool certReq, int clientCert, int alertIn, long long inAppBytes,
+                              bool reqSeen) {
     if (!certReq || clientCert < 0) return false;
     if (tlsAlertCertReject(alertIn)) return true;
-    return clientCert == 0 && inAppBytes <= 8192;
+    return clientCert == 0 && reqSeen && inAppBytes <= 8192;
+}
+// Сервер принял пустой сертификат и отдал больше 8 КБ — проверка у него
+// необязательная. Тогда и соседние соединения к тому же имени или адресу без
+// Alert (короткий ответ, простаивающий HTTP/2-сокет) — не отказ
+inline bool clientCertServed(bool certReq, int clientCert, int alertIn, long long inAppBytes) {
+    return certReq && clientCert == 0 && !tlsAlertCertReject(alertIn) && inAppBytes > 8192;
 }
 
 // IP ID отправителя — счётчик (Linux, Windows): у каждого следующего пакета на
@@ -442,8 +452,10 @@ std::string regionName(const std::string& cc);    // "RUSSIA" (колонка RE
 std::string countryNameRu(const std::string& cc); // "Россия" (режим гео-RTT)
 std::string fixPad(const std::string& s);
 bool isYesAnswer(const std::string& s);
+bool readLine(std::string& s);   // строка с консоли; false — Ctrl+C или конец ввода
 bool isValidIpv4Str(const std::string& str);
 bool looksLikeDomainStr(const std::string& str);
+std::string idnToAscii(const std::string& s);   // «мвд.рф» → «xn--b1aew.xn--p1ai»
 std::string askTargetIp();
 void rawOutput(const char* s, size_t n);
 std::vector<std::string> pickDumpFiles(HWND owner);
@@ -544,6 +556,9 @@ const char* ip2proxyTypeName(const std::string& type);      // «VPN-серви�
 void ip2proxyApply(std::unordered_map<std::string, IpInfo>& cache,
                    const std::vector<std::string>& ips);
 std::string resolveHostToIp(const std::string& host);
+// Все адреса домена (сначала IPv4, потом IPv6): 0 — есть, 1 — NXDOMAIN / нет
+// записей, 2 — ошибка резолва
+int resolveAllAddrs(const std::string& name, std::vector<std::string>& out);
 void runTraceMode();
 void runGeoRttMode();
 void runPortCheckMode();

@@ -32,6 +32,7 @@ struct FlowRec {
 // ------------------------------------------------------------------
 struct TcpConnState {
     std::string ip; int rport = 0, lport = 0;
+    std::string lip;                  // локальный конец: абонент или другое устройство LAN
     // SNI настоящего ClientHello: у обходчика DPI перед ним уходят фейки с чужим
     // SNI — их не берём (см. buildTcpConnTable)
     std::string sni;
@@ -96,7 +97,7 @@ struct TcpConnState {
     long long finOutTime = -1, finInTime = -1;   // первый FIN абонента / сервера
 };
 struct TcpConnTable {
-    std::map<std::string, TcpConnState> conns;   // ключ "rip|rport|lport"
+    std::map<std::string, TcpConnState> conns;   // ключ "rip|rport|lport|lip"
     long long tEnd = -1;              // время последнего пакета захвата
     bool anyInboundTcp = false;       // нет входящих — дамп однонаправленный, о дропах молчим
     int outTtlTypical = -1;           // медианный TTL исходящих пакетов абонента
@@ -157,6 +158,8 @@ bool isOwnIspOrg(const std::string& org, const std::string& asn);
 // UDP 500/4500: IPsec-VPN точно, VoWiFi (звонки по Wi-Fi) точно или не ясно
 enum IpsecClass { IPSEC_NONE, IPSEC_VPN, IPSEC_VOWIFI, IPSEC_UNSURE };
 IpsecClass ipsecClass(const Packet& p, int remotePort, const IpInfo* remote);
+// WG/AmneziaWG-листенер абонента по локальному порту (не к служебному порту); nullptr — нет
+const char* udpLocalVpnListener(const Packet& p, int remotePort, int localPort);
 std::string guessKind(const Packet& p, const IpInfo& srcI, const IpInfo& dstI);
 std::string sideLabel(const std::string& ip, const IpInfo& info);
 bool flagHas(const std::string& f, char c);
@@ -165,6 +168,9 @@ std::string wsFilter(const std::string& ip, int port = -1, const char* l4 = "tcp
 bool seqLess(long long a, long long b);
 TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets, const std::string& localIp);
 bool domainEndsWith(const std::string& d, const std::string& suffix);
+// Цель режима 2 — один адрес или все адреса домена через ", " (targetAddrs в
+// report.cpp). true — ip один из них; пустая цель не совпадает ни с чем.
+bool isTargetIp(const std::string& target, const std::string& ip);
 bool isCommonlyBlockedDomain(const std::string& d);
 const IpInfo* ipInfoOf(const std::unordered_map<std::string, IpInfo>* ipCache,
                        const std::string& ip);

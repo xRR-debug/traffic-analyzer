@@ -941,7 +941,8 @@ std::string reportText(const RknState& st, bool hasCdn) {
     const JVal& bs = ck["blocked_subnets"];
     if (bs.size()) line("  Заблокированные подсети (" + std::to_string(bs.size()) + "): " + brief(bs, 30));
     const JVal& cp = ck["cdn_providers"];
-    for (size_t i = 0; i < cp.items.size(); i++) {
+    // по ключам «провайдер → подсети»: у ответа другого вида (массив) их нет
+    for (size_t i = 0; i < cp.keys.size(); i++) {
         std::string s;
         const JVal& arr = cp.items[i];
         for (const auto& e : arr.items) {
@@ -1267,7 +1268,12 @@ void drawNet(const RknState& st) {
         kv("Тип цели", ck["target_type"].str());
         if (ips.size() <= kInline) kv("IP-адреса", ips.size() ? joinList(ips) : "нет");
         else kv("IP-адреса", fmtCount((long long)ips.size()) + " — список ниже");
-        if (filled(ck["subnet_size"])) kv("Размер подсети", fmtCount(ck["subnet_size"].num(0)) + " адресов");
+        // сервис отдаёт размер и строкой в сокращённой записи («65.5K», «79228162.5Z»):
+        // её — как есть (как в reportText), число через num() обрезалось бы до «65»
+        const JVal& ssz = ck["subnet_size"];
+        if (filled(ssz))
+            kv("Размер подсети", (ssz.t == JVal::NUM && ssz.n >= 0 && ssz.n < 1e15
+                                      ? fmtCount((long long)ssz.n) : brief(ssz)) + " адресов");
         if (geo.t == JVal::OBJ) {
             kv("AS", asnText(geo["asn"]));
             kv("Организация", geo["organisation"].str());
@@ -1321,7 +1327,7 @@ void drawLists(const RknState& st, bool hasCdn) {
         const JVal& wl = ck["whitelist"];
         kv("Белый список CDN", filled(wl) ? whitelistText(wl) : "нет", filled(wl) ? &K.good : nullptr,
            "Домены из белого списка снимают ограничение 16–20 КБ при подключении к заблокированным CDN.");
-        kv("Диапазоны CDN", hasCdn ? cdnNames(cp) : "нет", hasCdn ? &K.warn : nullptr,
+        kv("Диапазоны CDN", hasCdn ? cdnNames(cp) : filled(cp) ? brief(cp) : "нет", hasCdn ? &K.warn : nullptr,
            "ТСПУ ограничивает соединения с адресами этих CDN: после первых 16–20 КБ данные перестают приходить.");
         kvRest("", ck, {"id", "target", "target_type", "blocked", "rkn_domain", "ips", "subnet_size",
                         "blocked_subnets", "cdn_providers", "geo", "whitelist", "reverse_lookup",
@@ -1334,9 +1340,9 @@ void drawLists(const RknState& st, bool hasCdn) {
     }
     if (!hasCdn) return;
 
-    // провайдер → [{provider, cidr, region}]
+    // провайдер → [{provider, cidr, region}] (по ключам, как в reportText)
     std::vector<std::pair<const std::string*, const JVal*>> rows;
-    for (size_t i = 0; i < cp.items.size(); i++) {
+    for (size_t i = 0; i < cp.keys.size(); i++) {
         const JVal& arr = cp.items[i];
         if (arr.t == JVal::ARR) for (const auto& e : arr.items) rows.push_back({&cp.keys[i], &e});
         else rows.push_back({&cp.keys[i], &arr});
@@ -1793,7 +1799,10 @@ bool rknDrawTab(const GuiColors& c) {
     {
         std::lock_guard<std::mutex> lk(sp->mx);
         RknState& st = *sp;
-        const bool hasCdn = st.check["cdn_providers"].size() > 0;
+        // диапазоны CDN — объект «провайдер → подсети»; массив (API сменило формат,
+        // ответ подменён) не разбираем: в нём нет ключей-провайдеров
+        const JVal& cdn = st.check["cdn_providers"];
+        const bool hasCdn = cdn.t == JVal::OBJ && cdn.size() > 0;
         drawHeader(st, liveNow, hasCdn);
         if (st.checkOk) {
             ImGui::Spacing();

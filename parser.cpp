@@ -2,9 +2,30 @@
 // DNS, TLS ClientHello (SNI, JA4), QUIC Initial; загрузка и склейка набора файлов.
 #include "common.h"
 
+// Имена служб, которые tcpdump без -n печатает вместо номера порта
+// («1.2.3.4.https», «….domain»): частые и те, что смотрят детекторы.
+// Имена — из /etc/services Linux и macOS (4500 там зовётся по-разному).
+static int portByName(const std::string& s) {
+    static const std::pair<const char*, int> kPorts[] = {
+        {"http", 80}, {"https", 443}, {"domain", 53}, {"domain-s", 853}, {"ntp", 123},
+        {"isakmp", 500}, {"ipsec-nat-t", 4500}, {"ipsec-msft", 4500}, {"openvpn", 1194},
+        {"socks", 1080}, {"http-alt", 8080}, {"pcsync-https", 8443}, {"bootps", 67},
+        {"bootpc", 68}, {"mdns", 5353}, {"llmnr", 5355}, {"ssh", 22}, {"ftp", 21},
+        {"telnet", 23}, {"smtp", 25}, {"submission", 587}, {"pop3", 110}, {"pop3s", 995},
+        {"imap", 143}, {"imaps", 993}, {"microsoft-ds", 445}, {"netbios-ns", 137},
+        {"netbios-dgm", 138}, {"netbios-ssn", 139}, {"snmp", 161}, {"ssdp", 1900},
+        {"l2f", 1701}, {"l2tp", 1701}, {"pptp", 1723}, {"ms-wbt-server", 3389},
+        {"stun", 3478}, {"sip", 5060}, {"rtsp", 554},
+    };
+    for (const auto& e : kPorts) if (s == e.first) return e.second;
+    return -1;
+}
+
 // "10.199.102.163.57275" -> ip="10.199.102.163", port=57275
 // "2a00:1450:4010::65.443" -> ip="2a00:1450:4010::65", port=443
-static void splitIpPort(const std::string& token, std::string& ip, int& port) {
+// named — следы дампа без -n: бит 1 — вместо адреса имя хоста (PTR), бит 2 —
+// порт назван незнакомым именем службы (порт 0, номер неизвестен)
+static void splitIpPort(const std::string& token, std::string& ip, int& port, int& named) {
     // последняя точка отделяет порт
     size_t dot = token.find_last_of('.');
     int dots = (int)std::count(token.begin(), token.end(), '.');
@@ -17,11 +38,24 @@ static void splitIpPort(const std::string& token, std::string& ip, int& port) {
     if (hasPort) {
         ip = token.substr(0, dot);
         std::string p = token.substr(dot + 1);
-        port = p.empty() ? -1 : atoi(p.c_str());
+        // Номер — 1–5 цифр. Без -n tcpdump пишет имя службы («.https»): atoi
+        // давал 0, и DNS, TLS на :443 и VPN-порты молча пропадали из анализа
+        if (p.empty()) port = -1;
+        else if (p.size() <= 5 && p.find_first_not_of("0123456789") == std::string::npos &&
+                 atoi(p.c_str()) <= 65535)
+            port = atoi(p.c_str());
+        else if ((port = portByName(p)) < 0) { port = 0; named |= 2; }
     } else {
         ip = token;
         port = -1;
     }
+    // Адрес — цифры с точками (IPv4) или шестнадцатеричные с «:» (IPv6). Иначе
+    // это имя хоста, которое tcpdump без -n подставляет по PTR: ни адреса, ни
+    // границы порта в нём не определить, а гео/ASN ушли бы запрашивать имя
+    const bool v6 = ip.find(':') != std::string::npos;
+    for (char c : ip)
+        if (!(isdigit((unsigned char)c) || c == '.' ||
+              (v6 && (c == ':' || isxdigit((unsigned char)c))))) { named |= 1; break; }
 }
 
 // извлечь "ключ: число" после метки (ack/win/length)
@@ -74,8 +108,9 @@ static long long grabSeqStart(const std::string& s) {
 
 // ------------------------------------------------------------------
 // разбор одной (уже склеенной) строки пакета
+// named (необязательно) — следы дампа без -n, биты как у splitIpPort
 // ------------------------------------------------------------------
-static Packet parseLine(const std::string& raw) {
+static Packet parseLine(const std::string& raw, int* named = nullptr) {
     Packet pk;
     std::string line = trim(raw);
     if (line.empty()) return pk;
@@ -126,17 +161,21 @@ static Packet parseLine(const std::string& raw) {
     std::string srcTok;
     if (!(is >> srcTok)) return pk;
 
-    // 4) ">"
+    // 4) ">" — иначе это не «адрес > адрес» («IP truncated-ip - …»): не считаем
+    // такое слово именем хоста из дампа без -n
     std::string arrow;
-    if (!(is >> arrow)) return pk;
+    if (!(is >> arrow) || arrow != ">") return pk;
 
     // 5) dst (с двоеточием на конце)
     std::string dstTok;
     if (!(is >> dstTok)) return pk;
     if (!dstTok.empty() && dstTok.back() == ':') dstTok.pop_back();
 
-    splitIpPort(srcTok, pk.srcIp, pk.srcPort);
-    splitIpPort(dstTok, pk.dstIp, pk.dstPort);
+    int nm = 0;
+    splitIpPort(srcTok, pk.srcIp, pk.srcPort, nm);
+    splitIpPort(dstTok, pk.dstIp, pk.dstPort, nm);
+    if (named) *named = nm;
+    if (nm & 1) return pk;   // имя хоста вместо адреса — строку не разбираем
 
     // остаток строки — флаги/seq/ack/win/length/proto
     std::string rest;
@@ -513,6 +552,24 @@ static void parseDnsPayload(const uint8_t* d, size_t n, Packet& pk) {
 static std::string parseTlsSni(const uint8_t* d, size_t n); // объявление (тело ниже)
 static bool ja4FromTlsRecords(const uint8_t* d, size_t n, Packet& pk); // тоже ниже
 
+// Значения из HTTP — чужие байты из дампа: управляющие символы (ESC, BEL,
+// CR/LF, DEL и C1 U+0080…U+009F в UTF-8) заменяем на «?», как у имён DNS.
+// Иначе Location вида «http://x/\x1b[2J…» в консоли (--console, --batch)
+// стирал экран и подменял вердикт, OSC 52 — буфер обмена, а в файле отчёта
+// stripAnsiTo съедал всё от чужого ESC до ближайшей «m».
+static std::string httpSafe(std::string v) {
+    for (size_t i = 0; i < v.size(); i++) {
+        const unsigned char c = (unsigned char)v[i];
+        if (c < 0x20 || c == 0x7f) v[i] = '?';
+        else if (c == 0xC2 && i + 1 < v.size() &&
+                 (unsigned char)v[i + 1] >= 0x80 && (unsigned char)v[i + 1] <= 0x9F) {
+            v[i] = '?';
+            v.erase(i + 1, 1);
+        }
+    }
+    return v;
+}
+
 // Нешифрованный HTTP в начале сегмента: запрос -> Host, ответ -> код,
 // Location и признаки страницы-заглушки о блокировке (провайдерские
 // заглушки РКН обычно приходят ответом 302 на warning.rt.ru/lawfilter или
@@ -531,7 +588,7 @@ static void parseHttpHead(const uint8_t* d, size_t n, Packet& pk) {
         if (e == std::string::npos) e = s.size();
         std::string v = s.substr(p, e - p);
         size_t b = v.find_first_not_of(" \t");
-        return b == std::string::npos ? "" : v.substr(b, 200);
+        return b == std::string::npos ? "" : httpSafe(v.substr(b, 200));
     };
     static const char* kMethods[] = { "GET ", "POST ", "HEAD ", "PUT ", "OPTIONS ", "CONNECT " };
     for (const char* m : kMethods) {
@@ -544,7 +601,7 @@ static void parseHttpHead(const uint8_t* d, size_t n, Packet& pk) {
             // строка) — до конца строки, чтобы не захватить заголовки
             size_t ps = strlen(m), pe = std::min(s.find(' ', ps), s.find("\r\n", ps));
             if (pe == std::string::npos && s.size() > ps) pe = s.size();
-            if (pe != std::string::npos && pe > ps) pk.httpPath = s.substr(ps, std::min<size_t>(pe - ps, 200));
+            if (pe != std::string::npos && pe > ps) pk.httpPath = httpSafe(s.substr(ps, std::min<size_t>(pe - ps, 200)));
             return;
         }
     }
@@ -848,22 +905,29 @@ static bool parseFrame(const unsigned char* d, size_t len, int linkType,
         // если есть полезная нагрузка и порт похож на TLS — пробуем вытащить SNI
         const uint8_t* payload = l4 + doff;
         size_t payLen = (l4len > (size_t)doff) ? (l4len - doff) : 0;
-        if (payLen >= 5 && payload + payLen <= d + len && payload[0] == 0x16) {
-            std::string sni = parseTlsSni(payload, payLen);
+        // захваченная часть payload: при обрезке кадра snaplen (tcpdump -s 1500,
+        // зеркало с обрезкой) она короче payLen
+        const size_t cap = (payLen > 0 && payload < d + len)
+                         ? std::min(payLen, (size_t)((d + len) - payload)) : 0;
+        if (payLen >= 5 && cap > 0 && payload[0] == 0x16) {
+            // SNI — и по обрезанному сегменту: parseTlsSni терпит обрыв, а имя
+            // лежит в первых сотнях байт. Раньше в таком дампе SNI терялся у
+            // всех HTTPS-соединений, и блокировки по имени не находились
+            std::string sni = parseTlsSni(payload, cap);
             if (!sni.empty()) pk.sni = sni;
-            // ClientHello целиком в одном сегменте — сразу и JA4; иначе
-            // дособерёт HelloReassembler
-            if (payLen >= 6 && payload[5] == 0x01) ja4FromTlsRecords(payload, payLen, pk);
-        } else if (payLen >= 8 && payload < d + len) {
+            // ClientHello целиком в одном сегменте — сразу и JA4 (только по
+            // сегменту целиком); иначе дособерёт HelloReassembler
+            if (cap == payLen && payLen >= 6 && payload[5] == 0x01) ja4FromTlsRecords(payload, payLen, pk);
+        } else if (payLen >= 8 && cap > 0) {
             // HTTP: хватает и обрезанного snaplen начала сегмента
-            size_t cap = std::min(payLen, (size_t)((d + len) - payload));
             uint8_t c0 = payload[0];
             if (c0 == 'H' || c0 == 'G' || c0 == 'P' || c0 == 'O' || c0 == 'C')
                 parseHttpHead(payload, cap, pk);
         }
-        if (payLen > 0 && payload < d + len)
-            pk.l7 = detectL7(payload, std::min(payLen, (size_t)((d + len) - payload)), payLen, true);
-        if (tcpPay && tcpPayLen && payLen > 0 && payload + payLen <= d + len) {
+        if (cap > 0)
+            pk.l7 = detectL7(payload, cap, payLen, true);
+        // в сборку ClientHello — только сегмент целиком, иначе в ней будет дыра
+        if (tcpPay && tcpPayLen && payLen > 0 && cap == payLen) {
             *tcpPay = payload;
             *tcpPayLen = payLen;
         }
@@ -1961,10 +2025,26 @@ class QuicHelloCollector {
         QuicKeys keys{};
         std::vector<uint8_t> buf, have; // CRYPTO-поток и карта заполненных байт
         bool done = false;
+        int noHead = 0;                  // Initial-пакетов, после которых байта 0 всё нет
     };
     std::map<std::string, Flow> fl_;    // ключ — направление потока (клиент -> сервер)
     static constexpr size_t kMaxCrypto = 64 * 1024;
     static constexpr size_t kMaxFlows = 20000;
+    // Память сборки: буфер растёт только на пришедшие байты и дырку перед ними
+    // не больше kMaxGap (Chrome перемешивает CRYPTO-фреймы, но в пределах
+    // нескольких КБ), а все буферы вместе — не больше kMaxTotal. Иначе фрейм с
+    // offset 65535 и length 1 раздувал буфер потока до 64 КБ (вдвое — с картой),
+    // и 20000 таких потоков в подложенном дампе съедали ~2,5 ГБ памяти.
+    static constexpr size_t kMaxGap = 8 * 1024;
+    static constexpr size_t kMaxTotal = 32 * 1024 * 1024;
+    size_t total_ = 0;                  // байт в buf и have всех потоков
+
+    // поток собран или брошен — его буферы больше не нужны
+    void release(Flow& f) {
+        total_ -= f.buf.size() + f.have.size();
+        std::vector<uint8_t>().swap(f.buf);
+        std::vector<uint8_t>().swap(f.have);
+    }
 
     // ClientHello клиента: ключи потока, иначе — выведенные из DCID этого пакета.
     // Пакет сервера (другие ключи, "server in") просто не расшифруется — тег не сойдётся.
@@ -1976,7 +2056,7 @@ class QuicHelloCollector {
                           pk.dstIp + " " + std::to_string(pk.dstPort);
         auto it = fl_.find(key);
         if (it != fl_.end() && it->second.done) return;
-        if (it == fl_.end() && fl_.size() >= kMaxFlows) return;
+        if (it == fl_.end() && (fl_.size() >= kMaxFlows || total_ >= kMaxTotal)) return;
         std::vector<uint8_t> plain;
         QuicKeys k;
         bool ok = false;
@@ -2020,11 +2100,15 @@ class QuicHelloCollector {
                 p++;
                 uint64_t off = 0, len = 0;
                 if (!quicVarint(d, n, p, off) || !quicVarint(d, n, p, len) || len > n - p) break;
-                if (off < kMaxCrypto && len > 0) {
-                    size_t e = (size_t)std::min<uint64_t>(off + len, kMaxCrypto);
-                    if (f.buf.size() < e) { f.buf.resize(e, 0); f.have.resize(e, 0); }
-                    for (size_t i = (size_t)off; i < e; i++) { f.buf[i] = d[p + (i - (size_t)off)]; f.have[i] = 1; }
+                size_t e = 0;                         // конец фрейма в буфере (0 — не берём)
+                if (off < kMaxCrypto && len > 0 && off <= f.buf.size() + kMaxGap)
+                    e = (size_t)std::min<uint64_t>(off + len, kMaxCrypto);
+                if (e > f.buf.size()) {
+                    const size_t add = 2 * (e - f.buf.size());   // buf и have
+                    if (total_ + add > kMaxTotal) e = 0;           // бюджет исчерпан — фрейм пропускаем
+                    else { total_ += add; f.buf.resize(e, 0); f.have.resize(e, 0); }
                 }
+                for (size_t i = (size_t)off; i < e; i++) { f.buf[i] = d[p + (i - (size_t)off)]; f.have[i] = 1; }
                 p += (size_t)len;
                 continue;
             }
@@ -2034,8 +2118,13 @@ class QuicHelloCollector {
         // непрерывное начало потока — это ClientHello (без TLS-записи)
         size_t pre = 0;
         while (pre < f.have.size() && f.have[pre]) pre++;
-        if (pre == 0) return;
-        if (f.buf[0] != 0x01) { f.done = true; return; }
+        if (pre == 0) {
+            // начала ClientHello нет и после нескольких Initial — поток брошен
+            // (или подложен): память отдаём
+            if (++f.noHead >= 3) { f.done = true; release(f); }
+            return;
+        }
+        if (f.buf[0] != 0x01) { f.done = true; release(f); return; }
         std::vector<uint8_t> hs(f.buf.begin(), f.buf.begin() + pre);
         Packet& first = out[f.idx];
         if (first.sni.empty()) {
@@ -2048,6 +2137,7 @@ class QuicHelloCollector {
             if (pre >= need) {                        // ClientHello целиком
                 ja4FromHello(hs.data(), need, 'q', first.ja4, first.tlsClient, first.ja4Kind, &first.ech);
                 f.done = true;
+                release(f);
             }
         }
     }
@@ -2407,10 +2497,43 @@ static void fixFirstAbsoluteSeq(std::vector<Packet>& pk) {
     }
 }
 
+// tcpdump 4.99+ на Linux с «-i any» (SLL2) печатает перед «IP» интерфейс и
+// направление кадра: «12:00:00.000001 eth0  Out IP …», «… wlan0 In  IP …» (имя
+// дополнено пробелами до 5 знаков, направление — до 3). parseLine ждёт «IP»
+// вторым словом, и такой дамп отбрасывался целиком. Префикс снимаем до fixPad,
+// пока пробелы на месте: тот выкидывает прогоны из 2+ пробелов, и «eth0  In  IP»
+// склеилось бы в «eth0InIP». dir — 0 (In), 1 (Out), иначе -1, как Packet::dir
+// у pcap с SLL2 (B/M/P — широковещательный, групповой, чужой кадр).
+static std::string stripAnyIfPrefix(const std::string& line, int& dir) {
+    dir = -1;
+    const size_t t0 = line.find_first_not_of(" \t");
+    if (t0 == std::string::npos || !isdigit((unsigned char)line[t0])) return line;
+    const size_t t1 = line.find(' ', t0);                  // конец штампа времени
+    if (t1 == std::string::npos || line.find(':', t0) > t1 ||
+        t1 + 1 >= line.size() || line[t1 + 1] == ' ')
+        return line;
+    const size_t i1 = line.find(' ', t1 + 1);              // конец имени интерфейса
+    if (i1 == std::string::npos || i1 - (t1 + 1) > 15) return line;
+    const size_t d0 = line.find_first_not_of(' ', i1);
+    const size_t d1 = (d0 == std::string::npos) ? d0 : line.find(' ', d0);
+    if (d1 == std::string::npos) return line;
+    const std::string dw = line.substr(d0, d1 - d0);
+    if (dw != "In" && dw != "Out" && dw != "B" && dw != "M" && dw != "P" && dw != "?")
+        return line;
+    const size_t p0 = line.find_first_not_of(' ', d1);
+    if (p0 == std::string::npos) return line;
+    const size_t p1 = std::min(line.find_first_of(" ,", p0), line.size());
+    const std::string pw = line.substr(p0, p1 - p0);
+    if (pw != "IP" && pw != "IP6" && pw != "ARP") return line;
+    if (dw == "In") dir = 0; else if (dw == "Out") dir = 1;
+    return line.substr(0, t1 + 1) + line.substr(p0);
+}
+
 // Загрузка ОДНОГО файла дампа: бинарный pcap либо текстовый вывод tcpdump.
 // fmt — распознанный формат (для печати). false + err — файл прочитать не вышло.
+// warn — предупреждение о содержимом (файл прочитан, но не всё разобрано).
 static bool loadDumpFile(const std::string& path, std::vector<Packet>& out,
-                         std::string& err, std::string& fmt) {
+                         std::string& err, std::string& fmt, std::string& warn) {
     out.clear();
     std::string ext = lowerExt(path);
     bool wantPcap = (ext == "pcap" || ext == "pcapng" || ext == "cap" || ext == "dmp");
@@ -2464,31 +2587,51 @@ static bool loadDumpFile(const std::string& path, std::vector<Packet>& out,
                s.find("dropped by interface") != std::string::npos;
     };
 
-    std::vector<std::string> records;
+    // запись пакета и направление кадра из префикса «-i any» (-1 — нет)
+    std::vector<std::pair<std::string, int>> records;
     std::string raw, cur;
+    int curDir = -1;
     while (std::getline(f, raw)) {
         if (!raw.empty() && raw.back() == '\r') raw.pop_back();
-        raw = fixPad(raw);
+        int dir = -1;
+        raw = fixPad(stripAnyIfPrefix(raw, dir));
         std::string t = trim(raw);
         if (t.empty()) continue;
         if (isTcpdumpTrailer(t)) {        // дошли до сводки tcpdump — пакеты кончились
-            if (!cur.empty()) { records.push_back(cur); cur.clear(); }
+            if (!cur.empty()) { records.emplace_back(cur, curDir); cur.clear(); }
             continue;
         }
         if (startsWithTime(t)) {
-            if (!cur.empty()) records.push_back(cur);
+            if (!cur.empty()) records.emplace_back(cur, curDir);
             cur = t;
+            curDir = dir;
         } else if (!cur.empty()) {
             // настоящее продолжение пакета — приклеиваем через пробел
             cur += " " + t;
         }
     }
-    if (!cur.empty()) records.push_back(cur);
+    if (!cur.empty()) records.emplace_back(cur, curDir);
 
     out.reserve(records.size());
+    long long hostNamed = 0, portNamed = 0;   // следы дампа без -n
     for (auto& r : records) {
-        Packet p = parseLine(r);
-        if (p.valid) out.push_back(std::move(p));
+        int named = 0;
+        Packet p = parseLine(r.first, &named);
+        if (named & 1) hostNamed++;
+        else if (named & 2) portNamed++;
+        if (!p.valid) continue;
+        p.dir = r.second;
+        out.push_back(std::move(p));
+    }
+    // Без -n tcpdump пишет имена вместо адресов и портов: молча это давало
+    // порт 0 у DNS, HTTPS и VPN-портов — говорим, что разобрано не всё
+    if (hostNamed || portNamed) {
+        warn = "дамп снят без -n — вместо адресов и портов имена.";
+        if (hostNamed)
+            warn += " Пропущено строк с именем хоста вместо адреса: " + std::to_string(hostNamed) + ".";
+        if (portNamed)
+            warn += " Строк с незнакомым именем порта (номер неизвестен): " + std::to_string(portNamed) + ".";
+        warn += " Снимите дамп заново с ключом -nn: tcpdump -nn …";
     }
     fixFirstAbsoluteSeq(out);
     return true;
@@ -2605,8 +2748,8 @@ bool loadDumpSet(const std::vector<std::string>& paths,
     bool loadFailed = false;
     for (size_t fi = 0; fi < paths.size(); fi++) {
         std::vector<Packet> part;
-        std::string err, fmt;
-        if (!loadDumpFile(paths[fi], part, err, fmt)) {
+        std::string err, fmt, warn;
+        if (!loadDumpFile(paths[fi], part, err, fmt, warn)) {
             std::cout << C::RED << "Не удалось прочитать " << paths[fi] << ": " << err
                       << C::RST << "\n";
             loadFailed = true;
@@ -2614,6 +2757,8 @@ bool loadDumpSet(const std::vector<std::string>& paths,
         }
         std::cout << "Файл: " << paths[fi] << "\n"
                   << "  формат: " << fmt << ", пакетов: " << part.size() << "\n";
+        if (!warn.empty())
+            std::cout << C::YEL << "  внимание: " << warn << C::RST << "\n";
         origin.insert(origin.end(), part.size(), (int)fi);
         packets.insert(packets.end(),
                        std::make_move_iterator(part.begin()),
@@ -2648,8 +2793,12 @@ bool loadDumpSet(const std::vector<std::string>& paths,
                 t = std::max(0LL, prevT[fo]);
             } else {
                 t += dayOff[fo];
-                if (prevT[fo] >= 0 && t < prevT[fo] - DAY / 2) { dayOff[fo] += DAY; t += DAY; }
-                prevT[fo] = t;
+                if (prevT[fo] >= 0) {
+                    if (t < prevT[fo] - DAY / 2) { dayOff[fo] += DAY; t += DAY; }
+                    // запоздавший пакет прежних суток — как в absTimes
+                    else if (dayOff[fo] > 0 && t > prevT[fo] + DAY / 2) t -= DAY;
+                }
+                prevT[fo] = std::max(prevT[fo], t);
                 if (tMin[fo] < 0 || t < tMin[fo]) tMin[fo] = t;
                 if (t > tMax[fo])                 tMax[fo] = t;
             }

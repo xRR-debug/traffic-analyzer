@@ -50,14 +50,14 @@ void runCaptureMode() {
             printf("Скачайте установщик с https://npcap.com/#download («Npcap ... installer»),\n"
                    "установите его, затем снова выберите режим 5.\n\n");
             printf("Открыть страницу загрузки? (y/n): ");
-            std::string ans; std::getline(std::cin, ans);
+            std::string ans; readLine(ans);
             if (isYesAnswer(ans))
                 ShellExecuteA(nullptr, "open", "https://npcap.com/#download", nullptr, nullptr, SW_SHOWNORMAL);
             return;
         }
         printf("Установщик Npcap встроен в эту программу.\n\n");
         printf("Установить сейчас? (y/n): ");
-        std::string ans; std::getline(std::cin, ans);
+        std::string ans; readLine(ans);
         if (!isYesAnswer(ans)) {
             printf("Отменено. Можно установить Npcap вручную с https://npcap.com\n");
             return;
@@ -114,7 +114,7 @@ void runCaptureMode() {
     if (devs.empty()) { printf("Интерфейсы не найдены.\n"); pcap_freealldevs(alldevs); return; }
 
     printf("\nВыберите интерфейс (1-%d): ", (int)devs.size());
-    std::string line; std::getline(std::cin, line);
+    std::string line; readLine(line);
     int sel = atoi(line.c_str());
     if (sel < 1 || sel > (int)devs.size()) { printf("Неверный выбор.\n"); pcap_freealldevs(alldevs); return; }
     pcap_if_t* dev = devs[sel-1];
@@ -124,7 +124,7 @@ void runCaptureMode() {
     printf("Можно просто номер порта (443) или IP (8.8.8.8), либо полный\n");
     printf("синтаксис: host 8.8.8.8 | udp port 51820 | tcp port 443\n");
     printf("Фильтр: ");
-    std::string filter; std::getline(std::cin, filter);
+    std::string filter; readLine(filter);
     while (!filter.empty() && (filter.back()=='\r'||filter.back()=='\n'||filter.back()==' ')) filter.pop_back();
     while (!filter.empty() && filter.front()==' ') filter.erase(filter.begin());
 
@@ -174,41 +174,54 @@ void runCaptureMode() {
     char stamp[32]; strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &lt);
     std::string outPath = std::string("capture_") + stamp + ".pcap";
     std::string shownPath = outPath;        // для вывода — в UTF-8
-    bool inExeDir = false;
+    bool fullPath = false;                  // outPath — с папкой (shownPath), не в текущем каталоге
     // Кладём рядом с exe, а не в текущий каталог: при запуске с правами
-    // администратора им часто оказывается System32. pcap_dump_open берёт путь
-    // в ANSI-кодировке — если папку exe в ней не записать (символы вне
-    // кодовой страницы), остаёмся на текущем каталоге.
+    // администратора им часто оказывается System32. Если в папку exe писать
+    // нельзя (на Windows — Program Files без прав администратора), на Windows
+    // берём «Документы», затем временную папку; иначе — текущий каталог.
+    // pcap_dump_open на Windows берёт путь в ANSI-кодировке — папку, которую в
+    // ней не записать (символы вне кодовой страницы), пропускаем.
 #ifndef _WIN32
     {   // macOS: пути в UTF-8, перекодировать нечего
         std::string dir = exeDirUtf8();
         if (!dir.empty() && access(dir.c_str(), W_OK) == 0) {
             outPath = dir + outPath;
             shownPath = outPath;
-            inExeDir = true;
+            fullPath = true;
         }
     }
 #else
     {
-        wchar_t exe[MAX_PATH * 4];
-        DWORD n = GetModuleFileNameW(nullptr, exe, (DWORD)(sizeof(exe) / sizeof(exe[0])));
-        std::wstring dir = (n > 0 && n < sizeof(exe) / sizeof(exe[0])) ? std::wstring(exe, n) : L"";
-        size_t slash = dir.find_last_of(L"\\/");
-        dir = (slash == std::wstring::npos) ? L"" : dir.substr(0, slash + 1);
-        if (!dir.empty()) {
+        std::vector<std::wstring> dirs;     // кандидаты со слешем на конце
+        wchar_t buf[MAX_PATH * 4];
+        const DWORD cap = (DWORD)(sizeof(buf) / sizeof(buf[0]));
+        DWORD n = GetModuleFileNameW(nullptr, buf, cap);
+        std::wstring exe = (n > 0 && n < cap) ? std::wstring(buf, n) : L"";
+        size_t slash = exe.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) dirs.push_back(exe.substr(0, slash + 1));
+        n = GetEnvironmentVariableW(L"USERPROFILE", buf, cap);
+        if (n > 0 && n < cap) dirs.push_back(std::wstring(buf, n) + L"\\Documents\\");
+        n = GetTempPathW(cap, buf);
+        if (n > 0 && n < cap) dirs.push_back(std::wstring(buf, n));
+        for (const std::wstring& dir : dirs) {
             BOOL lossy = FALSE;
             int len = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, dir.c_str(), (int)dir.size(),
                                           nullptr, 0, nullptr, &lossy);
-            if (len > 0 && !lossy) {
-                std::string a(len, '\0');
-                WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, dir.c_str(), (int)dir.size(),
-                                    &a[0], len, nullptr, &lossy);
-                if (!lossy) {
-                    shownPath = w2u8(dir.c_str()) + outPath;
-                    outPath = a + outPath;
-                    inExeDir = true;
-                }
-            }
+            if (len <= 0 || lossy) continue;
+            std::string a(len, '\0');
+            WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, dir.c_str(), (int)dir.size(),
+                                &a[0], len, nullptr, &lossy);
+            if (lossy) continue;
+            // права на запись проверяем пробным файлом (удаляется при закрытии)
+            HANDLE probe = CreateFileW((dir + u8w(outPath) + L".probe").c_str(), GENERIC_WRITE, 0,
+                                       nullptr, CREATE_ALWAYS,
+                                       FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+            if (probe == INVALID_HANDLE_VALUE) continue;
+            CloseHandle(probe);
+            shownPath = w2u8(dir.c_str()) + outPath;
+            outPath = a + outPath;
+            fullPath = true;
+            break;
         }
     }
 #endif
@@ -255,7 +268,7 @@ void runCaptureMode() {
 
     // абсолютный путь для удобства
     char full[1024] = {0};
-    if (inExeDir)
+    if (fullPath)
         printf("Файл: %s%s%s\n", C::BWHT, shownPath.c_str(), C::RST);
 #ifdef _WIN32
     else if (_fullpath(full, outPath.c_str(), sizeof(full)))

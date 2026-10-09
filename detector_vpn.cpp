@@ -24,7 +24,7 @@ void analyzeJa4(const std::vector<Packet>& packets,
     if (ipCache || !ipW.empty()) ipCache = &ipW;
     for (const auto& p : packets) {
         if (p.ja4.empty()) continue;
-        if (!targetIp.empty() && p.srcIp != targetIp && p.dstIp != targetIp) continue;
+        if (!targetIp.empty() && !isTargetIp(targetIp, p.srcIp) && !isTargetIp(targetIp, p.dstIp)) continue;
         Agg& a = by[p.ja4];
         a.client = p.tlsClient; a.kind = p.ja4Kind; a.hellos++;
         if (!p.sni.empty()) a.snis.insert(p.sni);
@@ -33,8 +33,10 @@ void analyzeJa4(const std::vector<Packet>& packets,
             auto it = ipCache->find(p.dstIp);
             if (it != ipCache->end()) {
                 const IpInfo& ii = it->second;
-                if ((ii.hosting || looksHostingOrg(ii.org, ii.asn)) && !looksCdnOrg(ii.org) &&
-                    !ii.vpnWhite)
+                // сеть своего оператора — не хостинг, как в вердикте (flowVpnEvidence):
+                // geo-API бывает метит её hosting, а TV-приставка на TLS 1.2 к
+                // lk.<оператор>.ru — не «прокси/VPN-клиент»
+                if (isHostingNonCdn(&ii) && !ii.vpnWhite)
                     a.hostingSrv.insert(p.dstIp);
             }
         }
@@ -355,7 +357,11 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
         long long firstUs = -1, bytes = 0;
     };
     std::map<std::string, PortHit> portHits;   // ключ "ip|rport|lport|proto"
-    const long long captureStartUs = packets.empty() ? 0 : tsToMicros(packets.front().ts);
+    // время — с поправкой на полночь (absTimes): от начала суток поток после 00:00
+    // оказывался «раньше» начала записи и шёл за «с начала записи» (midStream)
+    const std::vector<long long> absT = absTimes(packets);
+    long long captureStartUs = -1;
+    for (long long t : absT) if (t >= 0) { captureStartUs = t; break; }
     auto normName = [](std::string s) {
         for (auto& c : s) c = (char)::tolower((unsigned char)c);
         while (!s.empty() && s.back() == '.') s.pop_back();
@@ -374,7 +380,8 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
         if (dn != dnsNamesOfIp.end() && dn->second.count(normName(c.sni))) siteByDns.insert(c.ip);
     }
     long long vlessDnsBytes = 0;   // TLS к хостингу, но к сайту по DNS (siteByDns)
-    for (const auto& p : packets) {
+    for (size_t i = 0; i < packets.size(); i++) {
+        const Packet& p = packets[i];
         const std::string* rip = remoteSideOf(p);   // ровно одна сторона локальная
         if (!rip) continue;
         const std::string& remote = *rip;
@@ -390,8 +397,10 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
 
         VpnRemote& fl = v.byRemote[remote];
         fl.bytes += p.length;                       // то же правило, что bytesByRemote
-        // MSS из SYN-ACK удалённой стороны: у IPv6 заголовок на 20 байт больше — приводим к IPv4
-        if (p.proto == "TCP" && p.mss > 0 && flagHas(p.flags, 'S') && !srcLocal)
+        // MSS из SYN-ACK удалённой стороны: у IPv6 заголовок на 20 байт больше — приводим к IPv4.
+        // Только SYN-ACK (ответ сервера абоненту): чистый SYN удалённого клиента
+        // (входящее — Plex/NAS/RDP с телефона в LTE) говорит о канале клиента, не о туннеле
+        if (p.proto == "TCP" && p.mss > 0 && flagHas(p.flags, 'S') && flagHas(p.flags, '.') && !srcLocal)
             fl.synMss = p.mss + ((remote.find(':') != std::string::npos) ? 20 : 0);
         if (remotePort > 0) fl.remotePorts.insert(remotePort);
         if (!p.sni.empty() && srcLocal) fl.snis.insert(normName(p.sni));
@@ -402,10 +411,14 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
         // (IPsec, не опознанный как VPN точно, guessKind пометил «(ipsec: …)» —
         // VoWiFi или не ясно; это не VPN-порт, см. ipsecClass.) Адрес из белого
         // списка по номеру порта не судим — только по сигнатурам ниже.
+        // Поток, опознанный по содержимому как BitTorrent, DHT или STUN (метка на
+        // всём потоке), — P2P или звонок, а не туннель: случайный порт пира
+        // (10808, 51820, 500…) VPN-портом не считаем, как и guessKind («(torrent)»)
         const bool white = infoFor(remote).vpnWhite;
-        const char* vp = (white || kind.rfind("(ipsec:", 0) == 0) ? nullptr
-                                                                  : vpnPortName(remotePort, p.proto);
-        const char* px = white ? nullptr : proxyPortName(remotePort);
+        const bool p2p = p.l7 == L7_BITTORRENT || p.l7 == L7_BT_DHT || p.l7 == L7_STUN;
+        const char* vp = (white || p2p || kind.rfind("(ipsec:", 0) == 0) ? nullptr
+                                                                         : vpnPortName(remotePort, p.proto);
+        const char* px = (white || p2p) ? nullptr : proxyPortName(remotePort);
         if (vp || px) {
             const int localPort = srcLocal ? p.srcPort : p.dstPort;
             PortHit& h = portHits[remote + "|" + std::to_string(remotePort) + "|" +
@@ -413,7 +426,7 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
             if (h.init < 0) {
                 h.ip = remote; h.proto = p.proto; h.rport = remotePort;
                 h.vpn = vp != nullptr; h.name = vp ? vp : px;
-                h.init = srcLocal ? 1 : 0; h.firstUs = tsToMicros(p.ts);
+                h.init = srcLocal ? 1 : 0; h.firstUs = absT[i];
             }
             if (p.proto == "TCP" && flagHas(p.flags, 'S') && !flagHas(p.flags, '.') && !h.synSeen) {
                 h.init = srcLocal ? 1 : 0; h.synSeen = true;
@@ -462,7 +475,7 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
         const IpInfo& i = infoFor(h.ip);
         const bool host = (i.hosting || looksHostingOrg(i.org, i.asn)) &&
                           !isOwnIspOrg(i.org, i.asn) && !looksCdnOrg(i.org);
-        const bool midStream = !h.synSeen && h.firstUs >= 0 &&
+        const bool midStream = !h.synSeen && h.firstUs >= 0 && captureStartUs >= 0 &&
                                h.firstUs - captureStartUs < kCaptureHeadUs;
         const bool byUser = h.init == 1 || midStream;
         const bool big = h.bytes >= kPortHitBytes;
@@ -920,6 +933,7 @@ void runVpnAnalysis(std::vector<Packet>& packets, const std::vector<std::string>
                     kind.find("http)")        != std::string::npos ||
                     kind.find("ssh")          != std::string::npos ||
                     kind.find("torrent")      != std::string::npos ||
+                    kind.find("stun/webrtc")  != std::string::npos ||
                     kind.find("dns")          != std::string::npos ||
                     kind.find("udp/quic")     != std::string::npos ||
                     kind.find("VPN:")         != std::string::npos ||
@@ -941,7 +955,11 @@ void runVpnAnalysis(std::vector<Packet>& packets, const std::vector<std::string>
                 // медиа» по высокому UDP-порту) лишний и противоречит. Подавляем.
                 bool kindIsVpn = (kind.find("VPN") != std::string::npos ||
                                   kind.find("proxy:") != std::string::npos);
-                if (app && !kindIsVpn) {
+                // торрент/STUN опознан по содержимому, порт пира случайный —
+                // подсказка по нему («[WireGuard]» на 51820) противоречит метке
+                bool kindIsP2p = kind.find("torrent") != std::string::npos ||
+                                 kind.find("stun/webrtc") != std::string::npos;
+                if (app && !kindIsVpn && !kindIsP2p) {
                     std::string appStr = app;
                     // фильтруем дубли: если app содержит то же что kind — пропускаем
                     bool appDups =
