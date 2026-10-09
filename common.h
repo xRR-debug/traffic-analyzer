@@ -455,6 +455,7 @@ bool isYesAnswer(const std::string& s);
 bool readLine(std::string& s);   // строка с консоли; false — Ctrl+C или конец ввода
 bool isValidIpv4Str(const std::string& str);
 bool looksLikeDomainStr(const std::string& str);
+std::string idnToAscii(const std::string& s);   // «мвд.рф» → «xn--b1aew.xn--p1ai»
 std::string askTargetIp();
 void rawOutput(const char* s, size_t n);
 std::vector<std::string> pickDumpFiles(HWND owner);

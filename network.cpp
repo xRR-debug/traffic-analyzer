@@ -1148,7 +1148,7 @@ void runTraceMode() {
 
     std::cout << "Укажите цель трассировки (IP или домен).\nЦель: " << std::flush;
     std::string s; readLine(s);
-    s = trim(s);
+    s = idnToAscii(trim(s));   // мвд.рф — в punycode
     if (s.empty()) { std::cout << "Цель не указана.\n"; return; }
 
     std::string targetIp, targetName;
@@ -1440,7 +1440,7 @@ void runGeoRttMode() {
     std::cout << "Укажите цель (IP или домен).\n"
               << "Пример: 8.8.8.8   или   youtube.com\nЦель: " << std::flush;
     std::string s; readLine(s);
-    s = trim(s);
+    s = idnToAscii(trim(s));
     if (s.empty()) { std::cout << "Цель не указана.\n"; return; }
 
     std::string targetIp, targetName;
@@ -1721,7 +1721,7 @@ void runPortCheckMode() {
     std::cout << "Проверка доступности TCP-порта ИЗВНЕ (зонды Globalping на разных континентах).\n";
     std::cout << "Цель (IP или домен): " << std::flush;
     std::string host; readLine(host);
-    host = trim(host);
+    host = idnToAscii(trim(host));
     if (host.empty()) { std::cout << "Цель не указана.\n"; return; }
     for (auto& ch : host) ch = (char)tolower((unsigned char)ch);
     if (!isValidIpv4Str(host) && !looksLikeDomainStr(host)) {
@@ -2067,7 +2067,7 @@ void runPortScanMode() {
 
     std::cout << "Скан портов с нашей машины.\nIP цели: " << std::flush;
     std::string ip; readLine(ip);
-    ip = trim(ip);
+    ip = idnToAscii(trim(ip));
     if (!isValidIpv4Str(ip)) {
         // допускаем домен — резолвим
         if (looksLikeDomainStr(ip)) {
@@ -2320,7 +2320,7 @@ void runDpiLocatorMode() {
     std::cout << "TSPU DPI Locator — поиск хопа, где режется по SNI.\n";
     std::cout << "Заблокированный домен (SNI), напр. rutracker.org: " << std::flush;
     std::string host; readLine(host);
-    host = trim(host);
+    host = idnToAscii(trim(host));   // SNI — только ASCII (punycode)
     if (host.empty()) { std::cout << "Домен не задан.\n"; return; }
     // имя длиннее 253 символов невалидно и не влезло бы в буфер ClientHello ниже
     if (host.size() > 253) { std::cout << "Слишком длинный домен.\n"; return; }
@@ -2500,7 +2500,7 @@ void runUdpProbeMode() {
 
     std::cout << "UDP handshake-пробы.\nIP цели: " << std::flush;
     std::string ip; readLine(ip);
-    ip = trim(ip);
+    ip = idnToAscii(trim(ip));
     if (!isValidIpv4Str(ip)) {
         if (looksLikeDomainStr(ip)) {
             std::string r = resolveHostToIp(ip);
@@ -2879,7 +2879,7 @@ void runDnsHonestyMode() {
         // контрольный домен нужен, чтобы отличить «DNS врёт» от «DNS не работает»
         DnsDomainRes c; c.name = "example.com"; c.control = true; doms.push_back(c);
         for (auto& d : splitInput(line)) {
-            std::string n = d;
+            std::string n = idnToAscii(d);
             for (auto& ch : n) ch = (char)tolower((unsigned char)ch);
             if (!looksLikeDomainStr(n)) { printf("  %sпропуск «%s» — не домен%s\n", C::GRY, d.c_str(), C::RST); continue; }
             if (n == "example.com") continue;
@@ -3686,6 +3686,7 @@ void runIpOwnerFor(const std::string& input) {
             addIp(b, "");
             continue;
         }
+        t = idnToAscii(t);                                      // мвд.рф — в punycode
         if (!looksLikeDomainStr(t)) {
             printf("  %sпропуск «%s» — не IP и не домен%s\n", C::GRY, tok.c_str(), C::RST);
             continue;

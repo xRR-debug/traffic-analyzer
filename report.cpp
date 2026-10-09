@@ -1879,8 +1879,7 @@ static void printDumpHeader(const std::vector<Packet>& packets,
 // совпадал с адресами в дампе. Свой резолв — только если домена в дампе нет.
 // Несколько адресов — через ", " (см. isTargetIp); "" — без фильтра.
 static std::string targetAddrs(const std::vector<Packet>& packets, const std::string& target) {
-    std::string d = target;
-    for (auto& ch : d) ch = (char)tolower((unsigned char)ch);
+    std::string d = idnToAscii(target);                 // нижний регистр; .рф — в punycode
     while (!d.empty() && d.back() == '.') d.pop_back();
     if (d.empty() || isValidIpv4Str(d) || d.find(':') != std::string::npos ||
         !looksLikeDomainStr(d))
