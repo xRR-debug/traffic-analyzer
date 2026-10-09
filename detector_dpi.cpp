@@ -237,12 +237,39 @@ void analyzeDnsAnomalies(const std::vector<Packet>& packets) {
     // заглушка на ПУБЛИЧНОМ IP: разные несвязанные домены резолвятся в один
     // адрес, и среди них — заведомо ограниченные в РФ. Без ограниченных порог
     // выше: общий адрес бывает и у CDN/хостинга с виртуальными хостами.
+    // Родственные домены одного сервиса честно делят адрес фронтенда или узла
+    // CDN (twitter.com и x.com, connect.facebook.net и static.xx.fbcdn.net,
+    // ytimg.com и ggpht.com на узле GGC) — считаем их одним сервисом, как живой
+    // тест DNS не считает такие домены несвязанными.
+    auto service = [](std::string s) {
+        for (auto& ch : s) ch = (char)tolower((unsigned char)ch);
+        struct F { const char* sld; const char* svc; };
+        static const F kSvc[] = {
+            {"twitter.com", "*x"}, {"x.com", "*x"}, {"twimg.com", "*x"}, {"t.co", "*x"},
+            {"facebook.com", "*meta"}, {"facebook.net", "*meta"}, {"fbcdn.net", "*meta"},
+            {"fb.com", "*meta"}, {"fbsbx.com", "*meta"}, {"instagram.com", "*meta"},
+            {"cdninstagram.com", "*meta"}, {"messenger.com", "*meta"},
+            {"whatsapp.com", "*meta"}, {"whatsapp.net", "*meta"},
+            {"youtube.com", "*google"}, {"googlevideo.com", "*google"}, {"ytimg.com", "*google"},
+            {"ggpht.com", "*google"}, {"youtu.be", "*google"}, {"google.com", "*google"},
+            {"googleapis.com", "*google"}, {"gstatic.com", "*google"},
+            {"googleusercontent.com", "*google"},
+            {"discord.com", "*discord"}, {"discordapp.com", "*discord"},
+            {"discordapp.net", "*discord"}, {"discord.gg", "*discord"}, {"discord.media", "*discord"},
+            {"tiktok.com", "*tiktok"}, {"tiktokcdn.com", "*tiktok"}, {"tiktokv.com", "*tiktok"},
+            {"linkedin.com", "*linkedin"}, {"licdn.com", "*linkedin"},
+        };
+        for (const F& f : kSvc) if (s == f.sld) return std::string(f.svc);
+        return s;
+    };
     std::vector<std::string> stubs;
     for (const auto& kv : ipDomains) {
+        std::set<std::string> svcs;              // сервисы за адресом (родственные SLD — один)
+        for (const auto& d : kv.second) svcs.insert(service(d));
         bool anyBlocked = false;
         for (const auto& d : ipFull[kv.first]) if (isCommonlyBlockedDomain(d)) { anyBlocked = true; break; }
-        bool strong = anyBlocked && kv.second.size() >= 2;
-        bool weak = kv.second.size() >= 5;
+        bool strong = anyBlocked && svcs.size() >= 2;
+        bool weak = svcs.size() >= 5;
         if (!strong && !weak) continue;
         std::string s = kv.first + " <- ";
         int n = 0;
