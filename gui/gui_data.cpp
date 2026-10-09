@@ -425,7 +425,10 @@ void buildFlows(Dataset& ds) {
             if (r.synAckOut == 0) r.state = FS_IN_REFUSED;
             else r.state = (r.rstIn > 0 && r.finIn == 0 && r.finOut == 0) ? FS_RST : FS_OK;
             r.problem = false;
-        } else if (r.synOut > 0 && r.synAckIn == 0) {
+        } else if (r.synOut > 0 && r.synAckIn == 0 && r.rstIn == 0 && r.bytesIn == 0) {
+            // ни SYN-ACK, ни RST, ни данных сервера — как «нет ответа» в «Обзоре»
+            // (!inRst) и synFail в режиме 2 (!sawData). RST на SYN (порт закрыт, ТСПУ) —
+            // «сброс» ниже; данные без SYN-ACK — его просто нет в записи, дальше как обычно
             r.state = FS_NO_ANSWER;
             r.problem = !inTail;
         } else if (r.rstIn > 0) {

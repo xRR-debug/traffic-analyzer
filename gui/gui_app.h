@@ -62,7 +62,7 @@ void logLine(const char* ansiColor, const std::string& text);
 // ------------------------------------------------------------------
 enum FlowState {
     FS_OK = 0,        // рукопожатие есть, данные в обе стороны
-    FS_NO_ANSWER,     // SYN без SYN-ACK
+    FS_NO_ANSWER,     // SYN без ответа: ни SYN-ACK, ни RST, ни данных сервера
     FS_RST,           // удалённая сторона (или кто-то за неё) прислала RST
     FS_ONE_WAY,       // данные только в одну сторону
     FS_MIDSTREAM,     // начало соединения не попало в дамп
