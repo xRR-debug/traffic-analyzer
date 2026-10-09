@@ -755,7 +755,7 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
     for (size_t i = 0; i < packets.size(); i++) {
         const Packet& p = packets[i];
         if (p.proto != "UDP") continue;
-        if (!targetIp.empty() && p.srcIp != targetIp && p.dstIp != targetIp) continue;
+        if (!targetIp.empty() && !isTargetIp(targetIp, p.srcIp) && !isTargetIp(targetIp, p.dstIp)) continue;
         bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
         if (sLoc == dLoc) continue;
         matched++;
@@ -1017,7 +1017,7 @@ void analyzeQuic(const std::vector<Packet>& packets,
             continue;
         }
         if (p.proto != "UDP") continue;
-        if (!targetIp.empty() && p.srcIp != targetIp && p.dstIp != targetIp) continue;
+        if (!targetIp.empty() && !isTargetIp(targetIp, p.srcIp) && !isTargetIp(targetIp, p.dstIp)) continue;
         std::string rip = sLoc ? p.dstIp : p.srcIp;
         int rport = sLoc ? p.dstPort : p.srcPort, lport = sLoc ? p.srcPort : p.dstPort;
         std::string key = rip + "|" + std::to_string(rport) + "|" + std::to_string(lport);
@@ -1690,7 +1690,7 @@ bool blockReasonIsBlock(const std::string& code) {
     return !d || d->block;
 }
 
-// onlyIp — ограничиться одним удалённым адресом (режим 2 с целью).
+// onlyIp — ограничиться адресами цели (режим 2 с целью, см. isTargetIp).
 std::vector<BlockReason> collectBlockReasons(
         const std::vector<Packet>& packets, const TcpConnTable& tt,
         const std::unordered_map<std::string, IpInfo>* ipCache,
@@ -1751,7 +1751,7 @@ std::vector<BlockReason> collectBlockReasons(
 
     for (const auto& kv : tt.conns) {
         const TcpConnState& c = kv.second;
-        if (!onlyIp.empty() && c.ip != onlyIp) continue;
+        if (!onlyIp.empty() && !isTargetIp(onlyIp, c.ip)) continue;
         if (c.synack > 0) ipWithSynAck.insert(c.ip);
         std::string name = connName(c);
         long long fz = -1;
@@ -1911,7 +1911,7 @@ std::vector<BlockReason> collectBlockReasons(
         if (!sLoc && absT[i] > lastInAny) lastInAny = absT[i];
         if (p.proto != "UDP") continue;
         std::string ip = sLoc ? p.dstIp : p.srcIp;
-        if (!onlyIp.empty() && ip != onlyIp) continue;
+        if (!onlyIp.empty() && !isTargetIp(onlyIp, ip)) continue;
         if (p.srcPort == 53 || p.dstPort == 53) continue;
         int rport = sLoc ? p.dstPort : p.srcPort;
         int lport = sLoc ? p.srcPort : p.dstPort;

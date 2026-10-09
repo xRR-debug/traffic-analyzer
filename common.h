@@ -555,6 +555,9 @@ const char* ip2proxyTypeName(const std::string& type);      // «VPN-серви�
 void ip2proxyApply(std::unordered_map<std::string, IpInfo>& cache,
                    const std::vector<std::string>& ips);
 std::string resolveHostToIp(const std::string& host);
+// Все адреса домена (сначала IPv4, потом IPv6): 0 — есть, 1 — NXDOMAIN / нет
+// записей, 2 — ошибка резолва
+int resolveAllAddrs(const std::string& name, std::vector<std::string>& out);
 void runTraceMode();
 void runGeoRttMode();
 void runPortCheckMode();

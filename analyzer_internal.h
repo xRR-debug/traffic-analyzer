@@ -168,6 +168,9 @@ std::string wsFilter(const std::string& ip, int port = -1, const char* l4 = "tcp
 bool seqLess(long long a, long long b);
 TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets, const std::string& localIp);
 bool domainEndsWith(const std::string& d, const std::string& suffix);
+// Цель режима 2 — один адрес или все адреса домена через ", " (targetAddrs в
+// report.cpp). true — ip один из них; пустая цель не совпадает ни с чем.
+bool isTargetIp(const std::string& target, const std::string& ip);
 bool isCommonlyBlockedDomain(const std::string& d);
 const IpInfo* ipInfoOf(const std::unordered_map<std::string, IpInfo>* ipCache,
                        const std::string& ip);

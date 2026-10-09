@@ -3513,7 +3513,8 @@ static std::string jsonTopField(const std::string& s, const std::string& key) {
 
 // Все адреса домена: сначала IPv4, потом IPv6.
 // 0 = адреса есть, 1 = NXDOMAIN / нет записей, 2 = ошибка резолва.
-static int resolveAllAddrs(const std::string& name, std::vector<std::string>& out) {
+int resolveAllAddrs(const std::string& name, std::vector<std::string>& out) {
+    ensureWsa();                           // зовётся и из режима 2 (report.cpp)
     addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
     int rc = getaddrinfo(name.c_str(), nullptr, &hints, &res);

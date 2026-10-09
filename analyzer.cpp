@@ -801,6 +801,18 @@ bool domainEndsWith(const std::string& d, const std::string& suffix) {
     return d[d.size() - suffix.size() - 1] == '.';
 }
 
+bool isTargetIp(const std::string& target, const std::string& ip) {
+    if (target.empty() || ip.empty()) return false;
+    if (target.size() == ip.size()) return target == ip;   // один адрес
+    for (size_t pos = 0; pos < target.size(); ) {
+        size_t e = target.find(", ", pos);
+        if (e == std::string::npos) e = target.size();
+        if (e - pos == ip.size() && target.compare(pos, e - pos, ip) == 0) return true;
+        pos = e + 2;
+    }
+    return false;
+}
+
 // Проверка «домен относится к ресурсу, ограниченному в РФ» (по точной границе).
 bool isCommonlyBlockedDomain(const std::string& d) {
     static const char* suf[] = {

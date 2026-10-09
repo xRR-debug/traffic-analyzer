@@ -24,7 +24,7 @@ void analyzeJa4(const std::vector<Packet>& packets,
     if (ipCache || !ipW.empty()) ipCache = &ipW;
     for (const auto& p : packets) {
         if (p.ja4.empty()) continue;
-        if (!targetIp.empty() && p.srcIp != targetIp && p.dstIp != targetIp) continue;
+        if (!targetIp.empty() && !isTargetIp(targetIp, p.srcIp) && !isTargetIp(targetIp, p.dstIp)) continue;
         Agg& a = by[p.ja4];
         a.client = p.tlsClient; a.kind = p.ja4Kind; a.hellos++;
         if (!p.sni.empty()) a.snis.insert(p.sni);

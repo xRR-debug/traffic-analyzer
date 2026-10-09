@@ -46,7 +46,7 @@ void analyzeThroughput(const std::vector<Packet>& packets,
     for (size_t i = 0; i < packets.size(); i++) {
         const Packet& p = packets[i];
         if (p.proto != "TCP" && p.proto != "UDP") continue;
-        if (!targetIp.empty() && p.srcIp != targetIp && p.dstIp != targetIp) continue;
+        if (!targetIp.empty() && !isTargetIp(targetIp, p.srcIp) && !isTargetIp(targetIp, p.dstIp)) continue;
         if (absT[i] < 0 || p.length <= 0) continue;
         bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
         if (sLoc == dLoc) continue;
@@ -404,7 +404,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
         const Packet& p = packets[pi];
         if (p.proto != "TCP") continue;
         // если задан целевой IP — анализируем только пакеты к/от него
-        if (!targetIp.empty() && p.srcIp != targetIp && p.dstIp != targetIp) continue;
+        if (!targetIp.empty() && !isTargetIp(targetIp, p.srcIp) && !isTargetIp(targetIp, p.dstIp)) continue;
         matched++;
         bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
         // Ключ соединения — полный 4-кортеж, а НЕ "удалённый ip:порт". Локальный
@@ -701,13 +701,16 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
 
     printf("\n=================== ДИАГНОСТИКА СОЕДИНЕНИЙ ===================\n");
     if (!targetIp.empty()) {
+        // несколько адресов — все адреса домена-цели (targetAddrs)
+        const bool many = targetIp.find(',') != std::string::npos;
         printf("Фильтр: только трафик к/от %s\n", targetIp.c_str());
         if (matched == 0) {
-            printf("%sTCP-трафика по этому IP в дампе нет. Если ниже есть UDP-секция "
-                   "— смотрите её (туннели/VPN идут по UDP).%s\n", C::YEL, C::RST);
+            printf("%sTCP-трафика по %s в дампе нет. Если ниже есть UDP-секция "
+                   "— смотрите её (туннели/VPN идут по UDP).%s\n",
+                   C::YEL, many ? "этим адресам" : "этому IP", C::RST);
             return;
         }
-        printf("Найдено пакетов с этим IP: %lld\n", matched);
+        printf("Найдено пакетов с %s: %lld\n", many ? "этими адресами" : "этим IP", matched);
     }
     // conns теперь по 4-кортежу, поэтому отдельно показываем число удалённых точек:
     // «10 соединений к 2 серверам» и «10 соединений к 10 серверам» — разные картины
@@ -838,7 +841,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
     std::vector<Packet> targetScope;
     if (!targetIp.empty())
         for (const auto& p : packets)
-            if (p.srcIp == targetIp || p.dstIp == targetIp) targetScope.push_back(p);
+            if (isTargetIp(targetIp, p.srcIp) || isTargetIp(targetIp, p.dstIp)) targetScope.push_back(p);
     const std::vector<Packet>& dpiScope = targetIp.empty() ? packets : targetScope;
 
     // байты по IP — из flow-builder (один проход)
@@ -866,7 +869,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
         r.score = (synFail ? 5 : 0) + r.rst * 2 + r.retr + r.dup + r.zw + r.synRetr;
         // в таблицу: проблемные (score>0) ВСЕГДА; а если задан конкретный target —
         // показываем и его (даже если он чистый, score=0) — карточка по запросу.
-        bool isTarget = (!targetIp.empty() && r.ip == targetIp);
+        bool isTarget = isTargetIp(targetIp, r.ip);
         if (r.score > 0 || isTarget) rows.push_back(r);
     }
     std::sort(rows.begin(), rows.end(), [](const IpRow& a, const IpRow& b){ return a.score > b.score; });
@@ -1064,8 +1067,9 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
 
     if (rows.empty()) {
         if (!targetIp.empty())
-            printf("\n%sПо адресу %s в дампе нет трафика (или только приватные пакеты).%s\n",
-                   C::YEL, targetIp.c_str(), C::RST);
+            printf("\n%sПо %s %s в дампе нет трафика (или только приватные пакеты).%s\n",
+                   C::YEL, targetIp.find(',') != std::string::npos ? "адресам" : "адресу",
+                   targetIp.c_str(), C::RST);
         else {
             // Ретрансмиссий/сбросов по счётчикам нет, но блокировка бывает и без
             // них: молчаливый дроп после ClientHello, RST по SNI, UDP/WireGuard.
@@ -1333,16 +1337,19 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
                    "только рукопожатия.%s\n", C::GRY, C::RST);
         }
 
-        // если запрашивали конкретный IP и он чистый — скажем явно
+        // если запрашивали конкретный IP (адреса домена) и он чистый — скажем явно
         if (!targetIp.empty()) {
-            for (auto& r : rows) {
-                if (r.ip == targetIp && r.score == 0) {
-                    printf("\n%sПо адресу %s проблем не выявлено: рукопожатие "
-                           "проходит, потерь/сбросов нет. Соединение в норме.%s\n",
-                           C::GRN, targetIp.c_str(), C::RST);
-                    break;
+            std::string clean;
+            int nClean = 0;
+            for (auto& r : rows)
+                if (isTargetIp(targetIp, r.ip) && r.score == 0) {
+                    clean += (clean.empty() ? "" : ", ") + r.ip;
+                    nClean++;
                 }
-            }
+            if (nClean > 0)
+                printf("\n%sПо %s %s проблем не выявлено: рукопожатие "
+                       "проходит, потерь/сбросов нет. Соединение в норме.%s\n",
+                       C::GRN, nClean > 1 ? "адресам" : "адресу", clean.c_str(), C::RST);
         }
 
         printf("\n%sДетали:%s\n", C::BOLD, C::RST);
@@ -1864,6 +1871,51 @@ static void printDumpHeader(const std::vector<Packet>& packets,
         std::cout << "MainIP IPv6: " << g_localIp6 << "\n";
 }
 
+// Цель режима 2 → адреса для фильтра. IP — как есть. Домен — все адреса его и
+// поддоменов (youtube.com — и www.youtube.com) по самому дампу: ответы DNS (по
+// имени из вопроса, то есть и через CNAME), SNI и Host соединений. Резолв на
+// этом ПК давал один IPv4, а у CDN адрес зависит от резолвера, региона и времени
+// (для заблокированного домена DNS провайдера отдаёт заглушку) — фильтр не
+// совпадал с адресами в дампе. Свой резолв — только если домена в дампе нет.
+// Несколько адресов — через ", " (см. isTargetIp); "" — без фильтра.
+static std::string targetAddrs(const std::vector<Packet>& packets, const std::string& target) {
+    std::string d = target;
+    for (auto& ch : d) ch = (char)tolower((unsigned char)ch);
+    while (!d.empty() && d.back() == '.') d.pop_back();
+    if (d.empty() || isValidIpv4Str(d) || d.find(':') != std::string::npos ||
+        !looksLikeDomainStr(d))
+        return target;                                   // адрес (или не домен) — как есть
+    std::set<std::string> ips;
+    for (const auto& kv : dnsNamesByIp(packets))
+        for (const auto& n : kv.second)
+            if (domainEndsWith(n, d)) { ips.insert(kv.first); break; }
+    for (const auto& p : packets)
+        for (const std::string* name : { &p.sni, &p.httpHost }) {   // ClientHello / запрос — к серверу
+            if (name->empty()) continue;
+            std::string h = name->substr(0, name->find(':'));        // Host: имя:порт
+            for (auto& ch : h) ch = (char)tolower((unsigned char)ch);
+            if (domainEndsWith(h, d)) ips.insert(p.dstIp);
+        }
+    std::string list;
+    if (!ips.empty()) {
+        for (const auto& ip : ips) list += (list.empty() ? "" : ", ") + ip;
+        std::cout << "Адреса " << d << " в дампе (DNS, SNI, Host): " << list << "\n";
+        return list;
+    }
+    // DNS мимо дампа (DoH, кэш), а в текстовом дампе нет SNI и Host
+    std::cout << "В дампе нет ни ответов DNS, ни соединений с именем " << d
+              << " — резолвлю на этом ПК..." << std::flush;
+    std::vector<std::string> res;
+    if (resolveAllAddrs(d, res) != 0) {
+        std::cout << " не удалось — домен не существует или нет ответа DNS.\n";
+        return "";
+    }
+    for (const auto& ip : res) list += (list.empty() ? "" : ", ") + ip;
+    std::cout << " -> " << list << "\n" << C::GRY
+              << "  (у абонента адреса могли быть другими: CDN, другой DNS)" << C::RST << "\n";
+    return list;
+}
+
 // Режим 2: диагностика блокировок и проблем соединения по загруженному дампу.
 // Консольный вариант: спрашивает цель у пользователя.
 void runConnAnalysis(const std::vector<Packet>& packets,
@@ -1882,7 +1934,9 @@ void runConnAnalysisFor(const std::vector<Packet>& packets,
     runConnAnalysisBody(packets, target);
 }
 
-void runConnAnalysisBody(const std::vector<Packet>& packets, const std::string& target) {
+void runConnAnalysisBody(const std::vector<Packet>& packets, const std::string& targetIn) {
+    // домен — все его адреса (консоль и окно передают цель как введена)
+    const std::string target = targetAddrs(packets, targetIn);
     if (target.empty())
         std::cout << "Цель не указана — анализирую все TCP-соединения в дампе.\n";
 
@@ -1891,7 +1945,7 @@ void runConnAnalysisBody(const std::vector<Packet>& packets, const std::string& 
     {
         std::set<std::string> pubIps;
         for (auto& p : packets) {
-            if (target.empty() || p.srcIp == target || p.dstIp == target) {
+            if (target.empty() || isTargetIp(target, p.srcIp) || isTargetIp(target, p.dstIp)) {
                 for (const std::string& ip : { p.srcIp, p.dstIp })
                     if (!isLocalIp(ip)) pubIps.insert(ip);
             }
