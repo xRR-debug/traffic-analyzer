@@ -2,9 +2,30 @@
 // DNS, TLS ClientHello (SNI, JA4), QUIC Initial; загрузка и склейка набора файлов.
 #include "common.h"
 
+// Имена служб, которые tcpdump без -n печатает вместо номера порта
+// («1.2.3.4.https», «….domain»): частые и те, что смотрят детекторы.
+// Имена — из /etc/services Linux и macOS (4500 там зовётся по-разному).
+static int portByName(const std::string& s) {
+    static const std::pair<const char*, int> kPorts[] = {
+        {"http", 80}, {"https", 443}, {"domain", 53}, {"domain-s", 853}, {"ntp", 123},
+        {"isakmp", 500}, {"ipsec-nat-t", 4500}, {"ipsec-msft", 4500}, {"openvpn", 1194},
+        {"socks", 1080}, {"http-alt", 8080}, {"pcsync-https", 8443}, {"bootps", 67},
+        {"bootpc", 68}, {"mdns", 5353}, {"llmnr", 5355}, {"ssh", 22}, {"ftp", 21},
+        {"telnet", 23}, {"smtp", 25}, {"submission", 587}, {"pop3", 110}, {"pop3s", 995},
+        {"imap", 143}, {"imaps", 993}, {"microsoft-ds", 445}, {"netbios-ns", 137},
+        {"netbios-dgm", 138}, {"netbios-ssn", 139}, {"snmp", 161}, {"ssdp", 1900},
+        {"l2f", 1701}, {"l2tp", 1701}, {"pptp", 1723}, {"ms-wbt-server", 3389},
+        {"stun", 3478}, {"sip", 5060}, {"rtsp", 554},
+    };
+    for (const auto& e : kPorts) if (s == e.first) return e.second;
+    return -1;
+}
+
 // "10.199.102.163.57275" -> ip="10.199.102.163", port=57275
 // "2a00:1450:4010::65.443" -> ip="2a00:1450:4010::65", port=443
-static void splitIpPort(const std::string& token, std::string& ip, int& port) {
+// named — следы дампа без -n: бит 1 — вместо адреса имя хоста (PTR), бит 2 —
+// порт назван незнакомым именем службы (порт 0, номер неизвестен)
+static void splitIpPort(const std::string& token, std::string& ip, int& port, int& named) {
     // последняя точка отделяет порт
     size_t dot = token.find_last_of('.');
     int dots = (int)std::count(token.begin(), token.end(), '.');
@@ -17,11 +38,24 @@ static void splitIpPort(const std::string& token, std::string& ip, int& port) {
     if (hasPort) {
         ip = token.substr(0, dot);
         std::string p = token.substr(dot + 1);
-        port = p.empty() ? -1 : atoi(p.c_str());
+        // Номер — 1–5 цифр. Без -n tcpdump пишет имя службы («.https»): atoi
+        // давал 0, и DNS, TLS на :443 и VPN-порты молча пропадали из анализа
+        if (p.empty()) port = -1;
+        else if (p.size() <= 5 && p.find_first_not_of("0123456789") == std::string::npos &&
+                 atoi(p.c_str()) <= 65535)
+            port = atoi(p.c_str());
+        else if ((port = portByName(p)) < 0) { port = 0; named |= 2; }
     } else {
         ip = token;
         port = -1;
     }
+    // Адрес — цифры с точками (IPv4) или шестнадцатеричные с «:» (IPv6). Иначе
+    // это имя хоста, которое tcpdump без -n подставляет по PTR: ни адреса, ни
+    // границы порта в нём не определить, а гео/ASN ушли бы запрашивать имя
+    const bool v6 = ip.find(':') != std::string::npos;
+    for (char c : ip)
+        if (!(isdigit((unsigned char)c) || c == '.' ||
+              (v6 && (c == ':' || isxdigit((unsigned char)c))))) { named |= 1; break; }
 }
 
 // извлечь "ключ: число" после метки (ack/win/length)
@@ -74,8 +108,9 @@ static long long grabSeqStart(const std::string& s) {
 
 // ------------------------------------------------------------------
 // разбор одной (уже склеенной) строки пакета
+// named (необязательно) — следы дампа без -n, биты как у splitIpPort
 // ------------------------------------------------------------------
-static Packet parseLine(const std::string& raw) {
+static Packet parseLine(const std::string& raw, int* named = nullptr) {
     Packet pk;
     std::string line = trim(raw);
     if (line.empty()) return pk;
@@ -126,17 +161,21 @@ static Packet parseLine(const std::string& raw) {
     std::string srcTok;
     if (!(is >> srcTok)) return pk;
 
-    // 4) ">"
+    // 4) ">" — иначе это не «адрес > адрес» («IP truncated-ip - …»): не считаем
+    // такое слово именем хоста из дампа без -n
     std::string arrow;
-    if (!(is >> arrow)) return pk;
+    if (!(is >> arrow) || arrow != ">") return pk;
 
     // 5) dst (с двоеточием на конце)
     std::string dstTok;
     if (!(is >> dstTok)) return pk;
     if (!dstTok.empty() && dstTok.back() == ':') dstTok.pop_back();
 
-    splitIpPort(srcTok, pk.srcIp, pk.srcPort);
-    splitIpPort(dstTok, pk.dstIp, pk.dstPort);
+    int nm = 0;
+    splitIpPort(srcTok, pk.srcIp, pk.srcPort, nm);
+    splitIpPort(dstTok, pk.dstIp, pk.dstPort, nm);
+    if (named) *named = nm;
+    if (nm & 1) return pk;   // имя хоста вместо адреса — строку не разбираем
 
     // остаток строки — флаги/seq/ack/win/length/proto
     std::string rest;
@@ -2427,8 +2466,9 @@ static void fixFirstAbsoluteSeq(std::vector<Packet>& pk) {
 
 // Загрузка ОДНОГО файла дампа: бинарный pcap либо текстовый вывод tcpdump.
 // fmt — распознанный формат (для печати). false + err — файл прочитать не вышло.
+// warn — предупреждение о содержимом (файл прочитан, но не всё разобрано).
 static bool loadDumpFile(const std::string& path, std::vector<Packet>& out,
-                         std::string& err, std::string& fmt) {
+                         std::string& err, std::string& fmt, std::string& warn) {
     out.clear();
     std::string ext = lowerExt(path);
     bool wantPcap = (ext == "pcap" || ext == "pcapng" || ext == "cap" || ext == "dmp");
@@ -2504,9 +2544,23 @@ static bool loadDumpFile(const std::string& path, std::vector<Packet>& out,
     if (!cur.empty()) records.push_back(cur);
 
     out.reserve(records.size());
+    long long hostNamed = 0, portNamed = 0;   // следы дампа без -n
     for (auto& r : records) {
-        Packet p = parseLine(r);
+        int named = 0;
+        Packet p = parseLine(r, &named);
+        if (named & 1) hostNamed++;
+        else if (named & 2) portNamed++;
         if (p.valid) out.push_back(std::move(p));
+    }
+    // Без -n tcpdump пишет имена вместо адресов и портов: молча это давало
+    // порт 0 у DNS, HTTPS и VPN-портов — говорим, что разобрано не всё
+    if (hostNamed || portNamed) {
+        warn = "дамп снят без -n — вместо адресов и портов имена.";
+        if (hostNamed)
+            warn += " Пропущено строк с именем хоста вместо адреса: " + std::to_string(hostNamed) + ".";
+        if (portNamed)
+            warn += " Строк с незнакомым именем порта (номер неизвестен): " + std::to_string(portNamed) + ".";
+        warn += " Снимите дамп заново с ключом -nn: tcpdump -nn …";
     }
     fixFirstAbsoluteSeq(out);
     return true;
@@ -2623,8 +2677,8 @@ bool loadDumpSet(const std::vector<std::string>& paths,
     bool loadFailed = false;
     for (size_t fi = 0; fi < paths.size(); fi++) {
         std::vector<Packet> part;
-        std::string err, fmt;
-        if (!loadDumpFile(paths[fi], part, err, fmt)) {
+        std::string err, fmt, warn;
+        if (!loadDumpFile(paths[fi], part, err, fmt, warn)) {
             std::cout << C::RED << "Не удалось прочитать " << paths[fi] << ": " << err
                       << C::RST << "\n";
             loadFailed = true;
@@ -2632,6 +2686,8 @@ bool loadDumpSet(const std::vector<std::string>& paths,
         }
         std::cout << "Файл: " << paths[fi] << "\n"
                   << "  формат: " << fmt << ", пакетов: " << part.size() << "\n";
+        if (!warn.empty())
+            std::cout << C::YEL << "  внимание: " << warn << C::RST << "\n";
         origin.insert(origin.end(), part.size(), (int)fi);
         packets.insert(packets.end(),
                        std::make_move_iterator(part.begin()),
