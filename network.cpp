@@ -2919,6 +2919,15 @@ static bool isStubAddr(const std::string& ip) {
     return ip.rfind("0.", 0) == 0 || ip.rfind("127.", 0) == 0 || isPrivateIp(ip);
 }
 
+static std::string rcodeName(int rc) {
+    switch (rc) {
+    case 2: return "SERVFAIL";
+    case 3: return "NXDOMAIN";
+    case 5: return "REFUSED";
+    default: return "код " + std::to_string(rc);
+    }
+}
+
 // Ответ одного резолвера на один домен + вердикт.
 struct DnsResolverAns {
     std::string label;              // «система», «DNS 10.0.0.1», «8.8.8.8 (UDP)» ...
@@ -3095,6 +3104,17 @@ void runDnsHonestyMode() {
                 r.sev = 2; r.verdict = "NXDOMAIN, хотя домен существует — подмена ответа";
             } else if (noAns && (!d.ref.empty() || d.refNx)) {
                 r.sev = 2; r.verdict = "нет ответа — запрос/ответ дропается";
+            } else if (r.viaUdp && r.probe.first.got && r.probe.first.rcode != 0 &&
+                       r.probe.first.rcode != 3) {
+                // REFUSED / SERVFAIL — так блокируют AdGuard Home, Unbound (refuse),
+                // RPZ. Раньше такой ответ без адресов проходил как «ок»; правило — как
+                // в режиме 13 (runIpOwnerFor)
+                r.sev = d.ref.empty() ? 1 : 2;
+                r.verdict = "ошибка сервера " + rcodeName(r.probe.first.rcode) +
+                    (d.ref.empty() ? std::string() : ", а DoH видит адреса — отказ / блокировка");
+            } else if (r.viaUdp && r.probe.first.got && r.ips.empty() && !d.ref.empty()) {
+                // NOERROR без A-записей (RPZ NODATA) при живом эталоне — тоже подмена
+                r.sev = 2; r.verdict = "пустой ответ (нет A-записей), хотя домен существует — подмена / блок";
             } else if (!shared.empty() && !d.ref.empty() && !overlap) {
                 r.sev = 2; r.verdict = "ЗАГЛУШКА — " + shared + " выдаётся для разных сайтов";
             } else if (!r.ips.empty() && !d.ref.empty() && !overlap) {
@@ -3168,7 +3188,7 @@ void runDnsHonestyMode() {
             if (r.viaUdp) {
                 if (!r.probe.first.got) val = "—";
                 else if (r.probe.first.rcode == 3) val = "NXDOMAIN";
-                else if (r.probe.first.rcode != 0) val = "rcode " + std::to_string(r.probe.first.rcode);
+                else if (r.probe.first.rcode != 0) val = rcodeName(r.probe.first.rcode);
                 else val = r.ips.empty() ? "(пусто)" : joinIps(r.ips);
                 if (r.probe.ms >= 0) val += "  " + std::to_string(r.probe.ms) + " мс";
             } else {
@@ -3225,7 +3245,7 @@ void runDnsHonestyMode() {
                "а не блокировка отдельных сайтов. Проверьте настройки DNS у клиента, "
                "роутер, доступность резолвера.%s\n", C::YEL, C::RST);
     } else if (bad > 0) {
-        printf("%sDNS врёт по %d домен(ам): заглушки/подмена/дроп.%s\n", C::RED, bad, C::RST);
+        printf("%sDNS врёт по %d домен(ам): заглушки/подмена/дроп/отказ.%s\n", C::RED, bad, C::RST);
         printf("Что сказать/сделать: блокировка на уровне DNS (реестр РКН / ТСПУ). "
                "Смена DNS в системе на 8.8.8.8/1.1.1.1 поможет, только если UDP:53 не "
                "перехватывается (см. блок «Перехват»); надёжно — DoH/DoT в браузере или ОС. "
@@ -3715,15 +3735,6 @@ static void queryResolver(ResolverAns& a, const std::string& name) {
     }
 }
 
-static std::string rcodeName(int rc) {
-    switch (rc) {
-    case 2: return "SERVFAIL";
-    case 3: return "NXDOMAIN";
-    case 5: return "REFUSED";
-    default: return "код " + std::to_string(rc);
-    }
-}
-
 void runIpOwnerMode() {
     std::cout << "Кому принадлежит IP / домен.\n"
                  "IP или домен (можно несколько через запятую или пробел): " << std::flush;
@@ -4035,6 +4046,11 @@ void runIpOwnerFor(const std::string& input) {
             } else if (a.rcode != 0 && a.rcode != 3) {
                 verdict = "ошибка сервера: " + rcodeName(a.rcode);
                 col = C::YEL;
+                // а DoH адреса видит — отказ именно по этому домену (как в режиме 11)
+                if (a.kind == 1 && !ref.empty()) {
+                    verdict += ", а DoH видит адреса — отказ / блок";
+                    col = C::RED; anyBadDns = true;
+                }
             } else if (a.ips.empty()) {
                 std::string what = a.rcode == 3 ? "NXDOMAIN" : "нет A-записей";
                 if (!ref.empty()) { verdict = what + ", а DoH видит адреса — подмена / блок"; col = C::RED; anyBadDns = true; }
