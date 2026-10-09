@@ -495,8 +495,11 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
         if (S) {
             if (sLoc) { c.synLocSeen = true; if (p.mss > 0) c.mssLoc = p.mss; c.wsLoc = p.wscale; }
             else      { c.synRemSeen = true; if (p.mss > 0) c.mssRem = p.mss; c.wsRem = p.wscale; }
-        } else if (sLoc && p.win >= 0 && c.synLocSeen && c.synRemSeen) {
-            // масштаб больше 14 RFC 7323 велит считать за 14 (и сдвиг на ≥ 64 — UB)
+        } else if (sLoc && p.win >= 0 && p.win <= 65535 && c.synLocSeen && c.synRemSeen) {
+            // масштаб больше 14 RFC 7323 велит считать за 14 (и сдвиг на ≥ 64 — UB).
+            // Поле окна — 16 бит; больше 65535 бывает только в испорченной строке
+            // текстового дампа (число цифр не ограничено), и сдвиг такого значения
+            // переполнил бы long long (UB) — такое окно считаем неизвестным.
             long long eff = (c.wsLoc >= 0 && c.wsRem >= 0)
                 ? ((long long)p.win << std::min(c.wsLoc, 14)) : (long long)p.win;
             if (eff > c.maxWinLoc) c.maxWinLoc = eff;
