@@ -2939,7 +2939,49 @@ bool loadDumpSet(const std::vector<std::string>& paths,
             std::string ip;
             long long best = top(freq, ip);
             // принимаем, только если адрес реально доминирует (>= 50% пакетов)
-            if (n == 0 || best < n * 0.5) ip.clear();
+            if (n == 0 || best < n * 0.5) { ip.clear(); return ip; }
+            // Ничья: дамп снят с фильтром на один адрес («host X» во встроенном
+            // захвате, экспорт Wireshark по ip.addr) — и абонент, и сервер есть
+            // в каждом пакете. Алфавитный порядок std::map тут ничего не значит:
+            // абонент — кто начинает (SYN без ACK, DNS-запрос, ClientHello,
+            // рукопожатие WireGuard), затем — сторона с эфемерным портом против
+            // общеизвестного, затем — приватный адрес.
+            std::vector<std::string> tied;
+            for (auto& kv : freq) if (kv.second == best) tied.push_back(kv.first);
+            if (tied.size() < 2) return ip;
+            std::map<std::string, long long> init, eph;
+            for (auto& p : packets) {
+                if ((p.srcIp.find(':') != std::string::npos) != v6) continue;
+                const bool syn = p.proto == "TCP" && p.flags.find('S') != std::string::npos &&
+                                 p.flags.find('.') == std::string::npos;
+                const bool dnsQuery = !p.dnsId.empty() && !p.dnsIsResponse && p.dstPort == 53;
+                if (syn || dnsQuery || !p.sni.empty() || p.wgType == 1) init[p.srcIp]++;
+                if (p.srcPort >= 1024 && p.dstPort >= 0 && p.dstPort < 1024) eph[p.srcIp]++;
+                else if (p.dstPort >= 1024 && p.srcPort >= 0 && p.srcPort < 1024) eph[p.dstIp]++;
+            }
+            // признаки по очереди: > 0 — a больше похож на абонента, чем b
+            auto cmp = [&](const std::string& a, const std::string& b) -> int {
+                if (init[a] != init[b]) return init[a] > init[b] ? 1 : -1;
+                if (eph[a] != eph[b]) return eph[a] > eph[b] ? 1 : -1;
+                return (int)isPrivateIp(a) - (int)isPrivateIp(b);
+            };
+            ip = tied[0];
+            bool unique = true;
+            for (size_t k = 1; k < tied.size(); k++) {
+                const int r = cmp(tied[k], ip);
+                if (r > 0) { ip = tied[k]; unique = true; }
+                else if (r == 0) unique = false;
+            }
+            if (!unique) {
+                std::string all;
+                for (size_t k = 0; k < tied.size(); k++)
+                    all += (k == 0 ? "" : k + 1 == tied.size() ? " и " : ", ") + tied[k];
+                std::cout << C::YEL << "Внимание: адрес абонента не определён однозначно — "
+                          << all << " есть в каждом пакете (дамп снят с фильтром на один "
+                             "адрес?), а признаков, кто из них абонент, нет. Взят " << ip
+                          << "; если абонент другой, входящие и исходящие в отчёте "
+                             "перепутаны — снимите дамп без фильтра по адресу." << C::RST << "\n";
+            }
             return ip;
         };
         bool rev4 = false, rev6 = false;
