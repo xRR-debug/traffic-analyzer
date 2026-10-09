@@ -199,8 +199,9 @@ enum L7Proto : uint8_t {
     L7_SOCKS5, L7_SOCKS4, L7_RDP, L7_TELNET, L7_SMB, L7_STUN, L7_DNS,
     L7_OPENVPN,
     // только на пакете, до сборки потока: OpenVPN засчитываем, лишь когда в
-    // потоке есть и сброс клиента, и ответ сервера (одиночный байт — не сигнатура)
-    L7_OVPN_CLIENT, L7_OVPN_SERVER,
+    // потоке есть и сброс клиента, и ответ сервера (одиночный байт — не сигнатура),
+    // а по UDP — ещё и управляющий пакет (P_CONTROL_V1/P_ACK_V1) с session id сброса
+    L7_OVPN_CLIENT, L7_OVPN_SERVER, L7_OVPN_CTRL,
 };
 const char* l7Name(int code);            // "SSH", "BitTorrent", ...; "" для L7_NONE
 inline bool l7IsProxy(int c) { return c == L7_SOCKS5 || c == L7_SOCKS4 || c == L7_HTTP_PROXY; }
@@ -218,6 +219,8 @@ struct Packet {
     long long   seq = -1;        // конец диапазона (для RTT seq->ack)
     long long   seqStart = -1;   // начало диапазона (для детекта ретрансмиссий)
     long long   ack = -1;
+    bool        seqRelFixed = false; // текстовый tcpdump: первый пакет беседы напечатан
+                                     // абсолютным, переведён в относительный (fixFirstAbsoluteSeq)
     long long   win = -1;
     long long   length = 0;
     std::string appHint;         // "HTTP" если в дампе помечено
@@ -245,6 +248,8 @@ struct Packet {
     // 2 — VoWiFi точно (звонки по Wi-Fi через ePDG оператора), 0 — не ясно
     uint8_t     ipsecPeer = 0;
     uint8_t     l7 = L7_NONE;    // протокол потока по содержимому (L7Proto), только pcap
+    // OpenVPN по UDP (L7_OVPN_*): 8 байт session id за опкодом, как есть; 0 — нет
+    uint64_t    ovpnSid = 0;
     // рукопожатие TLS открытым текстом (TLSHS_*): что началось в этом сегменте; только pcap
     uint8_t     tlsHs = 0;
     int         tlsAlert = -1;   // код открытого TLS Alert (при TLSHS_ALERT), -1 — нет
@@ -265,6 +270,7 @@ struct Packet {
     int         wscale = -1;     // window scale (сдвиг) из SYN/SYN-ACK
     int         sackBlocks = 0;  // число SACK-блоков (>0 = получатель сообщает о дырах)
     long long   tsVal = -1, tsEcr = -1;   // TCP timestamps (RFC 7323): TSval / TSecr
+    bool        tcpMd5 = false;  // опция MD5 (19, только pcap): ею zapret метит фейки (fooling=md5sig)
     // HTTP без TLS (только pcap, первый сегмент с данными):
     int         httpStatus = 0;  // код ответа "HTTP/1.x NNN" (0 = не ответ)
     std::string httpHost;        // Host: из запроса

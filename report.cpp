@@ -776,7 +776,10 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
     if (!targetIp.empty()) ttTarget = buildTcpConnTable(targetScope, localIp);
     const TcpConnTable& ttScope = targetIp.empty() ? ttAll : ttTarget;
 
-    std::set<std::string> tspuBlocked = collectTspuBlockedIps(packets, localIp, &ttAll, ipCache);
+    // «входящее направление записано» — по всему дампу: при цели таблица ниже
+    // смотрит только её пакеты, а у полностью отрезанной цели входящих нет
+    const bool inbound = dumpHasInbound(packets, localIp);
+    std::set<std::string> tspuBlocked = collectTspuBlockedIps(packets, localIp, &ttAll, ipCache, &inbound);
     // Домены, заблокированные по SNI, и адреса, где они встретились. Если такой
     // адрес не попал в tspuBlocked — он общий (CDN): другие сайты на нём
     // работают, заблокировано только имя. В таблице это SNI-BLOCK, а не TSPU?.
@@ -1567,7 +1570,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
 
             // все IP с признаками блокировки на ТСПУ (TCP-DPI/SYN-блок + UDP-WG)
             std::set<std::string> tspuIps = targetIp.empty()
-                ? tspuBlocked : collectTspuBlockedIps(dpiScope, localIp, &ttScope, ipCache);
+                ? tspuBlocked : collectTspuBlockedIps(dpiScope, localIp, &ttScope, ipCache, &inbound);
             bool tspuBlock = !tspuIps.empty();
             // домены, заблокированные по SNI (в т.ч. на общих адресах CDN)
             const auto blockedSnis = targetIp.empty()

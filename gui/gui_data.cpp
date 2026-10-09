@@ -186,7 +186,10 @@ void wfAdd(FlowRow& r, WfBuild& b, const Packet& p, bool out, long long rel) {
         }
         bool retx = false;
         if (p.seq >= 0) {
-            if (b.maxEnd[d] >= 0 && seqLE(p.seq, b.maxEnd[d])) retx = true;
+            // позади больше чем на 2^30 — не повтор, а сменилась база номеров
+            // (как seqRebased в buildTcpConnTable)
+            if (b.maxEnd[d] >= 0 && seqLE(p.seq, b.maxEnd[d]) &&
+                (int32_t)((uint32_t)p.seq - (uint32_t)b.maxEnd[d]) >= -(1 << 30)) retx = true;
             else b.maxEnd[d] = p.seq;
         }
         if (retx) {

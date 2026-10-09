@@ -180,22 +180,77 @@ static Packet parseLine(const std::string& raw) {
     //   запрос:  "... 40905+ A? top-fwz1.mail.ru. (34)"
     //   ответ A: "... 40905 1/0/0 A 95.163.52.67 (50)"
     //   NXDomain:"... 40905 NXDomain 0/1/0 (90)"
+    //   -vv:     "... [udp sum ok] 40905 q: A? mail.ru. 1/1/1 mail.ru. A 1.2.3.4 ns: … ar: … (90)"
+    // Сообщение начинается с id: у UDP — сразу за адресами (при -vv, а у IPv6 и при -v,
+    // перед ним метка «[udp sum ok]» / «[bad udp cksum 0x… -> 0x…!]»), у TCP — за
+    // «, length N». Раньше id был первым числом строки — «0» из метки, у TCP номер
+    // seq, — и запрос не находил ответа. Сегмент TCP без данных (SYN, ACK, FIN) — не
+    // DNS, как и в pcap.
     if (pk.srcPort == 53 || pk.dstPort == 53) {
-        std::istringstream ds(rest);
-        std::string w;
-        std::vector<std::string> toks;
-        while (ds >> w) toks.push_back(w);
-        // transaction id — первый токен вида "40905" или "40905+" или "40905*"
-        for (auto& tk : toks) {
-            std::string digits;
-            for (char c : tk) { if (isdigit((unsigned char)c)) digits+=c; else break; }
-            if (!digits.empty()) { pk.dnsId = digits; break; }
+        size_t m = std::string::npos;
+        if (pk.proto == "UDP") {
+            m = rest.find_first_not_of(' ');
+            while (m != std::string::npos && rest[m] == '[') {
+                size_t e = rest.find(']', m);
+                m = (e == std::string::npos) ? e : rest.find_first_not_of(' ', e + 1);
+            }
+        } else if (pk.proto == "TCP") {
+            size_t lp = rest.find(", length ");
+            if (lp != std::string::npos && atoll(rest.c_str() + lp + 9) > 0) {
+                m = rest.find(' ', lp + 9);
+                if (m != std::string::npos) m = rest.find_first_not_of(' ', m);
+            }
         }
-        bool isQuery = (rest.find("? ") != std::string::npos);  // "A? ", "AAAA? "
-        if (isQuery) {
-            pk.dnsIsResponse = false;
-            // домен идёт сразу после "A? " / "AAAA? " / "CNAME? "
-            size_t q = rest.find("? ");
+        std::vector<std::pair<size_t, std::string>> ws;   // слова сообщения: (позиция, слово)
+        for (size_t p = m; p != std::string::npos; p = rest.find_first_not_of(' ', p)) {
+            size_t e = std::min(rest.find(' ', p), rest.size());
+            ws.emplace_back(p, rest.substr(p, e - p));
+            p = e;
+        }
+        // id — число до 65535 и флаги заголовка: «+» (RD), «%» у запроса, «*-|$» у ответа
+        const std::string idw = ws.empty() ? std::string() : ws[0].second;
+        const size_t nd = std::min(idw.find_first_not_of("0123456789"), idw.size());
+        bool ok = nd >= 1 && nd <= 5 && atol(idw.c_str()) <= 65535 &&
+                  idw.find_first_not_of("+%*-|$", nd) == std::string::npos;
+        if (ok && ws.size() > 1) {          // код операции не QUERY — пропускаем, как и в pcap
+            static const char* kOps[] = { "inv_q", "stat", "op3", "notify", "update", "op6",
+                "op7", "op8", "updateA", "updateD", "updateDA", "updateM", "updateMA",
+                "zoneInit", "zoneRef" };
+            const std::string op = ws[1].second.substr(0, ws[1].second.find_first_of("+%*-|$"));
+            for (const char* o : kOps) if (op == o) ok = false;
+        }
+        // Запрос от ответа отличаем по заголовку, а не по «? » где угодно: при -vv ответ
+        // повторяет вопрос («q: A? имя.») и считался запросом. Только у ответа есть
+        // счётчики записей «N/N/N», у запроса раньше них идёт «ТИП? имя». Сообщение
+        // оборвано («[|domain]») — запрос, только если у id есть «+»/«%» (у ответа их нет).
+        auto isCounts = [](const std::string& w) {        // "1/0/0"
+            int sl = 0; bool dig = false;
+            for (char c : w) {
+                if (isdigit((unsigned char)c)) dig = true;
+                else if (c == '/' && dig && sl < 2) { sl++; dig = false; }
+                else return false;
+            }
+            return sl == 2 && dig;
+        };
+        int kind = 0;                        // 1 — запрос, 2 — ответ
+        size_t q = std::string::npos;        // «?» за типом первого вопроса
+        size_t ansB = std::string::npos;     // записи ответа — за «N/N/N»
+        bool vvQ = false, nx = false;
+        for (size_t i = 1; ok && !kind && i < ws.size(); i++) {
+            const std::string& w = ws[i].second;
+            if (w == "q:") vvQ = true;
+            else if (w.back() == '?') {
+                if (q == std::string::npos) q = ws[i].first + w.size() - 1;
+                if (!vvQ) kind = 1;
+            } else if (isCounts(w)) { kind = 2; ansB = ws[i].first + w.size(); }
+            else if (w.compare(0, 8, "NXDomain") == 0) nx = true;
+        }
+        if (ok && !kind) kind = (!vvQ && idw.find_first_of("+%", nd) != std::string::npos) ? 1 : 2;
+        if (kind) {
+            pk.dnsId = idw.substr(0, nd);
+            pk.dnsIsResponse = (kind == 2);
+            pk.dnsNxdomain = nx && kind == 2;
+            // имя вопроса — и в ответе (при -vv, из «q:»), как в pcap
             if (q != std::string::npos) {
                 // тип — слово перед "?": "A", "AAAA", "HTTPS", неизвестные — "Type65"
                 size_t tb = q;
@@ -207,6 +262,7 @@ static Packet parseLine(const std::string& raw) {
                 for (const auto& e : kQt) if (qt == e.first) { pk.dnsQtype = e.second; break; }
                 if (pk.dnsQtype == 0 && qt.size() > 4 && qt.compare(0, 4, "Type") == 0)
                     pk.dnsQtype = (uint16_t)atoi(qt.c_str() + 4);
+                // домен идёт сразу после "A? " / "AAAA? " / "CNAME? "
                 std::string dom;
                 size_t p = q + 2;
                 while (p < rest.size() && (isalnum((unsigned char)rest[p])||rest[p]=='.'||rest[p]=='-'||rest[p]=='_'))
@@ -214,20 +270,23 @@ static Packet parseLine(const std::string& raw) {
                 while (!dom.empty() && dom.back()=='.') dom.pop_back();
                 pk.dnsQuery = dom;
             }
-        } else {
-            pk.dnsIsResponse = true;
-            if (rest.find("NXDomain") != std::string::npos) pk.dnsNxdomain = true;
+        }
+        if (kind == 2 && ansB != std::string::npos) {
+            // записи ответа — до секций полномочий и дополнительной («ns:», «ar:» при -vv):
+            // адреса оттуда (glue NS-серверов) — не ответ на вопрос
+            const size_t ae = std::min(rest.find(" ns: ", ansB), rest.find(" ar: ", ansB));
+            const std::string ans = rest.substr(ansB, ae == std::string::npos ? ae : ae - ansB);
             // все "A <ip>" / "AAAA <ip>" ответа: "3/0/0 CNAME x., A 1.2.3.4, A 5.6.7.8"
             // dnsAnswerIp — первая A (если её нет — первая AAAA), dnsAnswers — все
             std::string firstA, firstA6;
             for (const char* rr : { " A ", " AAAA " }) {
                 size_t ap = 0;
-                while ((ap = rest.find(rr, ap)) != std::string::npos) {
+                while ((ap = ans.find(rr, ap)) != std::string::npos) {
                     size_t p = ap + strlen(rr);
                     ap = p;
                     std::string ip;
-                    while (p < rest.size() && (isxdigit((unsigned char)rest[p])||rest[p]=='.'||rest[p]==':'))
-                        ip += rest[p++];
+                    while (p < ans.size() && (isxdigit((unsigned char)ans[p])||ans[p]=='.'||ans[p]==':'))
+                        ip += ans[p++];
                     if (ip.find('.') == std::string::npos && ip.find(':') == std::string::npos) continue;
                     pk.dnsAnswers.push_back(ip);
                     if (rr[2] == ' ') { if (firstA.empty()) firstA = ip; }
@@ -237,12 +296,12 @@ static Packet parseLine(const std::string& raw) {
             pk.dnsAnswerIp = !firstA.empty() ? firstA : firstA6;
             // "CNAME fp-back.facct.ru., A 185.17.9.134" — цели CNAME по порядку
             size_t cp = 0;
-            while ((cp = rest.find(" CNAME ", cp)) != std::string::npos) {
+            while ((cp = ans.find(" CNAME ", cp)) != std::string::npos) {
                 size_t p = cp + 7;
                 cp = p;
                 std::string nm;
-                while (p < rest.size() && (isalnum((unsigned char)rest[p])||rest[p]=='.'||rest[p]=='-'||rest[p]=='_'))
-                    nm += rest[p++];
+                while (p < ans.size() && (isalnum((unsigned char)ans[p])||ans[p]=='.'||ans[p]=='-'||ans[p]=='_'))
+                    nm += ans[p++];
                 while (!nm.empty() && nm.back()=='.') nm.pop_back();
                 if (!nm.empty()) pk.dnsCnames.push_back(nm);
             }
@@ -544,11 +603,14 @@ static uint8_t detectL7(const uint8_t* p, size_t n, size_t full, bool tcp) {
     // OpenVPN: опкод в старших 5 битах, key_id = 0. 7/10 — сброс от клиента
     // (v2 / tls-crypt-v2), 8 — ответ сервера. Поток признаётся OpenVPN только
     // если это ПЕРВЫЕ пакеты обеих сторон (флоу-маркировка в loadDumpSet).
+    // 4/5 — P_CONTROL_V1/P_ACK_V1 (рукопожатие TLS внутри): вторая улика для UDP,
+    // байтов 0x20/0x28 у короткого заголовка QUIC не бывает (бит 0x40 есть всегда)
     auto ovpn = [](uint8_t b) -> uint8_t {
         if ((b & 7) != 0) return L7_NONE;
         uint8_t op = b >> 3;
         if (op == 7 || op == 10) return L7_OVPN_CLIENT;
         if (op == 8)             return L7_OVPN_SERVER;
+        if (op == 4 || op == 5)  return L7_OVPN_CTRL;
         return L7_NONE;
     };
     if (tcp) {
@@ -757,7 +819,7 @@ static bool parseFrame(const unsigned char* d, size_t len, int linkType,
         if (fl & 0x20) fs += 'U';
         pk.flags = "[" + (fs.empty() ? std::string("-") : fs) + "]";
         pk.win = be16(l4 + 14);
-        // TCP-опции: MSS(2), window scale(3), SACK(5), timestamps(8)
+        // TCP-опции: MSS(2), window scale(3), SACK(5), timestamps(8), MD5(19)
         if (doff > 20) {
             const uint8_t* o = l4 + 20;
             const uint8_t* oe = l4 + doff;
@@ -773,6 +835,7 @@ static bool parseFrame(const unsigned char* d, size_t len, int linkType,
                 else if (kind == 3 && ol == 3) pk.wscale = std::min<int>(o[2], 14);
                 else if (kind == 5 && ol >= 10) pk.sackBlocks = (ol - 2) / 8;
                 else if (kind == 8 && ol == 10) { pk.tsVal = be32(o + 2); pk.tsEcr = be32(o + 6); }
+                else if (kind == 19) pk.tcpMd5 = true;
                 o += ol;
             }
         }
@@ -826,6 +889,11 @@ static bool parseFrame(const unsigned char* d, size_t len, int linkType,
         if (!pk.wgType && pk.length > 0 && up < d + len)
             pk.l7 = detectL7(up, std::min((size_t)pk.length, (size_t)((d + len) - up)),
                              (size_t)pk.length, false);
+        // session id OpenVPN (8 байт за опкодом, открыт и при tls-auth/tls-crypt):
+        // по нему loadDumpSet сверяет сброс стороны с её управляющим пакетом
+        if ((pk.l7 == L7_OVPN_CLIENT || pk.l7 == L7_OVPN_SERVER || pk.l7 == L7_OVPN_CTRL) &&
+            up + 9 <= d + len)
+            memcpy(&pk.ovpnSid, up + 1, 8);
         // IPsec: на 4500 первые 4 байта 0 — маркер non-ESP (дальше IKE), иначе
         // это SPI ESP-пакета; 1 байт 0xFF — NAT-keepalive. Заголовок IKE:
         // SPIi(8) SPIr(8) next(1) версия(1) тип обмена(1) флаги(1) …
@@ -952,12 +1020,17 @@ static std::string parseTlsSni(const uint8_t* d, size_t n) {
 // расширений — server_name примерно в половине случаев оказывается во
 // втором сегменте, и SNI по одному пакету теряется. Кроме того, средства
 // обхода DPI режут ClientHello на несколько TLS-записей — их тоже склеиваем.
+// Они же шлют части задом наперёд (disorder) и фейки: ClientHello с чужим SNI
+// вне потока (seq раньше ISN+1 — GoodbyeDPI --wrong-seq, zapret badseq и
+// seqovl) и куски из нулей с тем же seq (zapret fakedsplit) — см. HelloReassembler.
 // ------------------------------------------------------------------
 
 // Выделить handshake-сообщение ClientHello из потока TLS-записей s.
 // 1 — собран целиком, 0 — нужны ещё байты, -1 — это не ClientHello.
-// В hs остаётся всё, что удалось собрать (даже при 0/-1).
-static int tlsCollectHello(const std::vector<uint8_t>& s, std::vector<uint8_t>& hs) {
+// В hs остаётся всё, что удалось собрать (даже при 0/-1); end (при 1) — где в s
+// кончается запись с последним байтом ClientHello.
+static int tlsCollectHello(const std::vector<uint8_t>& s, std::vector<uint8_t>& hs,
+                           size_t* end = nullptr) {
     hs.clear();
     size_t pos = 0;
     while (pos + 5 <= s.size()) {
@@ -970,7 +1043,11 @@ static int tlsCollectHello(const std::vector<uint8_t>& s, std::vector<uint8_t>& 
         if (hs.size() >= 4) {
             size_t need = 4 + (((size_t)hs[1] << 16) | ((size_t)hs[2] << 8) | hs[3]);
             if (need > 65536) return -1;
-            if (hs.size() >= need) { hs.resize(need); return 1; }
+            if (hs.size() >= need) {
+                hs.resize(need);
+                if (end) *end = pos + 5 + rlen;
+                return 1;
+            }
         }
         if (avail < rlen) return 0;
         pos += 5 + rlen;
@@ -1028,6 +1105,10 @@ static std::string sha256Hex12(const std::string& s) {
 
 // hs — handshake-сообщение ClientHello (начинается с 0x01, без TLS-записи).
 // transport: 't' — TCP, 'q' — QUIC. false — ClientHello неполный или битый.
+// Проверка строгая: в сборку из сегментов обходчик DPI подмешивает фейки (zapret
+// fakedsplit — куски из нулей с тем же seq), и мусор не должен давать отпечаток:
+// хоть один шифр, среди методов сжатия есть null, расширения ровно до конца
+// сообщения и без повторов, имя в server_name печатное.
 // ech (необязательно) — выставляется, если в ClientHello есть расширение
 // encrypted_client_hello (0xfe0d). Chrome шлёт его и «вхолостую» (GREASE ECH),
 // поэтому настоящий ECH отличаем уже в анализе — по внешнему SNI (isEchPublicName).
@@ -1044,7 +1125,7 @@ static bool ja4FromHello(const uint8_t* hs, size_t n, char transport,
     p += 1 + (size_t)hs[p];                         // session_id
     if (p + 2 > end) return false;
     size_t csLen = be16(hs + p); p += 2;
-    if (p + csLen > end || (csLen & 1)) return false;
+    if (csLen < 2 || p + csLen > end || (csLen & 1)) return false;
     std::vector<uint16_t> ciphers;
     bool grease = false;
     for (size_t i = 0; i < csLen; i += 2) {
@@ -1053,17 +1134,21 @@ static bool ja4FromHello(const uint8_t* hs, size_t n, char transport,
     }
     p += csLen;
     if (p + 1 > end) return false;
-    p += 1 + (size_t)hs[p];                         // compression_methods
-    if (p > end) return false;
+    const size_t cmLen = hs[p];                     // compression_methods
+    if (cmLen < 1 || p + 1 + cmLen > end ||
+        std::find(hs + p + 1, hs + p + 1 + cmLen, 0) == hs + p + 1 + cmLen)
+        return false;
+    p += 1 + cmLen;
 
     std::vector<uint16_t> exts, sigAlgs, groups;
-    bool hasSni = false;
+    bool hasSni = false, hasEch = false;
     std::string alpn;
     uint16_t maxVer = 0;
-    if (p + 2 <= end) {
+    if (p < end) {
+        if (p + 2 > end) return false;
         size_t extEnd = p + 2 + be16(hs + p);
         p += 2;
-        if (extEnd > end) return false;
+        if (extEnd != end) return false;
         while (p + 4 <= extEnd) {
             uint16_t t = be16(hs + p);
             size_t l = be16(hs + p + 2);
@@ -1072,10 +1157,16 @@ static bool ja4FromHello(const uint8_t* hs, size_t n, char transport,
             const uint8_t* e = hs + p;
             if (tlsIsGrease(t)) grease = true;
             else {
+                if (std::find(exts.begin(), exts.end(), t) != exts.end()) return false;
                 exts.push_back(t);
-                if (t == 0xfe0d && ech) *ech = true;
-                if (t == 0x0000) hasSni = true;
-                else if (t == 0x0010 && l >= 3) {          // ALPN: len2, {len1, имя}...
+                if (t == 0xfe0d) hasEch = true;
+                if (t == 0x0000) {                         // список(2), тип(1)=0, длина(2), имя
+                    const size_t nl = l >= 5 ? be16(e + 3) : 0;
+                    if (nl == 0 || e[2] != 0 || 5 + nl > l) return false;
+                    for (size_t i = 5; i < 5 + nl; i++)
+                        if (e[i] < 0x20 || e[i] > 0x7e) return false;
+                    hasSni = true;
+                } else if (t == 0x0010 && l >= 3) {        // ALPN: len2, {len1, имя}...
                     size_t nl = e[2];
                     if (3 + nl <= l) alpn.assign((const char*)e + 3, nl);
                 } else if (t == 0x000d && l >= 2) {        // signature_algorithms
@@ -1105,7 +1196,9 @@ static bool ja4FromHello(const uint8_t* hs, size_t n, char transport,
             }
             p += l;
         }
+        if (p != extEnd) return false;
     }
+    if (ech && hasEch) *ech = true;
 
     uint16_t ver = maxVer ? maxVer : legacyVer;
     const char* vs = "00";
@@ -1238,84 +1331,166 @@ static bool ja4FromTlsRecords(const uint8_t* d, size_t n, Packet& pk) {
 }
 
 class HelloReassembler {
+    // SYN абонента: где начинается поток (ISN+1) и чем помечены его настоящие пакеты
+    struct Syn {
+        uint32_t isn = 0;
+        int ttl = -1;
+        long long tsVal = -1;
+        bool md5 = false;
+    };
     struct Pending {
-        size_t idx = 0;              // пакет с первым сегментом — ему и пишем SNI
-        uint32_t nextSeq = 0;        // ожидаемый seq следующего сегмента
-        std::vector<uint8_t> buf;    // склеенные байты потока
+        uint32_t base = 0;           // seq байта 0: ISN+1 (или, без SYN в дампе, начало ClientHello)
+        std::vector<uint8_t> buf;    // байты потока от base
+        std::vector<uint8_t> have;   // 1 — байт пришёл (части бывают и задом наперёд)
+        size_t idx = SIZE_MAX;       // последний пакет с байтом 0 — ему и пишем SNI
+        std::vector<uint8_t> head;   // его байты
+        size_t end = 0;              // ClientHello собран и кончается здесь (0 — ещё нет)
         int segs = 0;
     };
-    std::map<std::string, Pending> pend_;   // ключ — направление потока
+    // ключ — направление потока; SYN забываем, когда поток собран или он не TLS
+    std::unordered_map<std::string, Syn> syn_;
+    std::unordered_map<std::string, Pending> pend_;
     static const size_t kMaxBuf = 24 * 1024;
     static const int kMaxSegs = 64;
+    static const size_t kMaxStreams = 20000;
+
+    // начало ClientHello. Средства обхода DPI (zapret/GoodbyeDPI/ByeDPI) режут его
+    // на сегменты по 1–2 байта — поэтому начало ловим и по крошечному сегменту.
+    static bool helloStart(const uint8_t* d, size_t n) {
+        return d[0] == 0x16 && (n < 2 || d[1] == 0x03) && (n < 6 || d[5] == 0x01);
+    }
+    // ClientHello из собранного подряд от байта 0 (1/0/-1 — как tlsCollectHello)
+    static int collect(const Pending& pd, std::vector<uint8_t>& hs, size_t* end = nullptr) {
+        size_t n = 0;
+        while (n < pd.have.size() && pd.have[n]) n++;
+        return tlsCollectHello(std::vector<uint8_t>(pd.buf.begin(), pd.buf.begin() + n), hs, end);
+    }
 
     // записать SNI из того, что собрано (в т.ч. частично — parseTlsSni
     // терпит обрыв, и имя часто уже есть в собранной части)
-    // JA4 — только если ClientHello собран целиком
+    // JA4 — только если ClientHello собран целиком. Пишем пакету с байтом 0, если
+    // его байты в сборке целы: с байта 0 начинается и фейк с тем же seq (GoodbyeDPI
+    // --wrong-chksum), а настоящий ClientHello ложится поверх. Неполный или битый
+    // ClientHello записанного раньше не стирает.
     static void apply(std::vector<Packet>& out, const Pending& pd) {
-        if (pd.idx >= out.size()) return;
-        std::vector<uint8_t> hs;
-        int st = tlsCollectHello(pd.buf, hs);
+        if (pd.idx >= out.size() || pd.head.size() > pd.buf.size() ||
+            !std::equal(pd.head.begin(), pd.head.end(), pd.buf.begin()))
+            return;
         Packet& pk = out[pd.idx];
-        if (pk.sni.empty()) {
-            std::string sni = sniFromHello(hs);
-            if (!sni.empty()) pk.sni = sni;
+        // ClientHello целиком в этом сегменте — его уже разобрал parseFrame
+        if (pd.end && pd.head.size() >= pd.end && !pk.ja4.empty()) return;
+        std::vector<uint8_t> hs;
+        int st = collect(pd, hs);
+        std::string sni = sniFromHello(hs);
+        if (!sni.empty()) pk.sni = sni;
+        std::string ja4, client;
+        int kind = 0;
+        bool ech = false;
+        if (st == 1 && ja4FromHello(hs.data(), hs.size(), 't', ja4, client, kind, &ech)) {
+            pk.ja4 = ja4; pk.tlsClient = client; pk.ja4Kind = kind; pk.ech = ech;
         }
-        if (st == 1 && pk.ja4.empty())
-            ja4FromHello(hs.data(), hs.size(), 't', pk.ja4, pk.tlsClient, pk.ja4Kind, &pk.ech);
+    }
+    // сборка закончена: дописать, что собрано, и больше этот поток не смотреть
+    void finish(std::vector<Packet>& out, std::unordered_map<std::string, Pending>::iterator it) {
+        apply(out, it->second);
+        syn_.erase(it->first);
+        pend_.erase(it);
     }
 
 public:
     // вызывать сразу после out.push_back(pk) с payload этого TCP-сегмента
+    // (и для SYN без данных: по нему видно, где начинается поток)
     void feed(std::vector<Packet>& out, const uint8_t* pay, size_t n) {
-        if (out.empty() || !pay || n == 0) return;
+        if (out.empty()) return;
         const size_t idx = out.size() - 1;
-        const Packet& pk = out[idx];
+        Packet& pk = out[idx];
         if (pk.proto != "TCP" || pk.seqStart < 0) return;
-        const uint32_t seq = (uint32_t)pk.seqStart;
+        const bool syn = pk.flags.find('S') != std::string::npos;
+        if (!syn && (!pay || n == 0)) return;
+        if (syn && pk.flags.find('.') != std::string::npos) return;   // SYN-ACK: поток сервера
+        uint32_t seq = (uint32_t)pk.seqStart;
         std::string key = pk.srcIp + " " + std::to_string(pk.srcPort) + ">" +
                           pk.dstIp + " " + std::to_string(pk.dstPort);
+        if (syn) {
+            if (syn_.size() >= kMaxStreams) syn_.clear();
+            Syn& s = syn_[key];
+            s = Syn();
+            s.isn = seq; s.ttl = pk.ttl; s.tsVal = pk.tsVal; s.md5 = pk.tcpMd5;
+            auto old = pend_.find(key);               // порт занят заново — новый поток
+            if (old != pend_.end()) { apply(out, old->second); pend_.erase(old); }
+            if (!pay || n == 0) return;
+            seq++;                                    // данные в SYN (TFO) — с ISN+1
+        }
+        auto sy = syn_.find(key);
+        Syn* sn = sy != syn_.end() ? &sy->second : nullptr;
+        // Фейки обходчиков DPI (zapret) в сборку не берём: TTL меньше, чем у SYN
+        // (fooling=ttl), TSval из прошлого (ts), опция MD5 (md5sig), данные без ACK
+        // (datanoack). Разобранный с них самих SNI остаётся — настоящий выбирает
+        // анализ (buildTcpConnTable)
+        if (sn && ((sn->ttl >= 0 && pk.ttl >= 0 && pk.ttl < sn->ttl) ||
+                   (sn->tsVal >= 0 && pk.tsVal >= 0 &&
+                    (int32_t)((uint32_t)pk.tsVal - (uint32_t)sn->tsVal) < 0) ||
+                   (pk.tcpMd5 && !sn->md5) || (!syn && pk.flags.find('.') == std::string::npos)))
+            return;
 
         auto it = pend_.find(key);
-        if (it != pend_.end()) {
-            Pending& pd = it->second;
-            int32_t diff = (int32_t)(seq - pd.nextSeq);
-            if (diff <= 0) {
-                // продолжение; перекрытие (ретрансмит) отрезаем
-                size_t skip = (size_t)(-(int64_t)diff);
-                if (skip < n) {
-                    pd.buf.insert(pd.buf.end(), pay + skip, pay + n);
-                    pd.nextSeq += (uint32_t)(n - skip);
-                }
-                pd.segs++;
-                std::vector<uint8_t> hs;
-                int st = tlsCollectHello(pd.buf, hs);
-                if (st != 0 || pd.buf.size() > kMaxBuf || pd.segs > kMaxSegs) {
-                    apply(out, pd);
-                    pend_.erase(it);
-                }
-                return;
-            }
-            // дырка (сегмент потерян при съёме) — берём, что успели собрать
-            apply(out, pd);
-            pend_.erase(it);
+        const uint32_t base = it != pend_.end() ? it->second.base : sn ? sn->isn + 1 : seq;
+        const int32_t d = (int32_t)(seq - base);
+        size_t skip = 0, off = 0;
+        if (d < 0) {
+            // весь сегмент до начала потока — фейк (GoodbyeDPI --wrong-seq, zapret badseq)
+            if ((int64_t)n <= -(int64_t)d) return;
+            skip = (size_t)(-(int64_t)d);
+            // начало потока внутри сегмента, перед ним — чужие байты (zapret seqovl:
+            // фейковый ClientHello «поверх» ещё не отправленного). SNI и JA4,
+            // разобранные с начала сегмента, — фейка
+            if (sn) { pk.sni.clear(); pk.ja4.clear(); pk.tlsClient.clear(); pk.ja4Kind = 0; pk.ech = false; }
+        } else {
+            off = (size_t)d;
         }
-
-        // начало нового ClientHello, которого не хватило одного сегмента?
-        // (SNI бывает уже в первом сегменте, а для JA4 нужен ClientHello целиком)
-        // Средства обхода DPI (zapret/GoodbyeDPI/ByeDPI) режут ClientHello
-        // на сегменты по 1–2 байта — поэтому начало ловим и по крошечному сегменту.
-        if (!pk.sni.empty() && !pk.ja4.empty()) return;
-        if (pay[0] != 0x16 || (n > 1 && pay[1] != 0x03) || (n > 5 && pay[5] != 0x01)) return;
-        Pending pd;
-        pd.idx = idx;
-        pd.nextSeq = seq + (uint32_t)n;
-        pd.buf.assign(pay, pay + n);
-        pd.segs = 1;
-        std::vector<uint8_t> hs;
-        int st = tlsCollectHello(pd.buf, hs);
-        if (st < 0) return;
-        if (st == 1) { apply(out, pd); return; }   // несколько записей в одном сегменте
-        pend_[key] = std::move(pd);
+        const uint8_t* q = pay + skip;
+        const size_t room = off < kMaxBuf ? kMaxBuf - off : 0;
+        const size_t qn = std::min(n - skip, room);
+        if (off == 0 && !helloStart(q, qn)) {
+            // байт 0 — не ClientHello: поток не TLS, больше не смотрим. После начала
+            // ClientHello это фейк из нулей с тем же seq (zapret fakedsplit) — пропускаем
+            if (it == pend_.end() || it->second.idx == SIZE_MAX) {
+                if (sn) syn_.erase(sy);
+                if (it != pend_.end()) pend_.erase(it);
+            }
+            return;
+        }
+        if (it == pend_.end()) {
+            // без SYN поток открывает только начало ClientHello; с SYN — и часть,
+            // пришедшая раньше начала (disorder)
+            if (off >= kMaxBuf || (off > 0 && !sn)) return;
+            if (pend_.size() >= kMaxStreams) flush(out);   // брошенные сборки
+            Pending np;
+            np.base = base;
+            it = pend_.emplace(key, std::move(np)).first;
+        }
+        Pending& pd = it->second;
+        // за собранным ClientHello пошли следующие данные (или поток слишком длинный)
+        if ((pd.end && off >= pd.end) || off >= kMaxBuf) { finish(out, it); return; }
+        if (pd.buf.size() < off + qn) { pd.buf.resize(off + qn); pd.have.resize(off + qn); }
+        bool changed = off == 0;
+        for (size_t i = 0; i < qn; i++) {
+            if (!pd.have[off + i] || pd.buf[off + i] != q[i]) changed = true;
+            pd.buf[off + i] = q[i];
+            pd.have[off + i] = 1;
+        }
+        if (off == 0) { pd.idx = idx; pd.head.assign(q, q + qn); }
+        if (changed) {
+            std::vector<uint8_t> hs;
+            size_t end = 0;
+            const int st = collect(pd, hs, &end);
+            pd.end = st == 1 ? end : 0;
+            if (pd.end) apply(out, pd);
+            // не ClientHello. С SYN это бывает и временно — фейк поверх заголовка
+            // записи, настоящие байты ещё придут; без SYN сборка на этом кончена
+            if (st < 0 && !sn) { finish(out, it); return; }
+        }
+        if (++pd.segs > kMaxSegs || n - skip > qn) finish(out, it);
     }
 
     // конец файла: дописать SNI по незавершённым сборкам
@@ -2187,6 +2362,51 @@ std::string siblingDumpPath(const std::string& path) {
     return f ? cand : std::string();
 }
 
+// tcpdump без -S печатает номера TCP от начала беседы, а первый пакет беседы с
+// флагом ACK — абсолютными: с него счёт и начинается (print-tcp.c). Обычно это
+// SYN-ACK, но у соединения, начатого до записи, — пакет с данными:
+// «seq 1000000000:1000020272, ack 3000000000», а за ним «seq 20272:21720, ack 1».
+// Из-за скачка номеров в миллиарды buildTcpConnTable принимал все дальнейшие
+// данные за повторы (ложная «заморозка 16 КБ»), а отчёт — за перестановки.
+// Переводим такой пакет в относительные номера, как посчитал бы сам tcpdump:
+// seq — от него самого, ack — 1. Дамп с -S (все номера абсолютные) узнаём по
+// следующему пакету беседы: его номера ближе к абсолютным первого — не трогаем.
+static void fixFirstAbsoluteSeq(std::vector<Packet>& pk) {
+    std::unordered_map<std::string, size_t> first;   // беседа -> её первый пакет (ждёт проверки)
+    const size_t kDone = SIZE_MAX;                     // проверять нечего
+    auto dist = [](long long a, long long b) {         // расстояние по модулю 2^32
+        return std::llabs((long long)(int32_t)((uint32_t)a - (uint32_t)b));
+    };
+    for (size_t i = 0; i < pk.size(); i++) {
+        Packet& p = pk[i];
+        // без ACK tcpdump номера не пересчитывает — такие пакеты не в счёт
+        if (p.proto != "TCP" || p.flags.find('.') == std::string::npos) continue;
+        const std::string a = p.srcIp + "|" + std::to_string(p.srcPort);
+        const std::string b = p.dstIp + "|" + std::to_string(p.dstPort);
+        auto ins = first.emplace(a < b ? a + "#" + b : b + "#" + a, i);
+        size_t& fi = ins.first->second;
+        if (p.flags.find('S') != std::string::npos) { fi = kDone; continue; }  // SYN-ACK — начало счёта
+        if (ins.second || fi == kDone) continue;
+        Packet& f = pk[fi];
+        const bool same = p.srcIp == f.srcIp && p.srcPort == f.srcPort;
+        // номера стороны первого пакета: seq её пакетов и ack встречных; другой — наоборот
+        const long long x = same ? p.seqStart : p.ack, y = same ? p.ack : p.seqStart;
+        int rel = 0;   // 1 — дальше номера относительные, -1 — абсолютные
+        if (x >= 0 && f.seqStart >= 0) rel = dist(x, 0) < dist(x, f.seqStart) ? 1 : -1;
+        else if (y >= 0 && f.ack >= 0) rel = dist(y, 1) < dist(y, f.ack) ? 1 : -1;
+        if (!rel) continue;            // сравнить не с чем — ждём следующий пакет беседы
+        if (rel > 0) {
+            if (f.seqStart >= 0 && f.seq >= 0) {
+                f.seq = (uint32_t)(f.seq - f.seqStart);
+                f.seqStart = 0;
+            }
+            if (f.ack >= 0) f.ack = 1;
+            f.seqRelFixed = true;
+        }
+        fi = kDone;
+    }
+}
+
 // Загрузка ОДНОГО файла дампа: бинарный pcap либо текстовый вывод tcpdump.
 // fmt — распознанный формат (для печати). false + err — файл прочитать не вышло.
 static bool loadDumpFile(const std::string& path, std::vector<Packet>& out,
@@ -2270,6 +2490,7 @@ static bool loadDumpFile(const std::string& path, std::vector<Packet>& out,
         Packet p = parseLine(r);
         if (p.valid) out.push_back(std::move(p));
     }
+    fixFirstAbsoluteSeq(out);
     return true;
 }
 
@@ -2599,6 +2820,9 @@ bool loadDumpSet(const std::vector<std::string>& paths,
         // Слабые сигнатуры (SOCKS, Telnet, опкод OpenVPN) — только из ПЕРВОГО
         // пакета с данными своей стороны: в середине потока такие байты
         // встречаются случайно (напр. короткий заголовок QUIC 0x40/0x50).
+        // Но если дамп начат посреди QUIC-соединения, первыми и окажутся
+        // короткие заголовки — поэтому OpenVPN по UDP требует ещё управляющий
+        // пакет (P_CONTROL_V1/P_ACK_V1) с тем же session id, что у сброса его стороны.
         std::unordered_map<std::string, int> ids;
         for (const auto& p : packets)
             if (p.l7 != L7_NONE) ids.emplace(p.proto + flowKey(p), (int)ids.size());
@@ -2608,10 +2832,14 @@ bool loadDumpSet(const std::vector<std::string>& paths,
                 std::string srcA;                       // сторона первого пакета с данными
                 bool seenA = false, seenB = false;
                 uint8_t firstA = L7_NONE, firstB = L7_NONE;
+                uint64_t sidA = 0, sidB = 0;            // session id OpenVPN в первом пакете стороны
+                bool udp = false, ovpnCtrl = false;     // ovpnCtrl — управляющий пакет той же сессии
             };
-            auto weak = [](uint8_t c) {
-                return c == L7_SOCKS5 || c == L7_SOCKS4 || c == L7_TELNET ||
-                       c == L7_OVPN_CLIENT || c == L7_OVPN_SERVER;
+            auto isOvpn = [](uint8_t c) {
+                return c == L7_OVPN_CLIENT || c == L7_OVPN_SERVER || c == L7_OVPN_CTRL;
+            };
+            auto weak = [&](uint8_t c) {
+                return c == L7_SOCKS5 || c == L7_SOCKS4 || c == L7_TELNET || isOvpn(c);
             };
             std::vector<Acc> acc(ids.size());
             std::vector<int> fid(packets.size(), -1);
@@ -2628,16 +2856,24 @@ bool loadDumpSet(const std::vector<std::string>& paths,
                 const bool first = sideA ? !a.seenA : !a.seenB;
                 (sideA ? a.seenA : a.seenB) = true;
                 const uint8_t c = p.l7;
-                if (first) (sideA ? a.firstA : a.firstB) = c;
+                if (p.proto == "UDP") a.udp = true;
+                if (first) {
+                    (sideA ? a.firstA : a.firstB) = c;
+                    (sideA ? a.sidA : a.sidB) = p.ovpnSid;
+                } else if (c == L7_OVPN_CTRL && p.ovpnSid != 0 &&
+                           p.ovpnSid == (sideA ? a.sidA : a.sidB)) {
+                    a.ovpnCtrl = true;
+                }
                 if (c == L7_NONE || a.code != L7_NONE) continue;
-                if (c == L7_OVPN_CLIENT || c == L7_OVPN_SERVER) continue;
+                if (isOvpn(c)) continue;
                 if (weak(c) && !first) continue;
                 a.code = c;
             }
             for (Acc& a : acc) {
                 const bool vpn = (a.firstA == L7_OVPN_CLIENT && a.firstB == L7_OVPN_SERVER) ||
                                  (a.firstA == L7_OVPN_SERVER && a.firstB == L7_OVPN_CLIENT);
-                if (vpn) a.code = L7_OPENVPN;
+                // по TCP сброс и так сверен с длиной в 2-байтном префиксе
+                if (vpn && (!a.udp || a.ovpnCtrl)) a.code = L7_OPENVPN;
             }
             for (size_t i = 0; i < packets.size(); i++)
                 if (fid[i] >= 0) packets[i].l7 = acc[(size_t)fid[i]].code;
@@ -2704,7 +2940,49 @@ bool loadDumpSet(const std::vector<std::string>& paths,
             std::string ip;
             long long best = top(freq, ip);
             // принимаем, только если адрес реально доминирует (>= 50% пакетов)
-            if (n == 0 || best < n * 0.5) ip.clear();
+            if (n == 0 || best < n * 0.5) { ip.clear(); return ip; }
+            // Ничья: дамп снят с фильтром на один адрес («host X» во встроенном
+            // захвате, экспорт Wireshark по ip.addr) — и абонент, и сервер есть
+            // в каждом пакете. Алфавитный порядок std::map тут ничего не значит:
+            // абонент — кто начинает (SYN без ACK, DNS-запрос, ClientHello,
+            // рукопожатие WireGuard), затем — сторона с эфемерным портом против
+            // общеизвестного, затем — приватный адрес.
+            std::vector<std::string> tied;
+            for (auto& kv : freq) if (kv.second == best) tied.push_back(kv.first);
+            if (tied.size() < 2) return ip;
+            std::map<std::string, long long> init, eph;
+            for (auto& p : packets) {
+                if ((p.srcIp.find(':') != std::string::npos) != v6) continue;
+                const bool syn = p.proto == "TCP" && p.flags.find('S') != std::string::npos &&
+                                 p.flags.find('.') == std::string::npos;
+                const bool dnsQuery = !p.dnsId.empty() && !p.dnsIsResponse && p.dstPort == 53;
+                if (syn || dnsQuery || !p.sni.empty() || p.wgType == 1) init[p.srcIp]++;
+                if (p.srcPort >= 1024 && p.dstPort >= 0 && p.dstPort < 1024) eph[p.srcIp]++;
+                else if (p.dstPort >= 1024 && p.srcPort >= 0 && p.srcPort < 1024) eph[p.dstIp]++;
+            }
+            // признаки по очереди: > 0 — a больше похож на абонента, чем b
+            auto cmp = [&](const std::string& a, const std::string& b) -> int {
+                if (init[a] != init[b]) return init[a] > init[b] ? 1 : -1;
+                if (eph[a] != eph[b]) return eph[a] > eph[b] ? 1 : -1;
+                return (int)isPrivateIp(a) - (int)isPrivateIp(b);
+            };
+            ip = tied[0];
+            bool unique = true;
+            for (size_t k = 1; k < tied.size(); k++) {
+                const int r = cmp(tied[k], ip);
+                if (r > 0) { ip = tied[k]; unique = true; }
+                else if (r == 0) unique = false;
+            }
+            if (!unique) {
+                std::string all;
+                for (size_t k = 0; k < tied.size(); k++)
+                    all += (k == 0 ? "" : k + 1 == tied.size() ? " и " : ", ") + tied[k];
+                std::cout << C::YEL << "Внимание: адрес абонента не определён однозначно — "
+                          << all << " есть в каждом пакете (дамп снят с фильтром на один "
+                             "адрес?), а признаков, кто из них абонент, нет. Взят " << ip
+                          << "; если абонент другой, входящие и исходящие в отчёте "
+                             "перепутаны — снимите дамп без фильтра по адресу." << C::RST << "\n";
+            }
             return ip;
         };
         bool rev4 = false, rev6 = false;
