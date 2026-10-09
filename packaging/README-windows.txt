@@ -35,5 +35,10 @@ TrafficAnalyzer — анализатор дампов трафика для те
   а при проверках DNS (режимы 11 и 13) — в DoH Google и Cloudflare и в
   публичные DNS (8.8.8.8, 1.1.1.1, 9.9.9.9 и др.).
 
+Лицензия
+  TrafficAnalyzer распространяется под GNU GPL версии 3 или (по вашему
+  выбору) любой более поздней версии, без каких-либо гарантий; текст —
+  в LICENSE.txt. Исходный код: https://github.com/xRR-debug/traffic-analyzer
+
 Сторонние компоненты
   Dear ImGui — лицензия MIT, см. LICENSE-imgui.txt.

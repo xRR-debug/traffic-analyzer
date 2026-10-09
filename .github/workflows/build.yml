@@ -96,6 +96,7 @@ jobs:
           New-Item -ItemType Directory -Force $d | Out-Null
           Copy-Item x64/Release/TrafficAnalyzer.exe, analyzer.ini.example -Destination $d
           Copy-Item packaging/README-windows.txt -Destination "$d/README.txt"
+          Copy-Item LICENSE -Destination "$d/LICENSE.txt"
           Copy-Item gui/imgui/LICENSE.txt -Destination "$d/LICENSE-imgui.txt"
           Compress-Archive -Path $d -DestinationPath dist/TrafficAnalyzer-windows-x64.zip
 
@@ -160,6 +161,7 @@ jobs:
           mkdir -p "$d"
           cp build/TrafficAnalyzer build/anime_bg.jpg build/analyzer.ini.example "$d/"
           cp packaging/README-macos.txt "$d/README.txt"
+          cp LICENSE "$d/LICENSE.txt"
           cp gui/imgui/LICENSE.txt "$d/LICENSE-imgui.txt"
           cp build/_deps/glfw-src/LICENSE.md "$d/LICENSE-glfw.txt"
           ditto -c -k --keepParent "$d" dist/TrafficAnalyzer-macos-universal.zip
