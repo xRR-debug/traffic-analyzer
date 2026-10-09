@@ -1088,10 +1088,15 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             if (!tspuBlocked.empty()) {
                 std::set<std::string> tcpIps;
                 for (const auto& kv : ttAll.conns) tcpIps.insert(kv.second.ip);
+                // туннель без ответа, а TCP к тому же VPS (SSH, панель) работает —
+                // режется UDP, это не «соединения режутся на старте»
+                std::set<std::string> tunIps;
+                for (const auto& r : blockReasons)
+                    if (r.code == "UDP_DROP" && r.detail.rfind("QUIC:", 0) != 0) tunIps.insert(r.ip);
                 bool anyTcp = false;
                 std::string lst;
                 for (const auto& ip : tspuBlocked) {
-                    if (tcpIps.count(ip)) anyTcp = true;
+                    if (tcpIps.count(ip) && !(tunIps.count(ip) && ttAll.workedIps.count(ip))) anyTcp = true;
                     if (!lst.empty()) lst += ", ";
                     lst += ip;
                 }

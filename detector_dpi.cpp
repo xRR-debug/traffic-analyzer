@@ -1900,6 +1900,7 @@ std::vector<BlockReason> collectBlockReasons(
         if (p.quic || rport == 443) u.quic = true;
         if (u.sni.empty() && !p.sni.empty()) u.sni = p.sni;
     }
+    std::set<std::string> tunnelDrop;       // имена с UDP_DROP туннеля (не QUIC)
     if (inbound) {
         for (const auto& kv : uc) {
             const U& u = kv.second;
@@ -1913,6 +1914,7 @@ std::vector<BlockReason> collectBlockReasons(
                     snprintf(b, sizeof(b), "%s: %lld пакетов за %.0f с, ответов %lld",
                              u.kind, u.out, (u.t1 - u.t0) / 1e6, u.in);
                 put(name, kv.first, "UDP_DROP", b);
+                tunnelDrop.insert(name);
             } else if (u.in == 0 && u.quic && !u.kind && u.out >= 3 && tt.tEnd - u.t0 >= cfg().tailUs &&
                        !worked.count(name)) {
                 snprintf(b, sizeof(b), "QUIC: %lld датаграмм, ответов 0 (по TCP не открылось)", u.out);
@@ -1950,9 +1952,13 @@ std::vector<BlockReason> collectBlockReasons(
         // соседний домен открывается, а заблокированный по SNI — нет
         // Не-блокировки (blockReasonIsBlock) — тоже: TCP к тому же серверу (вход
         // в игру) работает, а игровой UDP глохнет; при mTLS сервер отвечает, но
-        // без сертификата клиента не обслуживает
+        // без сертификата клиента не обслуживает.
+        // UDP_DROP туннеля рабочий TCP к тому же серверу (SSH, панель, VLESS на том
+        // же VPS) не гасит: режется протокол, а не адрес — как «ТСПУ?» в таблице
+        // (collectTspuBlockedIps) и журнал UDP. Гасится только QUIC: браузер ушёл на TCP
+        const bool tunnel = a.code == "UDP_DROP" && tunnelDrop.count(kv.first);
         const bool ipLevel = a.code == "SYN_DROP" || a.code == "UDP_DROP";
-        if ((worked.count(kv.first) || (ipLevel && workedIp.count(a.ip))) &&
+        if (!tunnel && (worked.count(kv.first) || (ipLevel && workedIp.count(a.ip))) &&
             a.code != "HTTP_STUB" && a.code != "TCP16" && blockReasonIsBlock(a.code))
             continue;
         BlockReason r; r.target = kv.first; r.ip = a.ip; r.code = a.code; r.detail = a.detail; r.conns = a.n;
