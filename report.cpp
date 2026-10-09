@@ -605,8 +605,14 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
     // для итогового вывода — только внешние адреса: роутер/LAN часто не
     // принимают TCP на служебных портах, это не блокировка (как DOWN в таблице)
     long long synNoReplyExt = 0;
+    // Повторы SYN у внешних соединений, так и не получивших ответа (ни SYN-ACK,
+    // ни RST), — для hardBlock. Повтор, после которого соединение встало, —
+    // потеря первого SYN (someLoss), а не недоступность: на крупном дампе с
+    // шумного Wi-Fi пяток таких повторов — обычное дело (как synRetrProblem).
+    long long synRetrFail = 0;
     for (auto& kv : conns) {
         const Conn& c = kv.second;
+        if (c.synack == 0 && c.rstRem == 0 && !isPrivateIp(c.remoteIp)) synRetrFail += c.synRetrans;
         // RST с удалённой стороны в ответ на SYN — тоже ответ (порт закрыт), а не
         // «нет ответа»: такие соединения считает sumRstEarly со своим порогом 4
         // (одиночный RST — норм. закрытый порт), как и режим 10 (!c.inRst)
@@ -1219,8 +1225,17 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
 
         // SYN-ретрансмиссии — клиент повторяет SYN, соединение не начинается.
         // 1–2 повтора — единичная потеря пакета на старте, не проблема (порог
-        // тот же, что у вердикта по адресу: synRetrProblem).
-        if (totalSynRetr >= 3) {
+        // тот же, что у вердикта по адресу: synRetrProblem). Если на все эти
+        // соединения ответ в итоге пришёл (synRetrFail == 0) — это потери на
+        // старте, а не недоступность (как hardBlock в ВЫВОДе).
+        if (totalSynRetr >= 3 && synRetrFail == 0) {
+            char b[512];
+            snprintf(b, sizeof(b),
+                "%lld повторов SYN, но на все эти соединения сервер в итоге ответил — "
+                "первые SYN терялись по пути: потери на старте, а не блокировка.",
+                totalSynRetr);
+            say(C::YEL, b);
+        } else if (totalSynRetr >= 3) {
             char b[512];
             snprintf(b, sizeof(b),
                 "%lld повторов SYN (клиент пересылал SYN) — соединение не "
@@ -1649,7 +1664,9 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             // hardBlock — действительно серьёзные признаки: SYN без ответа,
             // МНОГО ранних RST (одиночный RST = норм. закрытие/закрытый порт),
             // прямой DPI или упорные повторы SYN. Одиночный RST больше не триггер.
-            bool hardBlock = (synNoReplyExt > 0 || sumRstEarly >= 4 || dpiDetected || totalSynRetr >= 5);
+            // Повторы SYN — только у соединений, так и не получивших ответа
+            // (synRetrFail): успешные повторы — потери на старте, они в someLoss.
+            bool hardBlock = (synNoReplyExt > 0 || sumRstEarly >= 4 || dpiDetected || synRetrFail >= 5);
             // тяжёлые потери — высокая ДОЛЯ при умеренном объёме. На очень
             // крупных передачах (>=500 data-пакетов) высокий % обычно offload-
             // артефакт, а не потери, поэтому туда heavyLoss не распространяем
