@@ -143,15 +143,33 @@ void analyzeThroughput(const std::vector<Packet>& packets,
         size_t nb = (size_t)(dur / bw) + 1;
         std::vector<long long> bucket(nb, 0);
         long long dataPkts = 0, retr = 0;
-        std::unordered_set<long long> seen;        // начала сегментов — грубый счёт ретрансмиссий
+        // начало сегмента -> время первого прихода: повтор того же начала — грубый
+        // счёт ретрансмиссий. На загрузке оригинал мог потеряться ДО точки съёма
+        // (дамп с ПК абонента, полисер), и в дампе только повтор — с новым началом
+        // левее максимума; его, как в analyzeConnIssues, отличаем от реордеринга
+        // по времени (lostFillThrUs), иначе на загрузках «повторов ~0%» и полисер
+        // выдавался за шейпер.
+        std::map<long long, long long> seen;
+        long long maxSeq = -1;                     // наибольшее начало входящего сегмента
+        long long synT = -1, hsRtt = -1;           // RTT рукопожатия потока (база — последний SYN)
         for (size_t i = 0; i < packets.size(); i++) {
             const Packet& p = packets[i];
-            if (p.proto != f.proto || p.length <= 0 || absT[i] < 0) continue;
+            if (p.proto != f.proto || absT[i] < 0) continue;
+            // SYN / SYN-ACK без данных — только ради RTT рукопожатия загрузки
+            const bool hs = down && p.length <= 0 && f.proto == "TCP" && flagHas(p.flags, 'S');
+            if (p.length <= 0 && !hs) continue;
             bool sLoc = isLocal(p.srcIp);
-            if (sLoc == isLocal(p.dstIp) || sLoc == down) continue;   // только нужное направление
+            if (sLoc == isLocal(p.dstIp)) continue;
             const std::string& rip = sLoc ? p.dstIp : p.srcIp;
             if (rip != f.rip) continue;
             if ((sLoc ? p.dstPort : p.srcPort) != f.rport || (sLoc ? p.srcPort : p.dstPort) != f.lport) continue;
+            if (hs) {
+                const bool A = flagHas(p.flags, '.');
+                if (sLoc && !A) synT = absT[i];
+                else if (!sLoc && A && synT >= 0 && hsRtt < 0 && absT[i] >= synT) hsRtt = absT[i] - synT;
+                continue;
+            }
+            if (sLoc == down) continue;                // только нужное направление
             long long t = absT[i] - f.tFirst;
             if (t < 0) continue;
             size_t b = (size_t)(t / bw);
@@ -159,7 +177,16 @@ void analyzeThroughput(const std::vector<Packet>& packets,
             bucket[b] += p.length;
             if (f.proto == "TCP" && p.seqStart >= 0) {
                 dataPkts++;
-                if (!seen.insert(p.seqStart).second) retr++;
+                auto ins = seen.emplace(p.seqStart, absT[i]);
+                if (!ins.second) retr++;
+                else if (down && p.length > 1) {       // 1 байт — keep-alive-проба
+                    if (maxSeq < 0 || !seqBehindMax(p.seqStart, maxSeq)) maxSeq = p.seqStart;
+                    else {
+                        // время дыры — приход ближайшего сегмента правее
+                        auto nx = ins.first; ++nx;
+                        if (nx != seen.end() && absT[i] - nx->second > lostFillThrUs(hsRtt)) retr++;
+                    }
+                }
             }
         }
         double secs = bw / 1e6;
