@@ -637,6 +637,9 @@ char s_target[256] = "";
 
 // таблица соединений
 char s_flowFilter[256] = "";
+// «Показать только этот адрес»: удалённый адрес сравнивается точно, пока в строке
+// фильтра он сам (правка строки возвращает обычный поиск подстроки)
+std::string s_flowIp;
 int s_proto = 0;                 // 0 все, 1 TCP, 2 UDP, 3 прочие
 bool s_onlyProblems = false;
 std::vector<int> s_order;        // индексы ds->flows после фильтра и сортировки
@@ -1278,6 +1281,10 @@ void filterOrder(const View& v) {
     for (size_t i = 0; i < ds.flows.size(); i++) s_geo[i] = geoOf(v.ipCache.get(), ds.flows[i].remoteIp);
 
     const std::string f = lowerAscii(s_flowFilter);
+    // точно, а не подстрокой: «192.168.0.1» иначе находил и «192.168.0.100:…» —
+    // все соединения абонента, а «1.1.1.1» — и 11.1.1.1, 1.1.1.10…
+    const bool exactIp = !s_flowIp.empty() && s_flowIp == s_flowFilter;
+    if (!exactIp) s_flowIp.clear();
     s_order.clear();
     for (size_t i = 0; i < ds.flows.size(); i++) {
         const FlowRow& r = ds.flows[i];
@@ -1285,8 +1292,9 @@ void filterOrder(const View& v) {
         if (s_proto == 2 && r.proto != "UDP") continue;
         if (s_proto == 3 && (r.proto == "TCP" || r.proto == "UDP")) continue;
         if (s_onlyProblems && !r.problem && !isBlocked(s, r)) continue;
-        if (!f.empty() && r.search.find(f) == std::string::npos &&
-            lowerAscii(s_geo[i]).find(f) == std::string::npos) continue;
+        if (exactIp) { if (r.remoteIp != s_flowIp) continue; }
+        else if (!f.empty() && r.search.find(f) == std::string::npos &&
+                 lowerAscii(s_geo[i]).find(f) == std::string::npos) continue;
         s_order.push_back((int)i);
     }
 }
@@ -1527,8 +1535,11 @@ void drawFlows(const View& v) {
                 if (ImGui::MenuItem("Копировать фильтр Wireshark"))
                     ImGui::SetClipboardText(wiresharkFilter(r).c_str());
                 ImGui::Separator();
-                if (ImGui::MenuItem("Показать только этот адрес"))
+                if (ImGui::MenuItem("Показать только этот адрес")) {
                     snprintf(s_flowFilter, sizeof(s_flowFilter), "%s", r.remoteIp.c_str());
+                    s_flowIp = r.remoteIp;
+                    s_needRefilter = true;   // строка могла не измениться (тот же адрес вписан руками)
+                }
                 if (ImGui::MenuItem("Анализ блокировок по этому адресу", nullptr, false, !jobBusy())) {
                     snprintf(s_target, sizeof(s_target), "%s", r.remoteIp.c_str());
                     startConnAnalysis(r.remoteIp);
@@ -2592,6 +2603,7 @@ void guiFrame() {
         if (v.ds) s_selectTab = TAB_OVERVIEW;
         s_lastDs = v.ds;
         s_flowFilter[0] = 0;
+        s_flowIp.clear();
         s_onlyProblems = false;
         s_order.clear();
         s_geo.clear();
