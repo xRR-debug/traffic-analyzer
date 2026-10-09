@@ -801,12 +801,22 @@ void resolveIps(const std::vector<std::string>& ipsIn,
             continue; // следующий батч
         }
 
-        // делим массив на объекты по верхнеуровневым {...}
+        // делим массив на объекты по верхнеуровневым {...}. Скобки внутри строк
+        // не считаем: org/isp/as — свободный текст WHOIS, и одна непарная «}» или
+        // «{» в имени сети раньше теряла весь остаток батча (до 99 адресов).
         int depth = 0; size_t objStart = std::string::npos;
+        bool inStr = false;
         for (size_t k = 0; k < resp.size(); k++) {
             char ch = resp[k];
-            if (ch == '{') { if (depth == 0) objStart = k; depth++; }
+            if (inStr) {
+                if (ch == '\\') k++;                    // \" и \\ строку не закрывают
+                else if (ch == '"') inStr = false;
+                continue;
+            }
+            if (ch == '"') inStr = true;
+            else if (ch == '{') { if (depth == 0) objStart = k; depth++; }
             else if (ch == '}') {
+                if (depth == 0) continue;               // лишняя «}» — в минус не уходим
                 depth--;
                 if (depth == 0 && objStart != std::string::npos) {
                     std::string obj = resp.substr(objStart, k - objStart + 1);
@@ -3988,11 +3998,20 @@ void runIpOwnerFor(const std::string& input) {
         if (resp.empty() && attempt < 2) Sleep(1000);
     }
     if (!resp.empty()) {
+        // объекты батча — как в resolveIps: скобки внутри строк не считаются
         int depth = 0; size_t objStart = std::string::npos;
+        bool inStr = false;
         for (size_t k = 0; k < resp.size(); k++) {
             char ch = resp[k];
-            if (ch == '{') { if (depth == 0) objStart = k; depth++; }
+            if (inStr) {
+                if (ch == '\\') k++;                    // \" и \\ строку не закрывают
+                else if (ch == '"') inStr = false;
+                continue;
+            }
+            if (ch == '"') inStr = true;
+            else if (ch == '{') { if (depth == 0) objStart = k; depth++; }
             else if (ch == '}') {
+                if (depth == 0) continue;               // лишняя «}» — в минус не уходим
                 depth--;
                 if (depth != 0 || objStart == std::string::npos) continue;
                 std::string obj = resp.substr(objStart, k - objStart + 1);
