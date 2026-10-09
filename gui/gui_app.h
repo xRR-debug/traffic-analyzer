@@ -64,7 +64,7 @@ enum FlowState {
     FS_OK = 0,        // рукопожатие есть, данные в обе стороны
     FS_NO_ANSWER,     // SYN без ответа: ни SYN-ACK, ни RST, ни данных сервера
     FS_RST,           // удалённая сторона (или кто-то за неё) прислала RST
-    FS_ONE_WAY,       // данные только в одну сторону
+    FS_ONE_WAY,       // абонент шлёт данные, сервер — ни байта (без RST и FIN)
     FS_MIDSTREAM,     // начало соединения не попало в дамп
     FS_UDP,           // UDP/ICMP — без состояния
     FS_IN_REFUSED,    // входящий SYN, абонент не принял (RST или молчание) — чаще сканер
@@ -106,6 +106,7 @@ struct FlowRow {
     int localPort = -1, remotePort = -1;
     long long pktsOut = 0, pktsIn = 0, bytesOut = 0, bytesIn = 0;
     long long firstUs = -1, lastUs = -1;       // от начала дампа
+    long long firstOutDataUs = -1;             // первые данные абонента (>1 байта), от начала дампа
     std::string sni, ja4, tlsClient, dnsName, app;
     std::string dnsCname;                      // "fl.yoomoney.ru → fp-back.facct.ru" или пусто
     int ja4Kind = 0;

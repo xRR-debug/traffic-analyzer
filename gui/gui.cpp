@@ -708,7 +708,7 @@ ImVec4 stateColor(const FlowRow& r) {
     case FS_OK:        return kGood;
     case FS_NO_ANSWER: return r.problem ? kBad : kDim;
     case FS_RST:       return r.problem ? kBad : kWarn;
-    case FS_ONE_WAY:   return kWarn;
+    case FS_ONE_WAY:   return r.problem ? kWarn : kDim;
     default:           return r.problem ? kWarn : kDim;
     }
 }
@@ -1345,6 +1345,11 @@ void flowTooltip(const FlowRow& r, bool blocked) {
         ImGui::Text("SYN %d / SYN-ACK %d   (входящих: SYN %d / SYN-ACK %d)",
                     r.synOut, r.synAckIn, r.synIn, r.synAckOut);
         ImGui::Text("RST от сервера %d, от абонента %d;  FIN %d / %d", r.rstIn, r.rstOut, r.finIn, r.finOut);
+        if (r.state == FS_ONE_WAY)
+            ImGui::TextColored(r.problem ? kWarn : kDim, "%s", r.problem
+                ? "Абонент отправлял данные, а сервер не прислал ни байта (ни RST, ни FIN): запрос до сервера "
+                  "не дошёл или ответ отброшен по пути."
+                : "Абонент отправил данные в самом конце записи — ответ сервера мог в неё не попасть.");
     }
     if (!r.dnsCname.empty()) ImGui::Text("DNS: %s", r.dnsCname.c_str());
     if (!r.app.empty())

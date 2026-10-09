@@ -325,6 +325,9 @@ void buildFlows(Dataset& ds) {
             r.ja4 = p.ja4; r.tlsClient = p.tlsClient; r.ja4Kind = p.ja4Kind;
         }
         const long long rel = (ts[i] >= 0 && t0 >= 0) ? ts[i] - t0 : -1;
+        // первые данные абонента — как firstOutDataTime в buildTcpConnTable (>1 байта:
+        // keep-alive не в счёт)
+        if (out && p.length > 1 && rel >= 0 && r.firstOutDataUs < 0) r.firstOutDataUs = rel;
         if (srcLocal != dstLocal) {
             if (!out && rel > lastInAny) lastInAny = rel;
             if (p.proto == "UDP") us[ins.first->second].add(out, rel);
@@ -438,9 +441,13 @@ void buildFlows(Dataset& ds) {
         } else if (r.synOut == 0 && r.synIn == 0) {
             r.state = FS_MIDSTREAM;
             r.problem = r.pktsOut >= 3 && r.pktsIn == 0;
-        } else if (r.pktsIn == 0 || r.pktsOut == 0) {
+        } else if (r.bytesIn == 0 && r.finIn == 0 && r.firstOutDataUs >= 0) {
+            // рукопожатие прошло, абонент шлёт данные, а сервер — ни байта, без RST и
+            // FIN: запрос до него не дошёл или ответ отброшен по пути (OpenVPN-TCP под
+            // ТСПУ и т.п.). Как connSilentDrop в режиме 2, но на любом порту; «хвост» —
+            // от первых данных абонента: отправлены в самом конце — ответ мог не попасть
             r.state = FS_ONE_WAY;
-            r.problem = true;
+            r.problem = durUs - r.firstOutDataUs >= tail;
         } else {
             r.state = FS_OK;
         }
