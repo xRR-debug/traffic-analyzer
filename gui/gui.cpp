@@ -352,6 +352,9 @@ std::wstring s_wpPath;           // своя картинка; пусто — в
 std::wstring s_wpPending;        // загрузить в начале следующего кадра
 bool s_wpPendingSet = false;
 bool s_wpTried = false;          // сохранённую уже пробовали загрузить (не повторять каждый кадр)
+// что сейчас грузится: картинка читается в своём потоке, итог — wallpaperPoll
+enum { WPL_NONE = 0, WPL_PICKED, WPL_SAVED, WPL_BUILTIN };
+int s_wpLoad = WPL_NONE;
 float s_wpVis = 0;               // насколько видна сейчас, 0..1 (плавно)
 ImVec2 s_wpPar(0, 0);            // сглаженный параллакс от мыши
 ImVec4 s_panelBg;                // «стекло» карточек, журнала, таблицы
@@ -390,40 +393,50 @@ void actPickWallpaper() {
 }
 
 // Начало кадра: загрузка (отложенная из настроек или первая), плавность.
+// Картинка читается в своём потоке — сохранённый путь в недоступной сетевой
+// папке не подвешивает окно; пока картинки нет, интерфейс просто без фона.
 void updateWallpaper() {
     if (s_wpPendingSet) {
         s_wpPendingSet = false;
         s_wpTried = true;
-        const std::string name = s_wpPending.empty() ? std::string("встроенная") : wideName(s_wpPending);
-        std::string err;
-        if (wallpaperLoad(s_wpPending, err)) {
-            s_wpPath = s_wpPending;
-            regSetString(L"WallpaperPath", s_wpPath);
-            // выбрали свою картинку, а в этой теме она не показывается — показать
-            if (!s_wpPath.empty() && !wallpaperWanted()) {
-                s_wpMode = WP_ALWAYS;
-                regSetDword(L"WallpaperMode", (DWORD)s_wpMode);
-            }
-            logLine(C::GRN, "Картинка на фоне: " + name);
-        } else {
-            logLine(C::YEL, "Картинка «" + name + "» не загружена: " + err);
-        }
+        wallpaperLoad(s_wpPending);
+        s_wpLoad = WPL_PICKED;
     }
 
     bool want = wallpaperWanted();
     if (want && !wallpaperTex().tex && !s_wpTried) {
         s_wpTried = true;
-        std::string err;
-        if (!wallpaperLoad(s_wpPath, err)) {
-            if (s_wpPath.empty()) {
-                logLine(C::YEL, "Картинка на фоне: " + err);
+        wallpaperLoad(s_wpPath);
+        s_wpLoad = WPL_SAVED;
+    }
+
+    std::string err;
+    const int got = wallpaperPoll(err);
+    if (got != 0) {
+        const int what = s_wpLoad;
+        s_wpLoad = WPL_NONE;
+        if (what == WPL_PICKED) {
+            const std::string name = s_wpPending.empty() ? std::string("встроенная") : wideName(s_wpPending);
+            if (got > 0) {
+                s_wpPath = s_wpPending;
+                regSetString(L"WallpaperPath", s_wpPath);
+                // выбрали свою картинку, а в этой теме она не показывается — показать
+                if (!s_wpPath.empty() && !wallpaperWanted()) {
+                    s_wpMode = WP_ALWAYS;
+                    regSetDword(L"WallpaperMode", (DWORD)s_wpMode);
+                }
+                logLine(C::GRN, "Картинка на фоне: " + name);
             } else {
-                // файл переехал/удалён — путь в реестре не трогаем (может быть
-                // временно недоступная сетевая папка), показываем встроенную
-                logLine(C::YEL, "Картинка «" + wideName(s_wpPath) + "»: " + err + " — показываю встроенную");
-                std::string err2;
-                if (!wallpaperLoad(L"", err2)) logLine(C::YEL, "Встроенная картинка: " + err2);
+                logLine(C::YEL, "Картинка «" + name + "» не загружена: " + err);
             }
+        } else if (got < 0 && what == WPL_SAVED && !s_wpPath.empty()) {
+            // файл переехал/удалён — путь в реестре не трогаем (может быть
+            // временно недоступная сетевая папка), показываем встроенную
+            logLine(C::YEL, "Картинка «" + wideName(s_wpPath) + "»: " + err + " — показываю встроенную");
+            wallpaperLoad(L"");
+            s_wpLoad = WPL_BUILTIN;
+        } else if (got < 0) {
+            logLine(C::YEL, (what == WPL_BUILTIN ? "Встроенная картинка: " : "Картинка на фоне: ") + err);
         }
     }
     if (!wallpaperTex().tex) want = false;
@@ -2379,7 +2392,8 @@ void drawSettings() {
     if (ImGui::Button("Встроенная")) { s_wpPending.clear(); s_wpPendingSet = true; }
     ImGui::EndDisabled();
     ImGui::SameLine();
-    const std::string cur = !wp.tex ? std::string("ещё не загружалась")
+    const std::string cur = s_wpLoad != WPL_NONE ? std::string("загружается…")
+                          : !wp.tex ? std::string("ещё не загружалась")
                           : wp.builtin ? std::string("встроенная") : wideName(s_wpPath);
     ImGui::TextColored(kDim, "сейчас: %s", cur.c_str());
     if (!s_anim && wallpaperWanted())

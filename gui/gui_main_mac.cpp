@@ -69,10 +69,11 @@ void monitorPixels(double& w, double& h) {
     h = std::max(480.0, mode->height * (double)sy);
 }
 
-// Декодирует в RGBA 8 бит. Картинку крупнее монитора уменьшает заранее
+// Декодирует в RGBA 8 бит. Картинку крупнее монитора (monW×monH) уменьшает заранее
 // (сэмплер ImGui без мип-уровней — при сильном уменьшении на лету была бы рябь).
-bool decodeImage(const std::string& path, std::vector<unsigned char>& px, int& w, int& h,
-                 std::string& err) {
+// Зовётся из потока загрузки (см. WpJob).
+bool decodeImage(const std::string& path, double monW, double monH,
+                 std::vector<unsigned char>& px, int& w, int& h, std::string& err) {
     CFURLRef url = CFURLCreateFromFileSystemRepresentation(
         nullptr, (const UInt8*)path.data(), (CFIndex)path.size(), false);
     CGImageSourceRef src = url ? CGImageSourceCreateWithURL(url, nullptr) : nullptr;
@@ -85,8 +86,6 @@ bool decodeImage(const std::string& path, std::vector<unsigned char>& px, int& w
 
     const double sw = (double)CGImageGetWidth(img), sh = (double)CGImageGetHeight(img);
     if (sw < 1 || sh < 1) { CGImageRelease(img); err = "пустое изображение"; return false; }
-    double monW, monH;
-    monitorPixels(monW, monH);
     // «cover» на весь монитор с запасом 10% на движение
     const double k = std::max(monW / sw, monH / sh) * 1.1;
     w = (int)sw; h = (int)sh;
@@ -108,6 +107,23 @@ bool decodeImage(const std::string& path, std::vector<unsigned char>& px, int& w
     CGImageRelease(img);
     return true;
 }
+
+// Загрузка картинки — в своём потоке: файл с зависшего сетевого тома (/Volumes)
+// ImageIO ждёт до таймаута SMB, и окно всё это время «не отвечало» бы — при
+// каждом запуске, раз путь сохранён. Поток отвязан: зависшее чтение не держит ни
+// окно, ни выход из программы. Текстуру из готовых пикселей создаёт поток окна
+// (wallpaperPoll) — как в gui_main.cpp.
+struct WpJob {
+    std::wstring path;                   // как просили (пусто — встроенная)
+    std::string file;                    // что читать
+    double monW = 0, monH = 0;           // монитор — узнаём в потоке окна (GLFW)
+    std::atomic<bool> done{false};       // поля ниже готовы
+    bool ok = false;
+    std::vector<unsigned char> px;
+    int w = 0, h = 0;
+    std::string err;
+};
+std::shared_ptr<WpJob> g_wpJob;          // последний запрос; прежние, если ещё идут, забыты
 
 // Шрифт из системы, если файл есть (AddFontFromFileTTF в отладочной сборке
 // падает на assert, если файла нет). Берёт первый найденный из списка.
@@ -160,30 +176,46 @@ void guiToggleMaximize() {
 bool guiIsMaximized() { return g_win && glfwGetWindowAttrib(g_win, GLFW_MAXIMIZED); }
 void guiSetCaptionArea(float, float, float) {}
 
-bool wallpaperLoad(const std::wstring& path, std::string& err) {
-    if (!g_win) { err = "OpenGL не готов"; return false; }
+void wallpaperLoad(const std::wstring& path) {
+    auto job = std::make_shared<WpJob>();
+    job->path = path;
     // встроенная — anime_bg.jpg рядом с программой (CMake кладёт его туда)
-    const std::string file = path.empty() ? exeDirUtf8() + "anime_bg.jpg" : w2u8(path.c_str());
-    if (path.empty() && access(file.c_str(), R_OK) != 0) {
-        err = "нет файла anime_bg.jpg рядом с программой";
-        return false;
+    job->file = path.empty() ? exeDirUtf8() + "anime_bg.jpg" : w2u8(path.c_str());
+    monitorPixels(job->monW, job->monH);
+    g_wpJob = job;
+    try {
+        std::thread([job] {
+            if (job->path.empty() && access(job->file.c_str(), R_OK) != 0)
+                job->err = "нет файла anime_bg.jpg рядом с программой";
+            else
+                job->ok = decodeImage(job->file, job->monW, job->monH, job->px, job->w, job->h, job->err);
+            job->done = true;
+        }).detach();
+    } catch (const std::exception&) {
+        job->err = "не удалось запустить загрузку";
+        job->done = true;
     }
-    std::vector<unsigned char> px;
-    int w = 0, h = 0;
-    if (!decodeImage(file, px, w, h, err)) return false;
+}
+
+int wallpaperPoll(std::string& err) {
+    if (!g_wpJob || !g_wpJob->done) return 0;
+    const std::shared_ptr<WpJob> job = std::move(g_wpJob);
+    if (!job->ok) { err = job->err; return -1; }
+    if (!g_win) { err = "OpenGL не готов"; return -1; }
+    const int w = job->w, h = job->h;
 
     GLint maxTex = 0;
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTex);
     if (maxTex > 0 && (w > maxTex || h > maxTex)) {
         err = "видеокарта не приняла текстуру " + std::to_string(w) + "×" + std::to_string(h);
-        return false;
+        return -1;
     }
     // сбросить ошибки, оставшиеся от прошлых вызовов (ImGui, кадр): иначе
     // проверка ниже примет чужую ошибку за отказ в текстуре
     for (int n = 0; n < 16 && glGetError() != GL_NO_ERROR; n++) {}
     GLuint tex = 0;
     glGenTextures(1, &tex);
-    if (!tex) { err = "не удалось создать текстуру"; return false; }
+    if (!tex) { err = "не удалось создать текстуру"; return -1; }
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -191,23 +223,23 @@ bool wallpaperLoad(const std::wstring& path, std::string& err) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, job->px.data());
     glBindTexture(GL_TEXTURE_2D, 0);
     if (glGetError() != GL_NO_ERROR) {
         glDeleteTextures(1, &tex);
         err = "видеокарта не приняла текстуру " + std::to_string(w) + "×" + std::to_string(h);
-        return false;
+        return -1;
     }
 
-    // Прежнюю освобождаем сразу: gui.cpp зовёт загрузку в начале кадра, до
+    // Прежнюю освобождаем сразу: gui.cpp зовёт wallpaperPoll в начале кадра, до
     // того как старая текстура попала в списки отрисовки этого кадра.
     if (g_wpGl) glDeleteTextures(1, &g_wpGl);
     g_wpGl = tex;
     g_wp.tex = (ImTextureID)(intptr_t)tex;
     g_wp.w = w;
     g_wp.h = h;
-    g_wp.builtin = path.empty();
-    return true;
+    g_wp.builtin = job->path.empty();
+    return 1;
 }
 
 const WallpaperTex& wallpaperTex() { return g_wp; }
