@@ -1911,12 +1911,43 @@ static std::string parseServiceVersion(const std::string& banner, int port) {
     return "";
 }
 
+#ifdef _WIN32
+// Windows, получив RST в ответ на SYN, отдаёт WSAECONNREFUSED не сразу: ещё
+// дважды повторяет SYN с паузой ~0,5 с (MS KB175523), и отказ приходит позже
+// таймаута скана (800 мс). Закрытые порты выходили «filtered», а :65000 —
+// «drop — фаервол». На macOS RST сразу даёт ECONNREFUSED.
+// SIO_TCP_INITIAL_RTO (<mstcpip.h>: _WSAIOW(IOC_VENDOR,17)) убирает повторы SYN.
+// TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS (0xFE) понимают с Windows 10 1709
+// (сборка 16299); на более старых то же значение — 254 повтора, там ставим 1
+// (один повтор через ~0,5 с — отказ всё равно успевает до таймаута).
+static void tcpNoSynRetries(SOCKET s) {
+    static const UCHAR maxSyn = [] {
+        // GetVersionEx без манифеста занижает версию — спрашиваем ntdll
+        typedef LONG (WINAPI* RtlGetVersionFn)(OSVERSIONINFOW*);
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        auto fn = nt ? reinterpret_cast<RtlGetVersionFn>(GetProcAddress(nt, "RtlGetVersion")) : nullptr;
+        OSVERSIONINFOW v{}; v.dwOSVersionInfoSize = sizeof(v);
+        if (fn && fn(&v) == 0 &&
+            (v.dwMajorVersion > 10 || (v.dwMajorVersion == 10 && v.dwBuildNumber >= 16299)))
+            return (UCHAR)0xFE;
+        return (UCHAR)1;
+    }();
+    // как TCP_INITIAL_RTO_PARAMETERS; Rtt = 0xFFFF (UNSPECIFIED) — начальный RTO системный
+    struct { USHORT Rtt; UCHAR MaxSynRetransmissions; } p{ (USHORT)0xFFFF, maxSyn };
+    DWORD ret = 0;
+    WSAIoctl(s, _WSAIOW(IOC_VENDOR, 17), &p, (DWORD)sizeof(p), nullptr, 0, &ret, nullptr, nullptr);
+}
+#endif
+
 // TCP connect + опциональный баннер-граб. result: 1=open(+banner), 0=refused, -1=filtered.
 static int tcpProbeBanner(const std::string& ip, int port, int timeoutMs,
                           long long* connectMs, std::string* banner) {
     auto t0 = std::chrono::steady_clock::now();
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return -1;
+#ifdef _WIN32
+    tcpNoSynRetries(s);             // до connect: иначе RST ждёт повторов SYN
+#endif
     u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
     sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons((u_short)port);
     inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
@@ -2262,7 +2293,8 @@ void runPortScanMode() {
             printf("\n%sTCP fingerprint (распределение рукопожатия)%s\n", C::BOLD, C::RST);
             printf("  handshake медиана=%lldms мин=%lldms макс=%lldms разброс=%.1fms (%d проб, порт %d)\n",
                    med, mn, mx2, sd, (int)hs.size(), fpPort);
-            int closedBehavior = tcpProbe(ip, 65000, 600);
+            // таймаут — как у скана: на старых Windows отказ приходит через ~0,5 с
+            int closedBehavior = tcpProbe(ip, 65000, TCP_TO);
             printf("  закрытый порт :65000 — %s\n",
                    closedBehavior==0 ? "RST (refused, обычный стек)"
                    : closedBehavior<0 ? "молчит (drop — фаервол/фильтр)" : "открыт?!");
