@@ -2,6 +2,24 @@
 // причин блокировок) и режим 10 (сводка и сравнение двух дампов).
 #include "analyzer_internal.h"
 
+// Входящий сегмент с НОВЫМ для дампа началом, но левее уже принятого максимума:
+// либо переупорядочивание пути, либо повтор сегмента, потерянного ДО точки съёма
+// (дамп на ПК абонента, потеря на линии или у полисера) — оригинала в дампе нет,
+// есть только повтор. Различаем по времени от прихода сегмента, следующего за
+// дырой: повтор не приходит раньше чем через RTT (dup-ACK абонента должен дойти
+// до сервера, повтор — обратно), реордеринг пути — доли миллисекунды. Порог —
+// половина RTT соединения, но не меньше 2 мс; RTT неизвестен — 10 мс.
+static long long lostFillThrUs(long long rttUs) {
+    return rttUs > 0 ? std::max<long long>(rttUs / 2, 2000) : 10000;
+}
+// seq левее максимума, но не дальше 2^30: дальше — сменилась база нумерации
+// (новое соединение на тех же портах; как seqRebased в analyzer.cpp), и это
+// новые данные, а не реордеринг и не повтор
+static bool seqBehindMax(long long seq, long long maxSeq) {
+    const int32_t d = (int32_t)((uint32_t)seq - (uint32_t)maxSeq);
+    return d < 0 && d >= -(1 << 30);
+}
+
 // ------------------------------------------------------------------
 // СКОРОСТЬ ПОТОКОВ ВО ВРЕМЕНИ (аналог Statistics → I/O Graphs в Wireshark).
 // Для крупнейших потоков объём раскладывается по интервалам и рисуется
@@ -304,6 +322,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
         long long lastSynT = -1;                  // время ПОСЛЕДНЕГО чистого SYN (мкс) — база для SYN-RTT
         long long synRtt = -1;                    // RTT рукопожатия SYN->SYN-ACK (мкс)
         long long maxSeqIn = -1;                  // наибольший seq входящих данных (для реордеринга)
+        long long lostIn = 0;                     // входящих, потерянных ДО точки съёма (в дампе только повтор)
         // повторы ACK — по направлениям: дубли от сервера говорят о потере НАШИХ
         // сегментов, наши — о потере входящих; общий счётчик сбивался при чередовании
         long long lastAck[2] = { -1, -1 }; int ackRepeat[2] = { 0, 0 };   // [0] от абонента, [1] от сервера
@@ -342,6 +361,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
     long long lastTsUs = -1;      // время последнего пакета дампа (мкс) — граница захвата
     long long synTailSkipped = 0; // соединений, отброшенных как «SYN на самом хвосте»
     long long totalReorder = 0;   // входящих сегментов, пришедших не по порядку
+    long long totalLostIn = 0;    // входящих, потерянных до точки съёма (входят в totalRetrans)
     // RTT рукопожатия — отдельная выборка от RTT по данным (см. ниже, у SYN-ACK)
     long long synRttCnt = 0, synRttSum = 0, synRttMin = -1, synRttMax = -1;
     // потери по протоколу/порту: порт -> {ретрансмиссии, RST}
@@ -513,9 +533,24 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             // p.length > 1 отсекает keep-alive-пробы: они шлются с seq = snd.nxt-1
             // и одним мусорным байтом, то есть всегда «левее» максимума, хотя
             // никакого переупорядочивания в них нет.
+            // Новый сегмент левее максимума — это ещё и повтор сегмента, потерянного
+            // ДО точки съёма (оригинала в дампе нет): на дампе с ПК абонента так
+            // выглядят все потери на загрузке. Такой повтор — ретрансмиссия, а не
+            // реордеринг; отличаем по времени от прихода сегмента за дырой (см.
+            // lostFillThrUs), RTT — рукопожатия, иначе мин. по данным.
             if (!sLoc && isNewSeg && rkey >= 0 && p.length > 1) {
                 if (c.maxSeqIn < 0)                    c.maxSeqIn = rkey;
-                else if (seqLess(rkey, c.maxSeqIn))    totalReorder++;
+                else if (seqBehindMax(rkey, c.maxSeqIn)) {
+                    // ближайший входящий сегмент правее (ключ нечётный); чётные —
+                    // исходящие, их пропускаем, но недолго
+                    long long tHole = -1;
+                    auto nx = c.seqSeen.upper_bound(dirKey);
+                    for (int k = 0; nx != c.seqSeen.end() && k < 8; ++nx, ++k)
+                        if (nx->first & 1) { tHole = nx->second; break; }
+                    const long long rttC = (c.synRtt >= 0) ? c.synRtt : c.rttMin;
+                    if (tnow >= 0 && tHole >= 0 && tnow - tHole > lostFillThrUs(rttC)) c.lostIn++;
+                    else totalReorder++;
+                }
                 else                                   c.maxSeqIn = rkey;
             }
             // если это пакет ОТ ЛОКАЛЬНОЙ стороны — запоминаем ожидаемый ack.
@@ -599,6 +634,12 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
         for (long long gap : c.retrGaps) {
             if (gap > thr) { c.retrans++; totalRetrans++; byPort[c.remotePort].retr++; }
         }
+        // входящие, потерянные до точки съёма (в дампе только повтор), — те же
+        // ретрансмиссии: идут в LOSS по адресу, в % потерь и в вердикт
+        if (c.lostIn > 0) {
+            c.retrans += c.lostIn; totalRetrans += c.lostIn; totalLostIn += c.lostIn;
+            byPort[c.remotePort].retr += c.lostIn;
+        }
     }
 
     printf("\n=================== ДИАГНОСТИКА СОЕДИНЕНИЙ ===================\n");
@@ -630,8 +671,12 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
     printf("\n");
     printf("  RST (сбросы соединения):                 %s%lld%s\n",
            totalRst > 5 ? C::YEL : C::GRN, totalRst, C::RST);
-    printf("  Ретрансмиссии (повтор сегмента):          %s%lld%s\n",
+    printf("  Ретрансмиссии (повтор сегмента):          %s%lld%s",
            totalRetrans > 5 ? C::YEL : C::GRN, totalRetrans, C::RST);
+    if (totalLostIn > 0)
+        printf("  %s(из них %lld входящих: оригинал потерян до точки съёма, в дампе только повтор)%s",
+               C::GRY, totalLostIn, C::RST);
+    printf("\n");
     // «пропуск», а не «потеря»: дубликат ACK означает лишь дыру в последовательности,
     // а она бывает и от потери, и от переупорядочивания — что именно, показывает
     // следующая строка
@@ -1249,12 +1294,15 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
         long long dataPkts = 0;
         for (auto& kv : conns) dataPkts += (long long)kv.second.seqSeen.size() + kv.second.retrans;
         double retrRate = dataPkts > 0 ? 100.0 * sumRetr / dataPkts : 0.0;
+        // если data-пакетов много (крупная передача УСПЕШНО прошла), высокий
+        // % ретрансмиссий часто = артефакт offload (TSO/GRO/LRO) в захвате,
+        // а не реальные потери — иначе передача бы не завершилась. Входящие
+        // потери до точки съёма (totalLostIn) — не артефакт: оригинала в дампе
+        // нет вовсе, — если повторы в основном они, оговорку не делаем.
+        const bool offloadLike = (dataPkts >= 500 && totalLostIn * 2 < sumRetr);
         if (sumRetr >= 50 || retrRate >= 5.0) {
             char b[512];
-            // если data-пакетов много (крупная передача УСПЕШНО прошла), высокий
-            // % ретрансмиссий часто = артефакт offload (TSO/GRO/LRO) в захвате,
-            // а не реальные потери — иначе передача бы не завершилась.
-            if (dataPkts >= 500) {
+            if (offloadLike) {
                 snprintf(b, sizeof(b),
                     "%lld повторов сегментов (~%.1f%%) при крупной передаче (%lld "
                     "data-пакетов). На больших успешных загрузках это чаще артефакт "
@@ -1332,12 +1380,19 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             // сегмент приходит следом и терять ничего не пришлось. Одно событие
             // реордеринга даёт порядка одного-трёх дубликатов ACK, поэтому если
             // сегментов не по порядку хотя бы вдвое меньше числа дубликатов —
-            // картину объясняет реордеринг, а не потери.
-            if (totalReorder * 2 >= sumDup)
+            // картину объясняет реордеринг, а не потери. «Чинить нечего» — только
+            // если входящих потерь до точки съёма нет: иначе часть пропусков — потери.
+            if (totalReorder * 2 >= sumDup && totalLostIn == 0)
                 snprintf(b, sizeof(b),
                     "%lld дубликатов ACK при %lld сегментах не по порядку — пропуски в "
                     "потоке объясняются переупорядочиванием пути, а не потерями. "
                     "Данные доходят, чинить нечего.", sumDup, totalReorder);
+            else if (totalReorder * 2 >= sumDup)
+                snprintf(b, sizeof(b),
+                    "%lld дубликатов ACK: пропуски в потоке — частью переупорядочивание "
+                    "пути (%lld сегм.), частью потери до точки съёма (%lld сегм. пришли "
+                    "только повтором, учтены в ретрансмиссиях).",
+                    sumDup, totalReorder, totalLostIn);
             else
                 snprintf(b, sizeof(b),
                     "%lld дубликатов ACK — приёмник многократно просит потерянный "
@@ -1586,8 +1641,9 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             bool hardBlock = (synNoReplyExt > 0 || sumRstEarly >= 4 || dpiDetected || totalSynRetr >= 5);
             // тяжёлые потери — высокая ДОЛЯ при умеренном объёме. На очень
             // крупных передачах (>=500 data-пакетов) высокий % обычно offload-
-            // артефакт, а не потери, поэтому туда heavyLoss не распространяем.
-            bool heavyLoss = (dataPkts >= 100 && dataPkts < 500 && retrPct >= 10.0);
+            // артефакт, а не потери, поэтому туда heavyLoss не распространяем
+            // (кроме входящих потерь до точки съёма — см. offloadLike в Деталях).
+            bool heavyLoss = (dataPkts >= 100 && !offloadLike && retrPct >= 10.0);
             bool slowRoute = (avgRtt >= 500000);
             // одиночный повтор SYN — потеря одного пакета, не «потери» (порог 3)
             bool someLoss  = (retrPct >= 3.0 || sumDup >= 20 || sumZw >= 10 || totalSynRetr >= 3);
