@@ -2,6 +2,93 @@
 // DNS, TLS ClientHello (SNI, JA4), QUIC Initial; загрузка и склейка набора файлов.
 #include "common.h"
 
+// trim, fixPad, isPrivateIp, isLocalIp живут здесь, а не в ui.cpp/analyzer.cpp: разбор дампа
+// собирается и отдельно от программы — фаззером (fuzz/).
+
+// 10/8, 172.16/12, 192.168/16, 100.64/10, 127/8, 169.254/16, 0/8 («этот
+// хост»/0.0.0.0 — адрес-заглушка DNS-блокировок и источник DHCP Discover),
+// 224/4 multicast и 240/4 (включая broadcast 255.255.255.255).
+// IPv6: ::1, ::, fe80::/10 (link-local), fc00::/7 (ULA), ff00::/8 (multicast —
+// не публичный хост, резолвить его бессмысленно), ::ffff:a.b.c.d — по IPv4.
+bool isPrivateIp(const std::string& ip) {
+    if (ip.find(':') != std::string::npos) {
+        unsigned char a[16];
+        if (inet_pton(AF_INET6, ip.c_str(), a) != 1) return false;
+        static const unsigned char zero10[10] = {0};
+        if (memcmp(a, zero10, 10) == 0 && a[10] == 0xff && a[11] == 0xff) {
+            char v4[16];
+            snprintf(v4, sizeof(v4), "%u.%u.%u.%u", a[12], a[13], a[14], a[15]);
+            return isPrivateIp(std::string(v4));
+        }
+        bool zero15 = true;
+        for (int i = 0; i < 15; i++) if (a[i]) { zero15 = false; break; }
+        if (zero15 && a[15] <= 1) return true;                 // ::1 и ::
+        if (a[0] == 0xfe && (a[1] & 0xc0) == 0x80) return true; // fe80::/10
+        if ((a[0] & 0xfe) == 0xfc) return true;                 // fc00::/7
+        if (a[0] == 0xff) return true;                          // ff00::/8
+        return false;
+    }
+    // Разбор вручную, без sscanf: функция зовётся через isLocalIp по нескольку
+    // раз на каждый пакет в каждом анализаторе, и sscanf здесь был главным
+    // потребителем CPU на больших дампах.
+    int o[4];
+    const char* s = ip.c_str();
+    for (int k = 0; k < 4; k++) {
+        if (!isdigit((unsigned char)*s)) return false;
+        int v = 0, nd = 0;
+        while (isdigit((unsigned char)*s)) {
+            if (++nd > 3) return false;
+            v = v * 10 + (*s++ - '0');
+        }
+        if (v > 255) return false;                 // «300.1.1.1» — не адрес
+        o[k] = v;
+        if (k < 3) { if (*s != '.') return false; s++; }
+    }
+    if (*s != '\0') return false;                  // хвост после 4-го октета
+    int a = o[0], b = o[1];
+    if (a == 0) return true;
+    if (a == 10) return true;
+    if (a == 127) return true;
+    if (a == 172 && b >= 16 && b <= 31) return true;
+    if (a == 192 && b == 168) return true;
+    if (a == 100 && b >= 64 && b <= 127) return true;
+    if (a == 169 && b == 254) return true;
+    // 224/4 multicast (mDNS, SSDP, LLMNR) и 240/4 с 255.255.255.255 — не
+    // публичные хосты. Без этого SSDP/mDNS домашнего ПК считались «соединением
+    // наружу» и гасили детект «DNS работает, а соединений нет».
+    if (a >= 224) return true;
+    return false;
+}
+bool isLocalIp(const std::string& ip) {
+    return isPrivateIp(ip) || (!g_localIp.empty() && ip == g_localIp)
+                           || (!g_localIp6.empty() && ip == g_localIp6);
+}
+
+std::string trim(const std::string& s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+// tcpdump-вывод в txt разбит «дырами» из множества пробелов, которые рвут
+// числа (seq 135810<...пробелы...>9:1359521 == 1358109:1359521).
+// Убираем ТОЛЬКО длинные прогоны пробелов (>=2). Одиночные пробелы —
+// настоящие разделители — сохраняем.
+std::string fixPad(const std::string& s) {
+    std::string o; o.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        if (s[i] == ' ' || s[i] == '\t') {
+            size_t j = i;
+            while (j < s.size() && (s[j] == ' ' || s[j] == '\t')) j++;
+            if (j - i < 2) o += ' ';
+            i = j;
+        } else o += s[i++];
+    }
+    return o;
+}
+
 // Имена служб, которые tcpdump без -n печатает вместо номера порта
 // («1.2.3.4.https», «….domain»): частые и те, что смотрят детекторы.
 // Имена — из /etc/services Linux и macOS (4500 там зовётся по-разному).
@@ -986,6 +1073,24 @@ static bool parseFrame(const unsigned char* d, size_t len, int linkType,
                 }
             }
         }
+        // «случайность» payload — для мусорных пакетов AmneziaWG (awgJunkEvidence):
+        // энтропия по полубайтам (у шифра ≈4 бита) и доля нулевых байт
+        if (pk.length >= 32 && up <= d + len) {
+            const size_t un = std::min({(size_t)pk.length, (size_t)((d + len) - up), (size_t)512});
+            if (un >= 32) {
+                unsigned cnt[16] = {}, zeros = 0;
+                for (size_t i = 0; i < un; i++) {
+                    cnt[up[i] >> 4]++; cnt[up[i] & 15]++;
+                    if (!up[i]) zeros++;
+                }
+                double h = 0;
+                const double tot = 2.0 * un;
+                for (unsigned c : cnt) if (c) { const double q = c / tot; h -= q * std::log2(q); }
+                // на коротком отрезке оценка энтропии занижена — порог ниже
+                const double minH = un < 64 ? 3.65 : un < 128 ? 3.80 : 3.85;
+                pk.udpRand = (h >= minH && zeros * 100 < un * 8) ? 1 : 2;
+            }
+        }
         // DNS (порт 53) — разбираем по захваченным байтам, не выходя за кадр
         if (pk.srcPort == 53 || pk.dstPort == 53) {
             size_t avail = (up <= d + len) ? (size_t)((d + len) - up) : 0;
@@ -1394,6 +1499,19 @@ static bool ja4FromTlsRecords(const uint8_t* d, size_t n, Packet& pk) {
     return ja4FromHello(hs.data(), hs.size(), 't', pk.ja4, pk.tlsClient, pk.ja4Kind, &pk.ech);
 }
 
+#ifdef TA_FUZZ
+// Вход фаззера fuzz/fuzz_hello.cpp: те же байты — как handshake-сообщение
+// ClientHello (TCP и QUIC) и как поток TLS-записей. В программу не входит.
+void fuzzParseClientHello(const uint8_t* d, size_t n) {
+    std::string ja4, client; int kind = 0; bool ech = false;
+    ja4FromHello(d, n, 't', ja4, client, kind, &ech);
+    ja4FromHello(d, n, 'q', ja4, client, kind, &ech);
+    (void)parseTlsSni(d, n);
+    Packet pk;
+    ja4FromTlsRecords(d, n, pk);
+}
+#endif
+
 class HelloReassembler {
     // SYN абонента: где начинается поток (ISN+1) и чем помечены его настоящие пакеты
     struct Syn {
@@ -1672,6 +1790,147 @@ public:
         s.nextSeq = seq + (uint32_t)n;
         s.total = n;
         if (bytes(s, pay, n, pk)) st_.emplace(std::move(key), s);
+    }
+};
+
+// ------------------------------------------------------------------
+// TLS внутри TLS (VLESS/Trojan без XTLS Vision, VLESS-WS/gRPC поверх TLS):
+// туннель повторяет внутри внешнего TLS рукопожатие сайта, и это видно по
+// одним длинам записей. Первая порция данных клиента — внутренний ClientHello
+// (≥280 Б), ответ сервера — ServerHello…Finished (≥600 Б), а следующая запись
+// клиента — внутренний Finished: открытого текста 58 (TLS 1.3, SHA-256),
+// 64 (с CCS), 74 или 80 (SHA-384); внешняя запись длиннее на 17 (TLS 1.3),
+// 24 (TLS 1.2 GCM) или 16 (TLS 1.2 ChaCha). Перед туннелем бывает свой обмен
+// (WebSocket upgrade и ответ 101) — тогда отсчёт начинается заново, не более
+// трёх раз. Vision дополняет записи мусором — его так не видно.
+// Решение пишется в пакет с заголовком решающей записи: 2 — рисунок, 1 — нет.
+// ------------------------------------------------------------------
+class TlsInTlsTracker {
+    struct Dir {
+        uint32_t nextSeq = 0;  bool seqSet = false;
+        uint8_t rh[5] = {};  int rhHave = 0;   // заголовок записи
+        uint32_t recLeft = 0;                  // тело записи — пропускаем
+    };
+    struct Conn {
+        Dir c, s;                  // клиент → сервер, сервер → клиент
+        uint32_t chSeq = 0;        // seq внешнего ClientHello
+        int phase = 0;             // 0 внешнее рукопожатие, 1 после Finished клиента TLS 1.3,
+                                   // 2 первая порция данных клиента, 3 ответ сервера
+        int rounds = 0;            // перезапусков отсчёта
+        uint32_t c1 = 0, s1 = 0;   // открытого текста в порции клиента и в ответе сервера
+        uint32_t records = 0;
+    };
+    std::unordered_map<std::string, Conn> conns_;
+    static const size_t kMaxConns = 20000;
+    static const uint32_t kMaxRecords = 300;
+    static const uint32_t kMaxBurst = 64 * 1024;   // больше — уже передача данных
+
+    static bool innerFinished(uint32_t len) {
+        static const uint32_t over[] = {17, 24, 16};
+        for (uint32_t ov : over) {
+            if (len <= ov) continue;
+            const uint32_t pt = len - ov;
+            if (pt == 58 || pt == 64 || pt == 74 || pt == 80) return true;
+        }
+        return false;
+    }
+
+    // запись прикладных данных длиной len; false — решение принято или ждать нечего
+    static bool appRecord(Conn& k, bool fromClient, uint32_t len, Packet& pk) {
+        const uint32_t pt = len > 16 ? len - 16 : 0;   // открытый текст, грубо
+        if (!fromClient) {
+            if (k.phase < 2) return true;   // шифрованное рукопожатие сервера, NewSessionTicket
+            k.phase = 3;
+            k.s1 += pt;
+            if (k.s1 > kMaxBurst) { pk.tlsInTls = 1; return false; }
+            return true;
+        }
+        switch (k.phase) {
+        case 0:
+            // Finished внешнего TLS 1.3 (SHA-256 / SHA-384) — ещё не данные
+            if (len == 53 || len == 69) { k.phase = 1; return true; }
+            k.phase = 2; k.c1 = pt;
+            return true;
+        case 1:
+            k.phase = 2; k.c1 = pt;
+            return true;
+        case 2:
+            k.c1 += pt;
+            return k.c1 <= kMaxBurst;
+        default:
+            if (k.c1 >= 280 && k.s1 >= 600 && innerFinished(len)) { pk.tlsInTls = 2; return false; }
+            // короткий ответ сервера (101 Switching Protocols и т.п.) — туннель может начаться дальше
+            if (k.s1 < 600 && ++k.rounds <= 3) { k.phase = 2; k.c1 = pt; k.s1 = 0; return true; }
+            pk.tlsInTls = 1;
+            return false;
+        }
+    }
+
+    // false — поток бросаем (решение принято, мусор вместо записи, слишком длинно)
+    static bool walk(Conn& k, Dir& d, bool fromClient, const uint8_t* p, size_t n, Packet& pk) {
+        while (n > 0) {
+            if (d.recLeft > 0) {
+                const size_t m = std::min<size_t>(d.recLeft, n);
+                d.recLeft -= (uint32_t)m; p += m; n -= m;
+                continue;
+            }
+            d.rh[d.rhHave++] = *p++; n--;
+            if (d.rhHave < 5) continue;
+            d.rhHave = 0;
+            const uint8_t type = d.rh[0];
+            const uint32_t len = ((uint32_t)d.rh[3] << 8) | d.rh[4];
+            if (type < 20 || type > 23 || d.rh[1] != 3 || len == 0 || len > 18432) return false;
+            if (++k.records > kMaxRecords) return false;
+            d.recLeft = len;
+            if (type == 23 && !appRecord(k, fromClient, len, pk)) return false;
+        }
+        return true;
+    }
+
+public:
+    // вызывать сразу после out.push_back(pk) с payload этого TCP-сегмента
+    void feed(std::vector<Packet>& out, const uint8_t* pay, size_t n) {
+        if (out.empty() || !pay || n == 0) return;
+        Packet& pk = out.back();
+        if (pk.proto != "TCP" || pk.seqStart < 0) return;
+        const bool ch = n >= 6 && pay[0] == 0x16 && pay[1] == 0x03 && pay[5] == 0x01;
+        if (conns_.empty() && !ch) return;
+        const uint32_t seq = (uint32_t)pk.seqStart;
+        const std::string a = pk.srcIp + " " + std::to_string(pk.srcPort);
+        const std::string b = pk.dstIp + " " + std::to_string(pk.dstPort);
+
+        bool fromClient = true;
+        auto it = conns_.find(a + ">" + b);
+        if (it == conns_.end()) {
+            it = conns_.find(b + ">" + a);
+            if (it != conns_.end()) fromClient = false;
+        }
+        if (it != conns_.end() && fromClient && ch && it->second.chSeq != seq) {
+            conns_.erase(it);                     // те же порты — новое соединение
+            it = conns_.end();
+        }
+        if (it == conns_.end()) {
+            if (!ch) return;
+            if (conns_.size() >= kMaxConns) conns_.clear();   // брошенные соединения
+            Conn k;
+            k.chSeq = seq;
+            k.c.nextSeq = seq; k.c.seqSet = true;
+            it = conns_.emplace(a + ">" + b, k).first;
+            fromClient = true;
+        }
+        Conn& k = it->second;
+        Dir& d = fromClient ? k.c : k.s;
+        if (!d.seqSet) {
+            // первый сегмент сервера — ServerHello; иначе начало ответа не попало в дамп
+            if (n < 5 || pay[0] != 0x16 || pay[1] != 0x03) { conns_.erase(it); return; }
+            d.nextSeq = seq; d.seqSet = true;
+        }
+        const int32_t diff = (int32_t)(seq - d.nextSeq);
+        if (diff > 0) { conns_.erase(it); return; }   // дырка — граница записей потеряна
+        const size_t skip = (size_t)(-(int64_t)diff);
+        if (skip >= n) return;                         // повтор уже разобранного
+        d.nextSeq += (uint32_t)(n - skip);
+        if (!walk(k, d, fromClient, pay + skip, n - skip, pk)) conns_.erase(it);
     }
 };
 
@@ -2209,6 +2468,7 @@ static std::vector<Packet> readPcapng(const std::vector<unsigned char>& buf,
     std::vector<IfDesc> ifaces;
     HelloReassembler hello;
     TlsHsTracker tlsHs;
+    TlsInTlsTracker tit;
     QuicHelloCollector quic;
     DnsTcpReassembler dnsTcp;
     // у SPB своего времени нет — берём время последнего EPB, чтобы пакет не
@@ -2326,6 +2586,7 @@ static std::vector<Packet> readPcapng(const std::vector<unsigned char>& buf,
                 out.push_back(std::move(pk));
                 hello.feed(out, pay, payLen);
                 tlsHs.feed(out, pay, payLen);
+                tit.feed(out, pay, payLen);
                 quic.feed(out, pay, payLen);
                 dnsTcp.feed(out, pay, payLen);
             }
@@ -2344,6 +2605,7 @@ static std::vector<Packet> readPcapng(const std::vector<unsigned char>& buf,
                 out.push_back(std::move(pk));
                 hello.feed(out, pay, payLen);
                 tlsHs.feed(out, pay, payLen);
+                tit.feed(out, pay, payLen);
                 quic.feed(out, pay, payLen);
                 dnsTcp.feed(out, pay, payLen);
             }
@@ -2355,19 +2617,10 @@ static std::vector<Packet> readPcapng(const std::vector<unsigned char>& buf,
     return out;
 }
 
-static std::vector<Packet> readPcap(const std::string& path, std::string& err) {
+// Разбор pcap/pcapng, уже прочитанного в память. Отдельно от чтения файла —
+// чтобы фаззер (fuzz/fuzz_dump.cpp) гонял ровно тот же код, что и программа.
+std::vector<Packet> parsePcapBuffer(const std::vector<unsigned char>& buf, std::string& err) {
     std::vector<Packet> out;
-    std::ifstream f(upath(path), std::ios::binary | std::ios::ate);
-    if (!f) { err = "не удалось открыть файл"; return out; }
-    // одним read вместо istreambuf_iterator (тот читает побайтно и
-    // многократно перевыделяет вектор — на сотнях МБ это секунды)
-    std::streamoff fsz = f.tellg();
-    if (fsz < 0) { err = "не удалось прочитать файл"; return out; }
-    std::vector<unsigned char> buf((size_t)fsz);
-    f.seekg(0, std::ios::beg);
-    if (!buf.empty() && !f.read((char*)buf.data(), (std::streamsize)buf.size())) {
-        err = "не удалось прочитать файл"; return out;
-    }
     if (buf.size() < 24) { err = "файл слишком мал для pcap"; return out; }
 
     uint32_t magic = be32(buf.data());
@@ -2391,6 +2644,7 @@ static std::vector<Packet> readPcap(const std::string& path, std::string& err) {
     size_t pos = 24; // после глобального заголовка
     HelloReassembler hello;
     TlsHsTracker tlsHs;
+    TlsInTlsTracker tit;
     QuicHelloCollector quic;
     DnsTcpReassembler dnsTcp;
     while (pos + 16 <= buf.size()) {
@@ -2410,6 +2664,7 @@ static std::vector<Packet> readPcap(const std::string& path, std::string& err) {
             out.push_back(std::move(pk));
             hello.feed(out, pay, payLen);
             tlsHs.feed(out, pay, payLen);
+            tit.feed(out, pay, payLen);
             quic.feed(out, pay, payLen);
             dnsTcp.feed(out, pay, payLen);
         }
@@ -2417,6 +2672,23 @@ static std::vector<Packet> readPcap(const std::string& path, std::string& err) {
     }
     hello.flush(out);
     return out;
+}
+
+// Весь файл в память. false + err — не открылся или не прочитался.
+static bool readWholeFile(const std::string& path, std::vector<unsigned char>& buf,
+                          std::string& err) {
+    std::ifstream f(upath(path), std::ios::binary | std::ios::ate);
+    if (!f) { err = "не удалось открыть файл"; return false; }
+    // одним read вместо istreambuf_iterator (тот читает побайтно и
+    // многократно перевыделяет вектор — на сотнях МБ это секунды)
+    std::streamoff fsz = f.tellg();
+    if (fsz < 0) { err = "не удалось прочитать файл"; return false; }
+    buf.resize((size_t)fsz);
+    f.seekg(0, std::ios::beg);
+    if (!buf.empty() && !f.read((char*)buf.data(), (std::streamsize)buf.size())) {
+        err = "не удалось прочитать файл"; return false;
+    }
+    return true;
 }
 
 // расширение файла в нижнем регистре
@@ -2529,43 +2801,16 @@ static std::string stripAnyIfPrefix(const std::string& line, int& dir) {
     return line.substr(0, t1 + 1) + line.substr(p0);
 }
 
-// Загрузка ОДНОГО файла дампа: бинарный pcap либо текстовый вывод tcpdump.
-// fmt — распознанный формат (для печати). false + err — файл прочитать не вышло.
-// warn — предупреждение о содержимом (файл прочитан, но не всё разобрано).
-static bool loadDumpFile(const std::string& path, std::vector<Packet>& out,
-                         std::string& err, std::string& fmt, std::string& warn) {
-    out.clear();
-    std::string ext = lowerExt(path);
-    bool wantPcap = (ext == "pcap" || ext == "pcapng" || ext == "cap" || ext == "dmp");
-    if (!wantPcap) {
-        // заглянем в первые 4 байта — вдруг это pcap без «правильного» расширения
-        std::ifstream pf(upath(path), std::ios::binary);
-        if (pf) {
-            unsigned char m[4] = {0};
-            pf.read((char*)m, 4);
-            uint32_t le  = ((uint32_t)m[3]<<24)|((uint32_t)m[2]<<16)|((uint32_t)m[1]<<8)|m[0];
-            uint32_t beM = ((uint32_t)m[0]<<24)|((uint32_t)m[1]<<16)|((uint32_t)m[2]<<8)|m[3];
-            if (le == 0xA1B2C3D4 || beM == 0xA1B2C3D4 ||
-                le == 0xA1B23C4D || beM == 0xA1B23C4D || beM == 0x0A0D0D0A)
-                wantPcap = true;
-        }
-    }
+// Первые 4 байта — сигнатура pcap (любой порядок байт, мкс или нс) или pcapng
+static bool isPcapMagic(const unsigned char m[4]) {
+    uint32_t le  = ((uint32_t)m[3]<<24)|((uint32_t)m[2]<<16)|((uint32_t)m[1]<<8)|m[0];
+    uint32_t beM = ((uint32_t)m[0]<<24)|((uint32_t)m[1]<<16)|((uint32_t)m[2]<<8)|m[3];
+    return le == 0xA1B2C3D4 || beM == 0xA1B2C3D4 ||
+           le == 0xA1B23C4D || beM == 0xA1B23C4D || beM == 0x0A0D0D0A;
+}
 
-    if (wantPcap) {
-        out = readPcap(path, err);
-        if (!err.empty()) return false;
-        // Определяем формат по magic: pcapng начинается с 0x0A0D0D0A (SHB)
-        std::ifstream mf(upath(path), std::ios::binary);
-        unsigned char hdr[4] = {0};
-        if (mf) mf.read((char*)hdr, 4);
-        fmt = (be32(hdr) == 0x0A0D0D0A) ? "pcapng (бинарный)" : "pcap (бинарный)";
-        return true;
-    }
-
-    std::ifstream f(upath(path), std::ios::binary);
-    if (!f) { err = "не удалось открыть файл"; return false; }
-    fmt = "текстовый дамп tcpdump";
-
+// Текстовый вывод tcpdump. warn — предупреждение о содержимом (не всё разобрано).
+static void parseTextDump(std::istream& f, std::vector<Packet>& out, std::string& warn) {
     // читаем и склеиваем разорванные строки.
     // Запись пакета начинается со штампа времени вида HH:MM:SS.xxxxxx.
     auto startsWithTime = [](const std::string& s) {
@@ -2634,6 +2879,52 @@ static bool loadDumpFile(const std::string& path, std::vector<Packet>& out,
         warn += " Снимите дамп заново с ключом -nn: tcpdump -nn …";
     }
     fixFirstAbsoluteSeq(out);
+}
+
+// Дамп из памяти: pcap/pcapng по сигнатуре, иначе текст tcpdump. Тот же
+// разбор, что у файла, — для фаззера (fuzz/fuzz_dump.cpp).
+bool parseDumpBuffer(const unsigned char* d, size_t n, std::vector<Packet>& out,
+                     std::string& err, std::string& warn) {
+    out.clear();
+    if (n >= 4 && isPcapMagic(d)) {
+        out = parsePcapBuffer(std::vector<unsigned char>(d, d + n), err);
+        return err.empty();
+    }
+    std::istringstream is(std::string((const char*)d, n));
+    parseTextDump(is, out, warn);
+    return true;
+}
+
+// Загрузка ОДНОГО файла дампа: бинарный pcap либо текстовый вывод tcpdump.
+// fmt — распознанный формат (для печати). false + err — файл прочитать не вышло.
+// warn — предупреждение о содержимом (файл прочитан, но не всё разобрано).
+static bool loadDumpFile(const std::string& path, std::vector<Packet>& out,
+                         std::string& err, std::string& fmt, std::string& warn) {
+    out.clear();
+    std::string ext = lowerExt(path);
+    bool wantPcap = (ext == "pcap" || ext == "pcapng" || ext == "cap" || ext == "dmp");
+    if (!wantPcap) {
+        // заглянем в первые 4 байта — вдруг это pcap без «правильного» расширения
+        std::ifstream pf(upath(path), std::ios::binary);
+        unsigned char m[4] = {0};
+        if (pf && pf.read((char*)m, 4)) wantPcap = isPcapMagic(m);
+    }
+
+    if (wantPcap) {
+        std::vector<unsigned char> buf;
+        if (!readWholeFile(path, buf, err)) return false;
+        out = parsePcapBuffer(buf, err);
+        if (!err.empty()) return false;
+        // формат по magic: pcapng начинается с 0x0A0D0D0A (SHB)
+        fmt = (buf.size() >= 4 && be32(buf.data()) == 0x0A0D0D0A) ? "pcapng (бинарный)"
+                                                                     : "pcap (бинарный)";
+        return true;
+    }
+
+    std::ifstream f(upath(path), std::ios::binary);
+    if (!f) { err = "не удалось открыть файл"; return false; }
+    fmt = "текстовый дамп tcpdump";
+    parseTextDump(f, out, warn);
     return true;
 }
 
@@ -2882,6 +3173,7 @@ bool loadDumpSet(const std::vector<std::string>& paths,
                     // одном поток мог прерваться дыркой, в другом — нет
                     if (!(packets[b].tlsHs & TLSHS_ALERT)) packets[b].tlsAlert = packets[a].tlsAlert;
                     packets[b].tlsHs |= packets[a].tlsHs;
+                    if (packets[a].tlsInTls > packets[b].tlsInTls) packets[b].tlsInTls = packets[a].tlsInTls;
                     break;
                 }
             }

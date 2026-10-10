@@ -3,65 +3,6 @@
 // соединений. Детекторы — detector_dpi.cpp / detector_vpn.cpp, отчёты — report.cpp.
 #include "analyzer_internal.h"
 
-// 10/8, 172.16/12, 192.168/16, 100.64/10, 127/8, 169.254/16, 0/8 («этот
-// хост»/0.0.0.0 — адрес-заглушка DNS-блокировок и источник DHCP Discover),
-// 224/4 multicast и 240/4 (включая broadcast 255.255.255.255).
-// IPv6: ::1, ::, fe80::/10 (link-local), fc00::/7 (ULA), ff00::/8 (multicast —
-// не публичный хост, резолвить его бессмысленно), ::ffff:a.b.c.d — по IPv4.
-bool isPrivateIp(const std::string& ip) {
-    if (ip.find(':') != std::string::npos) {
-        unsigned char a[16];
-        if (inet_pton(AF_INET6, ip.c_str(), a) != 1) return false;
-        static const unsigned char zero10[10] = {0};
-        if (memcmp(a, zero10, 10) == 0 && a[10] == 0xff && a[11] == 0xff) {
-            char v4[16];
-            snprintf(v4, sizeof(v4), "%u.%u.%u.%u", a[12], a[13], a[14], a[15]);
-            return isPrivateIp(std::string(v4));
-        }
-        bool zero15 = true;
-        for (int i = 0; i < 15; i++) if (a[i]) { zero15 = false; break; }
-        if (zero15 && a[15] <= 1) return true;                 // ::1 и ::
-        if (a[0] == 0xfe && (a[1] & 0xc0) == 0x80) return true; // fe80::/10
-        if ((a[0] & 0xfe) == 0xfc) return true;                 // fc00::/7
-        if (a[0] == 0xff) return true;                          // ff00::/8
-        return false;
-    }
-    // Разбор вручную, без sscanf: функция зовётся через isLocalIp по нескольку
-    // раз на каждый пакет в каждом анализаторе, и sscanf здесь был главным
-    // потребителем CPU на больших дампах.
-    int o[4];
-    const char* s = ip.c_str();
-    for (int k = 0; k < 4; k++) {
-        if (!isdigit((unsigned char)*s)) return false;
-        int v = 0, nd = 0;
-        while (isdigit((unsigned char)*s)) {
-            if (++nd > 3) return false;
-            v = v * 10 + (*s++ - '0');
-        }
-        if (v > 255) return false;                 // «300.1.1.1» — не адрес
-        o[k] = v;
-        if (k < 3) { if (*s != '.') return false; s++; }
-    }
-    if (*s != '\0') return false;                  // хвост после 4-го октета
-    int a = o[0], b = o[1];
-    if (a == 0) return true;
-    if (a == 10) return true;
-    if (a == 127) return true;
-    if (a == 172 && b >= 16 && b <= 31) return true;
-    if (a == 192 && b == 168) return true;
-    if (a == 100 && b >= 64 && b <= 127) return true;
-    if (a == 169 && b == 254) return true;
-    // 224/4 multicast (mDNS, SSDP, LLMNR) и 240/4 с 255.255.255.255 — не
-    // публичные хосты. Без этого SSDP/mDNS домашнего ПК считались «соединением
-    // наружу» и гасили детект «DNS работает, а соединений нет».
-    if (a >= 224) return true;
-    return false;
-}
-bool isLocalIp(const std::string& ip) {
-    return isPrivateIp(ip) || (!g_localIp.empty() && ip == g_localIp)
-                           || (!g_localIp6.empty() && ip == g_localIp6);
-}
-
 // ------------------------------------------------------------------
 // классификация трафика (эвристика)
 // ------------------------------------------------------------------
@@ -620,6 +561,7 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
                                    "|" + lip];
         if (c.ip.empty()) { c.ip = rip; c.rport = rport; c.lport = lport; c.lip = lip; }
         if (t >= 0) { if (c.firstTime < 0) c.firstTime = t; c.lastTime = t; }
+        if (p.tlsInTls > c.tlsInTls) c.tlsInTls = p.tlsInTls;
         bool S = flagHas(p.flags, 'S'), A = flagHas(p.flags, '.');
         bool repeat = false;   // повтор уже отправленных/принятых данных (для «заморозки»)
         if (sLoc) {

@@ -3,7 +3,9 @@
 // объявления функций, которыми модули пользуются друг у друга.
 //
 // Модули:
-//   parser.cpp   — разбор дампов (текст tcpdump, pcap/pcapng, TLS/JA4, QUIC)
+//   parser.cpp   — разбор дампов (текст tcpdump, pcap/pcapng, TLS/JA4, QUIC);
+//                  ни от чего, кроме common.h, не зависит — фаззеры fuzz/*.cpp
+//                  собираются из него одного (fuzz/build_fuzz.cmd)
 //   analyzer.cpp — ядро анализа: адреса, порты, организации, потоки, TCP-таблица
 //   detector_dpi.cpp — детекторы блокировок/DPI/ТСПУ, DNS, UDP/QUIC, «16 КБ»
 //   detector_vpn.cpp — JA4, VLESS/Reality, признаки VPN, режим 1
@@ -253,6 +255,12 @@ struct Packet {
     // рукопожатие TLS открытым текстом (TLSHS_*): что началось в этом сегменте; только pcap
     uint8_t     tlsHs = 0;
     int         tlsAlert = -1;   // код открытого TLS Alert (при TLSHS_ALERT), -1 — нет
+    // TLS внутри TLS по длинам записей (TlsInTlsTracker, только pcap): 2 — рисунок
+    // внутреннего рукопожатия (VLESS/Trojan без Vision), 1 — проверено, рисунка нет
+    uint8_t     tlsInTls = 0;
+    // UDP-payload от 32 Б по захваченным байтам (только pcap): 1 — похоже на случайные
+    // (шифр или мусор AmneziaWG), 2 — видна структура (нули, малая энтропия); 0 — не оценён
+    uint8_t     udpRand = 0;
     // DNS (из текстового tcpdump: "A? domain" / "id 1/0/0 A 1.2.3.4" / NXDomain,
     // либо из UDP-payload бинарного дампа — поля заполняются в том же виде)
     std::string dnsQuery;        // запрашиваемый домен (если это DNS-запрос)
@@ -446,11 +454,13 @@ struct DumpSummary {
 };
 // Пороги вердикта VPN (kVpnLikelyScore/kVpnPossibleScore) — в config.h.
 
-// ---- ui.cpp ----
+// ---- parser.cpp (общие строковые помощники) ----
 std::string trim(const std::string& s);
+std::string fixPad(const std::string& s);
+
+// ---- ui.cpp ----
 std::string regionName(const std::string& cc);    // "RUSSIA" (колонка REGION)
 std::string countryNameRu(const std::string& cc); // "Россия" (режим гео-RTT)
-std::string fixPad(const std::string& s);
 bool isYesAnswer(const std::string& s);
 bool readLine(std::string& s);   // строка с консоли; false — Ctrl+C или конец ввода
 bool isValidIpv4Str(const std::string& str);
@@ -486,10 +496,20 @@ std::string siblingDumpPath(const std::string& path);
 long long tsToMicros(const std::string& ts);
 bool loadDumpSet(const std::vector<std::string>& paths,
                  std::vector<Packet>& packets, std::vector<int>& origin);
-
-// ---- analyzer.cpp ----
+// pcap/pcapng из памяти; пустой результат + err — файл не разобран
+std::vector<Packet> parsePcapBuffer(const std::vector<unsigned char>& buf, std::string& err);
+// Дамп любого формата из памяти (pcap/pcapng по сигнатуре, иначе текст tcpdump).
+// Без склейки in/out и поиска локального адреса — это делает loadDumpSet.
+bool parseDumpBuffer(const unsigned char* d, size_t n, std::vector<Packet>& out,
+                     std::string& err, std::string& warn);
+#ifdef TA_FUZZ
+// фаззер: разбор ClientHello (JA4 t/q, SNI, TLS-записи) из произвольных байт
+void fuzzParseClientHello(const uint8_t* d, size_t n);
+#endif
 bool isPrivateIp(const std::string& ip);
 bool isLocalIp(const std::string& ip);
+
+// ---- analyzer.cpp ----
 const char* localRoleLabel(const std::string& ip);   // «MainIP» (абонент) / «LocalIP» (прочая лок. сеть)
 // Внешний SNI настоящего ECH (cloudflare-ech.com и т.п.). Само расширение ECH
 // в ClientHello ещё не ECH — Chrome шлёт его холостым (GREASE) всегда.

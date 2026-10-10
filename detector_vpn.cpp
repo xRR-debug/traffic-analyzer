@@ -254,8 +254,48 @@ FlowEvidence flowVpnEvidence(const TcpConnTable& tt,
             longScore = 1;
         }
     }
-    ev.onlyJa4Lib = ev.score == 0 && jaScore == 1 && longScore == 0;   // Reality не было, uTLS тоже
-    ev.score += jaScore + longScore;
+    // 4) TLS внутри TLS (TlsInTlsTracker): внутреннее рукопожатие видно по длинам
+    // записей. Хостинг не нужен — VLESS-WS через CDN рисует то же. Одно совпадение
+    // бывает и случайно (HTTP/2 с кадрами нужной длины) — это только «не ясно»;
+    // признак — от двух соединений и не меньше четверти проверенных.
+    int titScore = 0;
+    {
+        struct Tit { int checked = 0, match = 0; std::string sni; };
+        std::map<std::string, Tit> tit;
+        for (const auto& kv : tt.conns) {
+            const TcpConnState& c = kv.second;
+            if (c.tlsInTls <= 0) continue;
+            const IpInfo* ii = ipInfoOf(ipCache, c.ip);
+            if (ii && ii->vpnWhite) continue;
+            Tit& t = tit[c.ip];
+            t.checked++;
+            if (c.tlsInTls == 2) { t.match++; if (t.sni.empty()) t.sni = c.sni; }
+        }
+        std::string single;
+        for (const auto& kv : tit) {
+            const Tit& t = kv.second;
+            if (t.match == 0) continue;
+            const std::string who = kv.first + (t.sni.empty() ? "" : " (SNI " + t.sni + ")");
+            char buf[512];
+            if (t.match >= 2 && t.match * 4 >= t.checked) {
+                if (titScore) continue;
+                snprintf(buf, sizeof(buf),
+                    "TLS внутри TLS к %s: %d из %d соединений — по длинам записей видно второе "
+                    "рукопожатие TLS внутри шифрованного (VLESS/Trojan без XTLS Vision)",
+                    who.c_str(), t.match, t.checked);
+                ev.reasons.push_back(buf);
+                titScore = 2;
+            } else if (single.empty()) {
+                snprintf(buf, sizeof(buf),
+                    "Не ясно: к %s %d из %d соединений похожи на TLS внутри TLS — "
+                    "для признака мало, без баллов", who.c_str(), t.match, t.checked);
+                single = buf;
+            }
+        }
+        if (!titScore && !single.empty()) ev.reasons.push_back(single);
+    }
+    ev.onlyJa4Lib = ev.score == 0 && jaScore == 1 && longScore == 0 && titScore == 0;   // Reality не было, uTLS тоже
+    ev.score += jaScore + longScore + titScore;
     if (ev.score > cfg().flowScoreCap) ev.score = cfg().flowScoreCap;
     return ev;
 }
@@ -324,6 +364,113 @@ static std::string vpnPacketKind(const Packet& p, const IpInfo& si, const IpInfo
 // Один список и для балла гео в вердикте, и для пометки в выводе режима 1.
 static bool isVpnCountry(const std::string& c) {
     return c=="NL"||c=="DE"||c=="FI"||c=="FR"||c=="US"||c=="GB"||c=="SE"||c=="LU";
+}
+
+// AmneziaWG: перед каждым рукопожатием клиент шлёт Jc мусорных датаграмм случайной
+// длины (Jmin..Jmax), а сами сообщения рукопожатия сдвинуты мусорным префиксом
+// (S1/S2) — сигнатуры WireGuard нет. Остаётся «поезд» в начале сессии: после паузы
+// ≥1 с (или с начала записи) 4–64 датаграммы в одну сторону за 250 мс, ≥3 разных
+// длин, ≥200 Б, почти все «случайные» (Packet::udpRand); ответ — в течение секунды
+// после поезда, и за 5 с от начала по ≥3 датаграммы в обе стороны и ≥6 «случайных».
+// Это совместимо с AWG, но не доказательство: признак — от двух таких начал в одной
+// беседе при ≥70% «случайных» во всей беседе. Беседы с узнаваемым протоколом
+// (WireGuard, QUIC, DNS, STUN, OpenVPN, IPsec…) и UDP/443 (HTTP/3) не смотрим.
+// Только pcap: у текстового tcpdump байтов нет, udpRand пуст.
+struct AwgEvidence { int score = 0; std::vector<std::string> reasons; };
+static AwgEvidence awgJunkEvidence(const std::vector<Packet>& packets,
+                                   const std::vector<long long>& absT,
+                                   const std::unordered_map<std::string, IpInfo>* ipCache) {
+    AwgEvidence ev;
+    struct Conv { std::vector<size_t> idx; bool skip = false; std::string ip; int rport = 0; };
+    std::map<std::string, Conv> convs;   // rip|rport|lport
+    for (size_t i = 0; i < packets.size(); i++) {
+        const Packet& p = packets[i];
+        if (p.proto != "UDP" || absT[i] < 0) continue;
+        const std::string* rip = remoteSideOf(p);
+        if (!rip) continue;
+        const bool sL = isLocalIp(p.srcIp);
+        const int rport = sL ? p.dstPort : p.srcPort, lport = sL ? p.srcPort : p.dstPort;
+        Conv& c = convs[*rip + "|" + std::to_string(rport) + "|" + std::to_string(lport)];
+        if (c.ip.empty()) { c.ip = *rip; c.rport = rport; }
+        if (c.skip) continue;
+        if (p.wgType || p.quic || p.l7 != L7_NONE || p.ipsec || p.dnsIsResponse || !p.dnsQuery.empty() ||
+            rport == 443 || rport == 53 || lport == 53) {
+            c.skip = true;
+            std::vector<size_t>().swap(c.idx);
+            continue;
+        }
+        c.idx.push_back(i);
+    }
+
+    const long long kIdleUs = 1000000, kTrainUs = 250000, kReplyUs = 1000000, kAfterUs = 5000000;
+    std::string single;
+    for (const auto& kv : convs) {
+        const Conv& c = kv.second;
+        if (c.skip || c.idx.size() < 12) continue;
+        const IpInfo* ii = ipInfoOf(ipCache, c.ip);
+        if (ii && (ii->vpnWhite || looksCdnOrg(ii->org))) continue;
+        int sampled = 0, rnd = 0;
+        for (size_t i : c.idx)
+            if (packets[i].udpRand) { sampled++; if (packets[i].udpRand == 1) rnd++; }
+        if (sampled < 12 || rnd * 100 < sampled * 70) continue;
+
+        const std::vector<size_t>& ix = c.idx;
+        int events = 0;
+        for (size_t k = 0; k < ix.size(); ) {
+            const long long t0 = absT[ix[k]];
+            if (k > 0 && t0 - absT[ix[k - 1]] < kIdleUs) { k++; continue; }   // не начало сессии
+            const std::string& from = packets[ix[k]].srcIp;
+            // поезд: подряд в одну сторону, не дольше 250 мс
+            size_t e = k;
+            std::set<long long> sizes;
+            long long bytes = 0;
+            int seen = 0, seenRnd = 0;
+            while (e < ix.size() && e - k <= 64 && packets[ix[e]].srcIp == from &&
+                   absT[ix[e]] - t0 <= kTrainUs) {
+                const Packet& p = packets[ix[e]];
+                sizes.insert(p.length);
+                bytes += p.length;
+                if (p.udpRand) { seen++; if (p.udpRand == 1) seenRnd++; }
+                e++;
+            }
+            const size_t n = e - k;
+            bool ok = n >= 4 && n <= 64 && sizes.size() >= 3 && bytes >= 200 &&
+                      seen * 2 >= (int)n && seenRnd * 4 >= seen * 3;
+            // ответ другой стороны в течение секунды после поезда
+            if (ok) ok = e < ix.size() && packets[ix[e]].srcIp != from &&
+                         absT[ix[e]] - absT[ix[e - 1]] <= kReplyUs;
+            if (ok) {
+                int fwd = 0, back = 0, r = 0;
+                for (size_t j = e; j < ix.size() && absT[ix[j]] - t0 <= kAfterUs; j++) {
+                    const Packet& p = packets[ix[j]];
+                    if (p.srcIp == from) fwd++; else back++;
+                    if (p.udpRand == 1) r++;
+                }
+                ok = fwd >= 3 && back >= 3 && r >= 6;
+            }
+            if (ok) events++;
+            k = e > k ? e : k + 1;   // следующее начало — только после новой паузы
+        }
+        if (events == 0) continue;
+        const std::string who = c.ip + ":" + std::to_string(c.rport);
+        char buf[640];
+        if (events >= 2) {
+            if (ev.score) continue;
+            snprintf(buf, sizeof(buf),
+                "UDP к %s: начал сессии с «поездом» случайных датаграмм разной длины — %d, "
+                "дальше двусторонний шифрованный обмен. Совместимо с AmneziaWG (мусорные "
+                "пакеты перед рукопожатием), но не доказательство", who.c_str(), events);
+            ev.reasons.push_back(buf);
+            ev.score = 2;
+        } else if (single.empty()) {
+            snprintf(buf, sizeof(buf),
+                "Не ясно: UDP к %s — одно начало сессии похоже на мусорные пакеты AmneziaWG; "
+                "для признака нужно хотя бы два, баллов не даёт", who.c_str());
+            single = buf;
+        }
+    }
+    if (!ev.score && !single.empty()) ev.reasons.push_back(single);
+    return ev;
 }
 
 // Полный вердикт VPN по дампу (без печати). ipCache может быть nullptr —
@@ -780,7 +927,8 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
         reasons.push_back("(признаки выше описывают один и тот же поток и вместе дают не более " +
                           std::to_string(kShapeCap) + " баллов)");
 
-    // 5б) потоковые признаки: Reality, отпечаток клиента, долгий двусторонний поток
+    // 5б) потоковые признаки: Reality, отпечаток клиента, долгий двусторонний поток,
+    //     TLS внутри TLS
     v.reality = collectRealitySuspects(packets, tt, ipCache);
     bool flowOnlyJa4Lib = false;
     {
@@ -788,6 +936,15 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
         v.flowScore = ev.score;
         flowOnlyJa4Lib = ev.onlyJa4Lib;
         for (auto& r : ev.reasons) reasons.push_back(r);
+    }
+    // 5в) AmneziaWG по мусорным пакетам перед рукопожатием — в тот же потолок потоков
+    {
+        AwgEvidence aw = awgJunkEvidence(packets, absT, ipCache);
+        for (auto& r : aw.reasons) reasons.push_back(r);
+        if (aw.score > 0) {
+            v.flowScore = std::min(v.flowScore + aw.score, cfg().flowScoreCap);
+            flowOnlyJa4Lib = false;
+        }
     }
     if (!quicUnknownSmall.empty()) {
         std::string l; int n = 0;
