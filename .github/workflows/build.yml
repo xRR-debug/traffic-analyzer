@@ -1,5 +1,5 @@
 # Сборка под Windows и macOS, дымовой прогон синтетических дампов
-# (tools/gen_test_dumps.py → tools/ci_smoke.py) и релиз.
+# (tools/gen_test_dumps.py → tools/ci_smoke.py), фаззинг разбора и релиз.
 #
 # Каждый push в main (то есть merge PR) после зелёной сборки выпускает релиз
 # vГГГГ.ММ.ДД.N с архивами для Windows и macOS и описанием на русском — темами
@@ -106,6 +106,43 @@ jobs:
           path: dist/TrafficAnalyzer-windows-x64.zip
           retention-days: 7
           if-no-files-found: error
+
+  # Фаззинг разбора дампов (pcap/pcapng/текст) и ClientHello: libFuzzer + ASan
+  # (MSVC), по 2,5 минуты на фаззер (fuzz/build_fuzz.cmd). Затравка — урезанные
+  # синтетические дампы (tools/gen_fuzz_seeds.py). Падение роняет проверку PR,
+  # входы-виновники — в артефакте fuzz-crashes; релиз от этой задачи не зависит.
+  fuzz:
+    name: Фаззинг разбора (libFuzzer + ASan)
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Затравка
+        run: |
+          pip install cryptography
+          python tools/gen_fuzz_seeds.py fuzz/out/seeds
+
+      - name: Сборка и прогон
+        shell: cmd
+        run: fuzz\build_fuzz.cmd 150
+
+      - name: Падения
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            fuzz/out/crash-*
+            fuzz/out/leak-*
+            fuzz/out/timeout-*
+            fuzz/out/oom-*
+          retention-days: 14
+          if-no-files-found: ignore
 
   # Релизная сборка macOS: один универсальный бинарник arm64 + x86_64 для
   # macOS 11+, GLFW вшит статически (TA_BUNDLED_GLFW) — Homebrew у

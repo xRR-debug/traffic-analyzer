@@ -151,12 +151,7 @@ static void enableAnsiColors() {
 // ------------------------------------------------------------------
 // утилиты
 // ------------------------------------------------------------------
-std::string trim(const std::string& s) {
-    size_t a = s.find_first_not_of(" \t\r\n");
-    if (a == std::string::npos) return "";
-    size_t b = s.find_last_not_of(" \t\r\n");
-    return s.substr(a, b - a + 1);
-}
+// trim и fixPad — в parser.cpp: разбор дампа собирается и без ui.cpp (фаззер)
 
 // Названия стран по ISO-коду: одна таблица для колонки REGION (англ., капс)
 // и режима гео-RTT (рус.). Раньше это были две функции с разными списками.
@@ -195,24 +190,6 @@ std::string regionName(const std::string& cc) {
 std::string countryNameRu(const std::string& cc) {
     const CountryNames* c = findCountry(cc);
     return c ? c->ru : cc;
-}
-
-// tcpdump-вывод в txt разбит «дырами» из множества пробелов, которые рвут
-// числа (seq 135810<...пробелы...>9:1359521 == 1358109:1359521).
-// Убираем ТОЛЬКО длинные прогоны пробелов (>=2). Одиночные пробелы —
-// настоящие разделители — сохраняем.
-std::string fixPad(const std::string& s) {
-    std::string o; o.reserve(s.size());
-    size_t i = 0;
-    while (i < s.size()) {
-        if (s[i] == ' ' || s[i] == '\t') {
-            size_t j = i;
-            while (j < s.size() && (s[j] == ' ' || s[j] == '\t')) j++;
-            if (j - i < 2) o += ' ';
-            i = j;
-        } else o += s[i++];
-    }
-    return o;
 }
 
 // Диалог выбора файлов дампа (если программу запустили без аргумента).

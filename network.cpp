@@ -2064,24 +2064,37 @@ static int tcpProbe(const std::string& ip, int port, int timeoutMs) {
     return tcpProbeBanner(ip, port, timeoutMs, nullptr, nullptr);
 }
 
-// UDP-handshake проба: шлём payload, ждём ЛЮБОЙ ответ в течение timeoutMs.
-// Возвращает: 1=получен ответ (порт открыт/сервис живой), 0=нет ответа.
-static int udpProbe(const std::string& ip, int port, const unsigned char* payload,
-                    int payloadLen, int timeoutMs) {
+// UDP-handshake проба: шлём payload и ждём первую датаграмму ОТ ЦЕЛИ (тот же
+// адрес и порт) в течение timeoutMs. Пакеты с других адресов пропускаем.
+// Возвращает true и кладёт ответ в reply; что это за ответ — решает
+// classifyUdpReply: «какой-то ответ» ещё не значит «тот протокол».
+static bool udpProbe(const std::string& ip, int port, const unsigned char* payload,
+                     int payloadLen, int timeoutMs, std::vector<unsigned char>& reply) {
+    reply.clear();
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s == INVALID_SOCKET) return 0;
+    if (s == INVALID_SOCKET) return false;
     sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons((u_short)port);
     inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
     sendto(s, (const char*)payload, payloadLen, 0, (sockaddr*)&addr, sizeof(addr));
 
-    fd_set rf; FD_ZERO(&rf); FD_SET(s, &rf);
-    timeval tv; tv.tv_sec = timeoutMs/1000; tv.tv_usec = (timeoutMs%1000)*1000;
-    int sel = select((int)s + 1, &rf, nullptr, nullptr, &tv);
-    int got = 0;
-    if (sel > 0 && FD_ISSET(s, &rf)) {
-        char buf[1500]; sockaddr_in from{}; socklen_t fl = sizeof(from);
-        int n = recvfrom(s, buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
-        if (n > 0) got = 1;
+    const auto t0 = std::chrono::steady_clock::now();
+    bool got = false;
+    for (;;) {
+        long long left = timeoutMs - (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        if (left <= 0) break;
+        fd_set rf; FD_ZERO(&rf); FD_SET(s, &rf);
+        timeval tv; tv.tv_sec = (long)(left / 1000); tv.tv_usec = (long)((left % 1000) * 1000);
+        int sel = select((int)s + 1, &rf, nullptr, nullptr, &tv);
+        if (sel <= 0 || !FD_ISSET(s, &rf)) break;
+        unsigned char buf[2048]; sockaddr_in from{}; socklen_t fl = sizeof(from);
+        int n = recvfrom(s, (char*)buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
+        if (n < 0) break;   // ICMP port unreachable (Windows: WSAECONNRESET) — ответа нет
+        if (from.sin_addr.s_addr != addr.sin_addr.s_addr || from.sin_port != addr.sin_port)
+            continue;       // чужой пакет — ждём дальше
+        reply.assign(buf, buf + n);
+        got = true;
+        break;
     }
     closesocket(s);
     return got;
@@ -2152,12 +2165,13 @@ static int buildIkeSaInit(unsigned char* b) {
     return 28;
 }
 static int buildDnsQuery(unsigned char* b) {
-    // DNS-запрос A example.com
+    // DNS-запрос A example.com; id случайный — по нему проверяем ответ
     static const unsigned char q[] = {
         0x12,0x34, 0x01,0x00, 0x00,0x01, 0x00,0x00, 0x00,0x00, 0x00,0x00,
         7,'e','x','a','m','p','l','e', 3,'c','o','m', 0, 0x00,0x01, 0x00,0x01
     };
     memcpy(b, q, sizeof(q));
+    b[0] = rndByte(); b[1] = rndByte();
     return (int)sizeof(q);
 }
 static int buildOpenVpnReset(unsigned char* b) {
@@ -2220,6 +2234,107 @@ static bool parsePortList(const std::string& s, std::vector<int>& ports, std::st
         for (long p = a; p <= b; p++) ports.push_back((int)p);
     }
     return true;
+}
+
+// Собирает пробу нужного вида; каждый вызов — новые случайные идентификаторы.
+// Буфер b — не меньше 1200 байт (QUIC Initial).
+static int buildUdpProbe(const std::string& kind, int port, unsigned char* b) {
+    if (kind.rfind("WireGuard",0)==0)      { buildWireGuardInit(b); return 148; }
+    if (kind=="AmneziaWG")                 return buildAmneziaWG(b);
+    if (kind.rfind("Hysteria2",0)==0)      return buildHysteria2Quic(b);
+    if (kind=="OpenVPN")                   return buildOpenVpnReset(b);
+    if (kind=="IKE/IPsec") {
+        // на 4500 (NAT-T) IKE идёт после 4-байтного нулевого non-ESP маркера
+        // (RFC 3948 §2.2), без него пакет читается как ESP и отбрасывается
+        if (port == 4500) { memset(b, 0, 4); return 4 + buildIkeSaInit(b + 4); }
+        return buildIkeSaInit(b);
+    }
+    return buildDnsQuery(b);
+}
+
+static std::string hexPrefix(const std::vector<unsigned char>& v, size_t n = 16) {
+    std::string s; char t[4];
+    for (size_t i = 0; i < v.size() && i < n; i++) { snprintf(t, sizeof(t), "%02x", v[i]); s += t; }
+    if (v.size() > n) s += "…";
+    return s;
+}
+
+// Что вернулось на пробу. CONFIRMED — только если в ответе есть наш случайный
+// идентификатор в том месте, где его кладёт сам протокол: такой ответ не мог
+// прийти от постороннего сервиса или отражателя. Любой другой ответ — «не X».
+enum class UdpReplyKind { Confirmed, Echo, Other };
+struct UdpReply { UdpReplyKind kind; std::string detail; };
+
+static UdpReply classifyUdpReply(const std::string& kind, int port, const unsigned char* req,
+                                 int reqLen, const std::vector<unsigned char>& rep) {
+    const unsigned char* r = rep.data();
+    const size_t n = rep.size();
+    if (n == (size_t)reqLen && memcmp(r, req, n) == 0)
+        return {UdpReplyKind::Echo, ""};
+    auto other = [&]() {
+        return UdpReply{UdpReplyKind::Other, std::to_string(n) + " Б: " + hexPrefix(rep)};
+    };
+
+    if (kind.rfind("WireGuard",0)==0) {
+        // наш sender index — req[4..7]; ответ сервера: 92 Б, тип 2, receiver = наш
+        // индекс в [8..11]; cookie reply: 64 Б, тип 3, receiver в [4..7]
+        if (n == 92 && r[0]==2 && !r[1] && !r[2] && !r[3] && memcmp(r+8, req+4, 4)==0)
+            return {UdpReplyKind::Confirmed, "Handshake Response с нашим индексом"};
+        if (n == 64 && r[0]==3 && !r[1] && !r[2] && !r[3] && memcmp(r+4, req+4, 4)==0)
+            return {UdpReplyKind::Confirmed, "Cookie Reply с нашим индексом (сервер под нагрузкой)"};
+        return other();
+    }
+    if (kind == "AmneziaWG") {
+        // наш sender index — req[12..15] (после 8 junk-байт и типа). Ответ AWG
+        // может иметь префикс S2 (до 128 Б) и свой магический тип H2, поэтому
+        // ищем смещение, где после префикса ровно 92 Б и receiver = наш индекс.
+        for (size_t o = 0; o <= 128 && o + 92 <= n; o++)
+            if (n - o == 92 && memcmp(r+o+8, req+12, 4)==0)
+                return {UdpReplyKind::Confirmed, "ответ 92 Б с нашим индексом, префикс " + std::to_string(o) + " Б"};
+        return other();
+    }
+    if (kind.rfind("Hysteria2",0)==0) {
+        // Version Negotiation (RFC 9000 §17.2.1): версия 0, DCID = наш пустой SCID,
+        // SCID = наш DCID (8 Б), дальше список версий по 4 байта
+        if (n > 15 && (r[0] & 0x80) && !r[1] && !r[2] && !r[3] && !r[4] &&
+            r[5]==0 && r[6]==8 && memcmp(r+7, req+6, 8)==0 && (n-15)%4==0) {
+            std::string vers;
+            for (size_t i = 15; i + 4 <= n && i < 15 + 4*6; i += 4) {
+                char t[16]; snprintf(t, sizeof(t), "%s%02x%02x%02x%02x", vers.empty()?"":" ",
+                                     r[i], r[i+1], r[i+2], r[i+3]);
+                vers += t;
+            }
+            return {UdpReplyKind::Confirmed, "QUIC Version Negotiation, версии: " + vers};
+        }
+        return other();
+    }
+    if (kind == "IKE/IPsec") {
+        // ответ — тот же initiator SPI в [0..7] и версия IKE 2.x; на 4500 —
+        // после нулевого non-ESP маркера
+        const unsigned char* q = req; const unsigned char* a = r; size_t an = n;
+        if (port == 4500) {
+            q = req + 4;
+            if (an >= 4 && !a[0] && !a[1] && !a[2] && !a[3]) { a += 4; an -= 4; }
+        }
+        if (an >= 28 && memcmp(a, q, 8)==0 && (a[17] >> 4) == 2)
+            return {UdpReplyKind::Confirmed, "IKEv2-ответ с нашим SPI, exchange " + std::to_string(a[18])};
+        return other();
+    }
+    if (kind == "OpenVPN") {
+        // HARD_RESET_SERVER_V2 (8) или ACK_V1 (5), и в нём наш session id —
+        // сервер подтверждает его как remote session id после ACK-массива
+        int op = n ? r[0] >> 3 : 0;
+        if (n >= 18 && (op == 8 || op == 5))
+            for (size_t i = 9; i + 8 <= n; i++)
+                if (memcmp(r+i, req+1, 8)==0)
+                    return {UdpReplyKind::Confirmed, op == 8 ? "HARD_RESET_SERVER_V2 с нашим session id"
+                                                             : "ACK с нашим session id"};
+        return other();
+    }
+    // DNS: тот же id и бит QR (это ответ, а не запрос)
+    if (n >= 12 && r[0]==req[0] && r[1]==req[1] && (r[2] & 0x80))
+        return {UdpReplyKind::Confirmed, "DNS-ответ с нашим id, rcode " + std::to_string(r[3] & 0x0F)};
+    return other();
 }
 
 void runPortScanMode() {
@@ -2735,34 +2850,63 @@ void runUdpProbeMode() {
 
         for (const char* kind : kinds) {
             if (g_traceAbort.load()) break;
-            int len = 0;
             std::string k = kind;
-            if (k.rfind("WireGuard",0)==0)      { buildWireGuardInit(buf); len=148; }
-            else if (k=="AmneziaWG")            { len=buildAmneziaWG(buf); }
-            else if (k.rfind("Hysteria2",0)==0) { len=buildHysteria2Quic(buf); }
-            else if (k=="IKE/IPsec")            { len=buildIkeSaInit(buf); }
-            else if (k=="OpenVPN")              { len=buildOpenVpnReset(buf); }
-            else if (k=="DNS")                  { len=buildDnsQuery(buf); }
-            else                                { len=buildDnsQuery(buf); }
 
-            int got = udpProbe(ip, p, buf, len, 1200);
-            if (got) {
-                printf("  UDP:%-6d %s%-16s%s %sОТВЕТ — сервис активен%s\n",
-                       p, C::BWHT, kind, C::RST, C::GRN, C::RST);
+            // До 3 попыток, каждая с новыми случайными идентификаторами.
+            // Подтверждение — 2 совпавших ответа. Тишина на первой попытке —
+            // сразу «тихо»: повторять незачем, вывода из тишины всё равно нет.
+            // Эхо или чужой ответ — сразу итог: это уже не наш протокол.
+            int confirmed = 0, tries = 0;
+            bool echo = false, foreign = false;
+            std::string detail, otherDesc;
+            for (int a = 0; a < 3 && confirmed < 2; a++) {
+                if (g_traceAbort.load()) break;
+                if (a > 0) Sleep(200);
+                int len = buildUdpProbe(k, p, buf);
+                std::vector<unsigned char> rep;
+                tries++;
+                if (!udpProbe(ip, p, buf, len, 1200, rep)) {
+                    if (confirmed == 0) break;  // ни одного ответа — тихо
+                    continue;                   // после подтверждения — потеря, ещё попытка
+                }
+                UdpReply r = classifyUdpReply(k, p, buf, len, rep);
+                if (r.kind == UdpReplyKind::Confirmed) { confirmed++; detail = r.detail; }
+                else if (r.kind == UdpReplyKind::Echo) { echo = true; break; }
+                else { foreign = true; otherDesc = r.detail; break; }
+            }
+
+            if (confirmed >= 2) {
+                printf("  UDP:%-6d %s%-16s%s %sПОДТВЕРЖДЁН%s (%d из %d) — %s\n",
+                       p, C::BWHT, kind, C::RST, C::GRN, C::RST, confirmed, tries, detail.c_str());
                 anyUdp = true;
+            } else if (confirmed == 1) {
+                printf("  UDP:%-6d %-16s %sнеубедительно%s: совпал 1 ответ из %d (%s)%s\n",
+                       p, kind, C::YEL, C::RST, tries, detail.c_str(),
+                       echo ? ", потом эхо" : foreign ? ", потом чужой ответ" : "");
+            } else if (echo) {
+                printf("  UDP:%-6d %-16s %sэхо%s — порт возвращает наш же пакет (отражатель), это не %s\n",
+                       p, kind, C::YEL, C::RST, kind);
+            } else if (foreign) {
+                printf("  UDP:%-6d %-16s %sответ не %s%s — %s\n",
+                       p, kind, C::YEL, kind, C::RST, otherDesc.c_str());
             } else {
-                printf("  UDP:%-6d %-16s %sтихо (no-reply / filtered)%s\n",
+                printf("  UDP:%-6d %-16s %sтихо (нет ответа / фильтруется)%s\n",
                        p, kind, C::GRY, C::RST);
             }
             fflush(stdout);
         }
     }
 
-    printf("\n%sГотово.%s ОТВЕТ = сервис подтверждён живым.\n", C::GRN, C::RST);
+    printf("\n%sГотово.%s ПОДТВЕРЖДЁН = в ответе вернулся наш случайный идентификатор "
+           "(индекс WireGuard, DCID QUIC, SPI IKE, session id OpenVPN, id DNS) "
+           "минимум в 2 попытках. «Ответ не X» — порт живой, но отвечает не этот протокол.\n",
+           C::GRN, C::RST);
+    printf("%sТишина ничего не значит: настоящие WireGuard, AmneziaWG и WARP никогда не "
+           "отвечают на handshake без ключа сервера; OpenVPN с tls-auth/tls-crypt тоже молчит. "
+           "Hysteria2 по ответу не отличить от любого другого QUIC-сервера.%s\n",
+           C::GRY, C::RST);
     if (!anyUdp)
-        printf("%sНи один порт не ответил. Для WireGuard/AmneziaWG это норма "
-               "(молчат без валидного ключа) — тишина не значит отсутствие. "
-               "Ответ = точное подтверждение.%s\n", C::GRY, C::RST);
+        printf("%sНи один протокол не подтверждён.%s\n", C::GRY, C::RST);
 }
 
 // ==================================================================

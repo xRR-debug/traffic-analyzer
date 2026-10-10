@@ -12,6 +12,7 @@ build/
 *.exe
 *.log
 *.tlog/
+fuzz/out/
 
 # Npcap: лицензия не разрешает распространять (см. README, «Сборка»)
 npcap-sdk/

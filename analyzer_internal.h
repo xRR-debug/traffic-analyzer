@@ -95,6 +95,7 @@ struct TcpConnState {
     long long respTime = -1;          // первые данные сервера после запроса
     long long inAppBytes = 0;         // данные сервера после его ChangeCipherSpec
     long long finOutTime = -1, finInTime = -1;   // первый FIN абонента / сервера
+    int tlsInTls = 0;                 // Packet::tlsInTls соединения: 2 — рисунок TLS-in-TLS, 1 — нет
 };
 struct TcpConnTable {
     std::map<std::string, TcpConnState> conns;   // ключ "rip|rport|lport|lip"
