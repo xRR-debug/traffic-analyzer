@@ -518,6 +518,7 @@ const char* portService(int p);
 const char* appByPort(int port, const std::string& proto);
 bool looksHostingOrg(const std::string& org, const std::string& /*asn*/);
 bool looksCdnOrg(const std::string& org);
+bool looksServiceOrg(const std::string& org);
 // Хостинг «по-настоящему»: флаг ip-api/ipapi.is или имя организации, но не CDN/
 // крупный сервис (Google, Microsoft, Yandex…) и не сеть самого оператора.
 bool isHostingNonCdn(const IpInfo* i);

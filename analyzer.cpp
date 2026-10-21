@@ -24,6 +24,8 @@ const char* vpnPortName(int port, const std::string& proto) {
 // (markIpsecPeers: IKEv1, IKE начат удалённой стороной, DNS-имя ePDG); без них
 // VPN — только адрес на хостинге (ePDG стоят в сети оператора, не на VPS).
 // Адрес не резолвили (remote == nullptr) — хостинг не подтверждён.
+// Мессенджеры/игры (looksServiceOrg) — не хостинг; весь looksCdnOrg не исключаем:
+// корпоративные IPsec-шлюзы часто стоят в AWS/Azure/Google Cloud.
 // Одно правило для guessKind, UDP-таблицы, TSPU?-пометки и причин блокировок —
 // иначе VoWiFi в одном месте «звонки», в другом «VPN режут».
 IpsecClass ipsecClass(const Packet& p, int remotePort, const IpInfo* remote) {
@@ -32,7 +34,7 @@ IpsecClass ipsecClass(const Packet& p, int remotePort, const IpInfo* remote) {
     if (p.ipsecPeer == 1) return IPSEC_VPN;
     if (remote && !remote->vpnWhite &&
         (remote->hosting || looksHostingOrg(remote->org, remote->asn)) &&
-        !isOwnIspOrg(remote->org, remote->asn))
+        !isOwnIspOrg(remote->org, remote->asn) && !looksServiceOrg(remote->org))
         return IPSEC_VPN;
     return IPSEC_UNSURE;
 }
@@ -250,16 +252,31 @@ bool looksHostingOrg(const std::string& org, const std::string& /*asn*/) {
     return false;
 }
 
+// Мессенджеры и игровые сервисы: свои AS, geo-API метит их как датацентр, но это
+// легитимный сервис — НЕ хостинг и не CDN. Входят в looksCdnOrg; отдельно — для
+// режима 13, где их нельзя называть ни CDN, ни хостингом.
+bool looksServiceOrg(const std::string& org) {
+    std::string o = org;  for (auto& c : o) c = (char)::tolower((unsigned char)c);
+    static const char* svcKw[] = {
+        "telegram", "whatsapp", "viber", "signal", "discord", "twitch", "blizzard",
+        // игровые серверы Riot (LoL, Valorant).
+        // Целиком «riot games» — подстрока «riot» есть в «Patriot».
+        "riot games"
+    };
+    for (auto* kw : svcKw)
+        if (o.find(kw) != std::string::npos) return true;
+    return false;
+}
+
 // CDN/крупные контентные сети — точно НЕ VPN (даже на 443).
 bool looksCdnOrg(const std::string& org) {
+    if (looksServiceOrg(org)) return true;
     std::string o = org;  for (auto& c : o) c = (char)::tolower((unsigned char)c);
     static const char* cdnKw[] = {
         "google", "akamai", "cloudflare", "fastly", "amazon", "aws", "microsoft",
-        "azure", "meta", "facebook", "edgecast", "blizzard", "yandex", "vkontakte",
+        "azure", "meta", "facebook", "edgecast", "yandex", "vkontakte",
         "vk ", "mail.ru", "apple", "netflix", "cloudfront", "limelight", "stackpath",
         "incapsula", "sucuri", "bunny", "cdn",
-        // мессенджеры/сервисы — это НЕ хостинг (свои AS, но легитимный сервис):
-        "telegram", "whatsapp", "viber", "signal", "discord", "twitch",
         "cloudflarenet", "warp", "ddos-guard", "ddosguard", "stormwall", "qrator",
         "storm systems", "stormsystems", "github", "githubusercontent", "gitlab", "fastly"
     };

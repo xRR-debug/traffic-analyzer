@@ -4456,17 +4456,21 @@ void runIpOwnerFor(const std::string& input) {
             row("ASN", as);
         }
         if (r.geoOk) {
-            bool cdn = looksCdnOrg(r.isp) || looksCdnOrg(r.org) || looksCdnOrg(r.asname);
+            // мессенджер / игровой сервис: не CDN и не хостинг, хотя ip-api метит его AS
+            // как датацентр (так же его считает остальная программа — looksCdnOrg)
+            bool svc = looksServiceOrg(r.isp) || looksServiceOrg(r.org) || looksServiceOrg(r.asname);
+            bool cdn = !svc && (looksCdnOrg(r.isp) || looksCdnOrg(r.org) || looksCdnOrg(r.asname));
             anyCdn = anyCdn || cdn;
             std::vector<std::string> tags;
+            if (svc)       tags.push_back("сервис (мессенджер / игры), не хостинг");
             if (cdn)       tags.push_back("CDN");
-            if (r.hosting) tags.push_back("хостинг / дата-центр");
+            if (r.hosting && !svc) tags.push_back("хостинг / дата-центр");
             if (r.mobile)  tags.push_back("мобильный оператор");
             if (r.proxy)   tags.push_back("прокси / VPN / Tor");
             std::string t;
             for (size_t i = 0; i < tags.size(); i++) t += (i ? ", " : "") + tags[i];
             if (t.empty()) t = "провайдер доступа / организация (не хостинг по базе ip-api)";
-            row("Тип", t, (r.proxy || (r.hosting && !cdn)) ? C::YEL : "");
+            row("Тип", t, (r.proxy || (r.hosting && !cdn && !svc)) ? C::YEL : "");
         }
         Ip2ProxyRec px;
         if (pxOn && ip2proxyLookup(r.ip, px)) {

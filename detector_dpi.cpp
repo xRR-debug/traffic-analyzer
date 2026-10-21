@@ -625,11 +625,21 @@ std::set<std::string> collectTspuBlockedIps(const std::vector<Packet>& packets,
     std::set<std::string> workedSni;
     // по каждому IP — SNI соединений, получивших нормальный ответ ("" — без SNI)
     std::map<std::string, std::set<std::string>> workedByIp;
+    // имена (SNI, Host, иначе адрес), по которым хоть одно соединение отработало —
+    // как worked в collectBlockReasons: поддельный RST посреди рабочих параллельных
+    // соединений к тому же сайту адрес не помечает
+    std::set<std::string> workedName;
+    auto nameOf = [](const TcpConnState& c) {
+        return !c.sni.empty() ? c.sni : !c.httpHost.empty() ? c.httpHost : c.ip;
+    };
     for (const auto& kv : tt.conns) {
         const TcpConnState& c = kv.second;
         if (c.serverBytes < 200) continue;
+        // оборванное поддельным RST — не «рабочее» (как в collectBlockReasons)
+        if (connIsForgedRst(c)) continue;
         if (c.ch) workedSni.insert(c.ip + "|" + c.sni);
         workedByIp[c.ip].insert(c.sni);
+        workedName.insert(nameOf(c));
     }
     // Адрес общий (CDN, хостинг): по нему нормально работал ДРУГОЙ сайт.
     // Тогда блокировка — по имени, а не по адресу: помечать весь IP нельзя,
@@ -645,7 +655,8 @@ std::set<std::string> collectTspuBlockedIps(const std::vector<Packet>& packets,
         const TcpConnState& c = kv.second;
         bool sniBlock = (connSniRst(c) || connSilentDrop(tt, c)) &&
                         !workedSni.count(c.ip + "|" + c.sni);
-        if ((sniBlock || connIsForgedRst(c)) && !otherSiteWorked(c))
+        bool forgedBlock = connIsForgedRst(c) && !workedName.count(nameOf(c));
+        if ((sniBlock || forgedBlock) && !otherSiteWorked(c))
             blocked.insert(c.ip);
         PerIp& pi = perIp[c.ip];
         pi.syn += c.syn; pi.synack += c.synack; pi.data += c.serverBytes;
@@ -1881,8 +1892,8 @@ std::vector<BlockReason> collectBlockReasons(
                  c0.inUniqBytes / 1024.0, kv.second.silence / 1e6, (int)kv.second.c.size());
         std::string d = b;
         if (ii) d += " (" + ii->country + ", " + ii->org + ")";
-        std::string name = connName(c0);
-        for (size_t i = 0; i < kv.second.c.size(); i++) put(name, kv.first, "TCP16", d);
+        // имя — у каждого соединения своё: на общем адресе зависнуть могли разные сайты
+        for (const TcpConnState* c : kv.second.c) put(connName(*c), kv.first, "TCP16", d);
     }
     for (const auto& kv : synDrop) {
         if (kv.second.syn < 3 || ipWithSynAck.count(kv.first) || workedIp.count(kv.first)) continue;
