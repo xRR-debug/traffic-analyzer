@@ -2541,6 +2541,13 @@ static std::string icmpHopAtTtl(const std::string& targetIp, int ttl) {
 #endif
 }
 
+// Abortive close (RST): без него стек продолжит ретрансмитить неподтверждённые данные.
+static void closeAbortive(SOCKET s) {
+    linger lg{}; lg.l_onoff = 1; lg.l_linger = 0;
+    setsockopt(s, SOL_SOCKET, SO_LINGER, (char*)&lg, sizeof(lg));
+    closesocket(s);
+}
+
 // Результат одной TLS-пробы DPI-локатора.
 enum class DpiProbe { NoTcp, SendFail, Reply, Reset, Closed, Timeout };
 
@@ -2583,11 +2590,472 @@ static DpiProbe dpiTlsProbe(const std::string& ip, int port, const unsigned char
         else if (n == 0) r = DpiProbe::Closed;
         else r = (WSAGetLastError() == WSAECONNRESET) ? DpiProbe::Reset : DpiProbe::Timeout;
     }
-    // abortive close: без этого стек продолжит ретрансмитить неподтверждённый CH
-    linger lg{}; lg.l_onoff = 1; lg.l_linger = 0;
-    setsockopt(s, SOL_SOCKET, SO_LINGER, (char*)&lg, sizeof(lg));
-    closesocket(s);
+    closeAbortive(s);
     return r;
+}
+
+// ------------------------------------------------------------------
+// Хоп ТСПУ и блокировка по IP за ним — метод cheburcheck (dpi_hop).
+// Порт логики probe/src/dpi_hop.rs и описания /kb/probing проекта cheburcheck
+// (https://github.com/LowderPlay/cheburcheck), (c) LowderPlay, BSD-3-Clause.
+//
+// 1) Хоп ТСПУ. На каждый TTL — отдельная TCP-сессия к контрольному серверу:
+//    ClientHello с нейтральным SNI уходит с обычным TTL (ТСПУ видит обычный
+//    TLS; если первым пойдёт пакет с низким TTL, на части маршрутов это само
+//    включает фильтрацию), через 100 мс TTL сокета снижается до n и уходят
+//    256 случайных байт. Узлы до ТСПУ отвечают ICMP Time Exceeded с цитатой
+//    нашего TCP-заголовка, из-за ТСПУ для такой сессии ответов уже нет:
+//    последний TTL с Time Exceeded — хоп ТСПУ.
+// 2) Блокировка по IP. TCP SYN к цели с TTL = хоп+1..хоп+3, по 3 попытки.
+//    Time Exceeded, RST или установленное соединение — SYN проходит ТСПУ,
+//    блокировки IP на нём нет. Полная тишина — ТСПУ режет SYN к этому IP.
+//    Сначала та же трассировка к контрольному серверу (наше дополнение): если
+//    и там тишина, узлы за хопом молчат на TCP и вывод о блокировке невозможен.
+// ICMP на TCP-пакеты принимает только сырой сокет: нужны права
+// администратора (Windows) или root (macOS).
+// ------------------------------------------------------------------
+static std::string ipv4Str(const in_addr& a) {
+    char b[INET_ADDRSTRLEN] = {0};
+    inet_ntop(AF_INET, &a, b, sizeof(b));
+    return b;
+}
+
+// Локальный адрес, с которого уходят пакеты к dstIp (UDP-connect ничего не шлёт).
+static bool localAddrFor(const std::string& dstIp, in_addr& out) {
+    SOCKET u = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (u == INVALID_SOCKET) return false;
+    sockaddr_in d{}; d.sin_family = AF_INET; d.sin_port = htons(53);
+    inet_pton(AF_INET, dstIp.c_str(), &d.sin_addr);
+    sockaddr_in me{}; socklen_t ml = sizeof(me);
+    bool ok = connect(u, (sockaddr*)&d, sizeof(d)) == 0 &&
+              getsockname(u, (sockaddr*)&me, &ml) == 0 && me.sin_addr.s_addr != 0;
+    if (ok) out = me.sin_addr;
+    closesocket(u);
+    return ok;
+}
+
+// Сырой сокет для приёма ICMP (неблокирующий), привязанный к local: Windows
+// отдаёт сырые пакеты только сокету с конкретным адресом. Без прав — INVALID_SOCKET.
+// Windows: сырой IPPROTO_ICMP получает только ICMP на свои же эхо-запросы,
+// Time Exceeded на TCP ему не доставляются (проверено). Поэтому там — сырой
+// IP-сокет в режиме SIO_RCVALL: весь трафик интерфейса, ICMP отбирает разбор
+// (teQuotedSport). Режим снимается вместе с закрытием сокета.
+#if defined(_WIN32) && !defined(SIO_RCVALL)
+#define SIO_RCVALL _WSAIOW(IOC_VENDOR, 1)   // <mstcpip.h>
+#endif
+// why — шаг и код ошибки при неудаче (для сообщения, когда права есть).
+static SOCKET openIcmpRaw(const in_addr& local, std::string* why = nullptr) {
+    auto fail = [&](SOCKET r, const char* step) -> SOCKET {
+        const int e = WSAGetLastError();
+        if (why) {
+            *why = std::string(step) + ", код " + std::to_string(e);
+#ifdef _WIN32
+            if (e == WSAEACCES)
+                *why += " — доступ запрещён: сырые сокеты, видимо, блокирует антивирус/защита";
+            else if (e == WSAEADDRNOTAVAIL)
+                *why += " — адрес " + ipv4Str(local) + " уже не принадлежит этому компьютеру";
+            else if (!strcmp(step, "SIO_RCVALL"))
+                *why += " — адаптер с адресом " + ipv4Str(local) +
+                        " не поддерживает приём всего трафика (бывает у VPN- и виртуальных адаптеров)";
+#endif
+        }
+        if (r != INVALID_SOCKET) closesocket(r);
+        return INVALID_SOCKET;
+    };
+#ifdef _WIN32
+    SOCKET r = socket(AF_INET, SOCK_RAW, IPPROTO_IP);
+#else
+    SOCKET r = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+#endif
+    if (r == INVALID_SOCKET) return fail(r, "socket");
+    sockaddr_in me{}; me.sin_family = AF_INET; me.sin_addr = local;
+    if (bind(r, (sockaddr*)&me, sizeof(me)) != 0) return fail(r, "bind");
+#ifdef _WIN32
+    DWORD on = 1 /* RCVALL_ON */, ret = 0;
+    if (WSAIoctl(r, SIO_RCVALL, &on, sizeof(on), nullptr, 0, &ret, nullptr, nullptr) != 0)
+        return fail(r, "SIO_RCVALL");
+#endif
+    u_long nb = 1; ioctlsocket(r, FIONBIO, &nb);
+    return r;
+}
+
+// Сообщение, когда сырой сокет не открылся: без прав — подсказка про права,
+// с правами — реальная причина.
+static void printRawSockFail(const std::string& why) {
+    if (!processElevated())
+        printf("%sНет доступа к сырому ICMP-сокету — запустите программу от имени\n"
+               "администратора (macOS: через sudo).%s\n", C::YEL, C::RST);
+    else if (processBelowHighIntegrity())
+        printf("%sСырой ICMP-сокет запрещён: программа запущена от администратора, но с\n"
+               "низким уровнем целостности — на exe или его папке стоит метка «Low»\n"
+               "(её ставят песочницы). Запустите exe из другой папки или снимите метку.%s\n",
+               C::YEL, C::RST);
+    else
+        printf("%sСырой ICMP-сокет не открылся, хотя права администратора есть:\n"
+               "%s.%s\n", C::YEL, why.c_str(), C::RST);
+    fflush(stdout);
+}
+
+// Буфер приёма сырого сокета: под SIO_RCVALL приходят и склеенные сетевой
+// картой пакеты больше MTU (иначе WSAEMSGSIZE обрывает вычитку).
+static const int kRawBuf = 65536;
+
+// Порт источника TCP-пакета к target:dport, на который пришёл ICMP Time
+// Exceeded (11/0), или -1. b — пакет сырого сокета с внешним IP-заголовком.
+// Адрес источника в цитате не сверяем: за NAT без перевода цитаты (RFC 5508)
+// там внешний адрес, а совпадение цели, порта цели и нашего порта достаточно.
+static int teQuotedSport(const unsigned char* b, int n, const in_addr& target, int dport) {
+    if (n < 20 || (b[0] >> 4) != 4 || b[9] != IPPROTO_ICMP) return -1;
+    const int ohl = (b[0] & 0x0F) * 4;
+    if (n < ohl + 8 + 20) return -1;
+    const unsigned char* ic = b + ohl;
+    if (ic[0] != 11 || ic[1] != 0) return -1;
+    const unsigned char* in = ic + 8;
+    const int ihl = (in[0] & 0x0F) * 4;
+    if ((in[0] >> 4) != 4 || ihl < 20 || n < ohl + 8 + ihl + 4 || in[9] != IPPROTO_TCP) return -1;
+    if (memcmp(in + 16, &target, 4) != 0) return -1;
+    const unsigned char* tcp = in + ihl;
+    if (((tcp[2] << 8) | tcp[3]) != dport) return -1;
+    return (tcp[0] << 8) | tcp[1];
+}
+
+// Вычитать всё, что накопилось в сыром сокете (ICMP прошлых проб). Под
+// SIO_RCVALL трафик идёт непрерывно — вычитка ограничена числом пакетов.
+static void icmpDrain(SOCKET r) {
+    std::vector<char> buf(kRawBuf);
+    for (int i = 0; i < 10000 && recv(r, buf.data(), kRawBuf, 0) > 0; i++) {}
+}
+
+// Ждёт до timeoutMs Time Exceeded на наш TCP-пакет (порт источника sport).
+// Возвращает IP ответившего узла, пусто — ответа не было.
+static std::string icmpWaitTe(SOCKET r, const in_addr& target, int dport, int sport,
+                              int timeoutMs) {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<unsigned char> vb(kRawBuf);
+    unsigned char* buf = vb.data();
+    while (!g_traceAbort) {
+        const int el = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        if (el >= timeoutMs) break;
+        fd_set rf; FD_ZERO(&rf); FD_SET(r, &rf);
+        timeval tv{}; tv.tv_usec = std::min(timeoutMs - el, 50) * 1000;
+        if (select((int)r + 1, &rf, nullptr, nullptr, &tv) <= 0) continue;
+        sockaddr_in from{}; socklen_t fl = sizeof(from);
+        int n;
+        while ((n = (int)recvfrom(r, (char*)buf, kRawBuf, 0, (sockaddr*)&from, &fl)) > 0) {
+            if (teQuotedSport(buf, n, target, dport) == sport) return ipv4Str(from.sin_addr);
+            fl = sizeof(from);
+        }
+    }
+    return "";
+}
+
+// Неблокирующий connect с таймаутом; сокет остаётся неблокирующим.
+// 1 — соединение есть, 0 — отказ (RST), -1 — таймаут или другая ошибка.
+static int tcpConnectNb(SOCKET s, const sockaddr_in& sa, int timeoutMs) {
+    u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
+    if (connect(s, (const sockaddr*)&sa, sizeof(sa)) == 0) return 1;
+    if (!sockConnectPending()) return WSAGetLastError() == WSAECONNREFUSED ? 0 : -1;
+    fd_set wf, ef; FD_ZERO(&wf); FD_ZERO(&ef); FD_SET(s, &wf); FD_SET(s, &ef);
+    timeval tv{}; tv.tv_sec = timeoutMs / 1000; tv.tv_usec = (timeoutMs % 1000) * 1000;
+    if (select((int)s + 1, nullptr, &wf, &ef, &tv) <= 0) return -1;
+    int err = 0; socklen_t len = sizeof(err);
+    getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&err, &len);
+    if (err == 0 && FD_ISSET(s, &wf)) return 1;
+    return err == WSAECONNREFUSED ? 0 : -1;
+}
+
+// Неблокирующий сокет: закрыл ли собеседник (или фильтр) соединение — FIN/RST.
+// Принятые данные (ServerHello) вычитываются и отбрасываются.
+static bool tcpPeerClosed(SOCKET s) {
+    char buf[2048];
+    for (;;) {
+        int n = recv(s, buf, sizeof(buf), 0);
+        if (n > 0) continue;
+        return n == 0 || WSAGetLastError() != WSAEWOULDBLOCK;
+    }
+}
+
+struct DpiHopScan {
+    int hop = -1;               // TTL хопа ТСПУ: последний с Time Exceeded
+    std::string hopIp;
+    bool anyIcmp = false;       // пришёл хоть один Time Exceeded
+    bool connectError = false;  // TCP к контрольному серверу не установился
+    bool earlyClose = false;    // сессию закрыли ещё до снижения TTL
+    bool noGap = false;         // Time Exceeded шли вплоть до самого сервера
+};
+
+// Шаг 1: хоп ТСПУ на маршруте к контрольному серверу ctlIp:port.
+// Отличия от cheburcheck: стоп после закрытия сессии (байты дошли до сервера,
+// дальше Time Exceeded не будет) и после 6 немых TTL подряд за последним
+// ответившим — чтобы не ждать до kMaxTtl по секунде на TTL.
+static DpiHopScan dpiHopScan(const std::string& ctlIp, int port, SOCKET raw,
+                             const unsigned char* ch, int chLen) {
+    DpiHopScan res;
+    const int kMaxTtl = 20, kHopTimeoutMs = 1000, kSilentStop = 6;
+    sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons((u_short)port);
+    inet_pton(AF_INET, ctlIp.c_str(), &sa.sin_addr);
+
+    printf("  %-4s %-19s %s\n", "TTL", "ХОП", "РЕАКЦИЯ");   // ширина в байтах: +3 на кириллицу
+    fflush(stdout);
+    int silent = 0;
+    for (int ttl = 1; ttl <= kMaxTtl && !g_traceAbort; ttl++) {
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        int c = s == INVALID_SOCKET ? -1 : tcpConnectNb(s, sa, 3000);
+        if (c != 1) {
+            printf("  %-4d %-16s %s%s%s\n", ttl, "*", C::YEL,
+                   c == 0 ? "RST на SYN" : "TCP не установился", C::RST);
+            fflush(stdout);
+            if (s != INVALID_SOCKET) closesocket(s);
+            res.connectError = true;
+            break;
+        }
+        sockaddr_in me{}; socklen_t ml = sizeof(me);
+        getsockname(s, (sockaddr*)&me, &ml);
+        const int sport = ntohs(me.sin_port);
+
+        send(s, (const char*)ch, chLen, 0);     // контрольный CH — обычный TTL
+        Sleep(100);                             // время ТСПУ на классификацию потока
+        icmpDrain(raw);
+        if (tcpPeerClosed(s)) {
+            printf("  %-4d %-16s %sсессию закрыли сразу после ClientHello%s\n",
+                   ttl, "*", C::YEL, C::RST);
+            fflush(stdout);
+            closeAbortive(s);
+            res.earlyClose = true;
+            break;
+        }
+        // TTL держится до закрытия: повторы этих байт тоже истекают на хопе ttl
+        DWORD ttlv = (DWORD)ttl;
+        setsockopt(s, IPPROTO_IP, IP_TTL, (char*)&ttlv, sizeof(ttlv));
+        unsigned char junk[256];
+        for (auto& b : junk) b = rndByte();
+        send(s, (const char*)junk, sizeof(junk), 0);
+
+        std::string router = icmpWaitTe(raw, sa.sin_addr, port, sport, kHopTimeoutMs);
+        bool closed = router.empty() && tcpPeerClosed(s);
+        closeAbortive(s);
+        if (g_traceAbort) break;
+
+        if (!router.empty()) {
+            res.anyIcmp = true; res.hop = ttl; res.hopIp = router; silent = 0;
+            printf("  %-4d %s%-16s%s Time Exceeded\n", ttl, C::CYN, router.c_str(), C::RST);
+        } else if (closed) {
+            printf("  %-4d %-16s сессия закрыта (байты дошли до сервера)\n", ttl, "*");
+        } else {
+            silent++;
+            printf("  %-4d %-16s %sтишина%s\n", ttl, "*", C::GRY, C::RST);
+        }
+        fflush(stdout);
+        if (closed) { res.noGap = res.hop == ttl - 1; break; }
+        if (res.hop > 0 && silent >= kSilentStop) break;
+    }
+    return res;
+}
+
+// Шаг 2: TCP-трассировка к цели за хопом ТСПУ: TTL = fromTtl..fromTtl+2, на
+// каждый по 3 параллельных SYN. true — что-то ответило (Time Exceeded, RST,
+// соединение): SYN к цели проходит ТСПУ.
+static bool tcpTraceAfterHop(const std::string& ip, int port, SOCKET raw, int fromTtl) {
+    const int kTries = 3, kWaitMs = 2000;
+    sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons((u_short)port);
+    inet_pton(AF_INET, ip.c_str(), &sa.sin_addr);
+
+    for (int ttl = fromTtl; ttl < fromTtl + 3 && !g_traceAbort; ttl++) {
+        icmpDrain(raw);
+        std::vector<SOCKET> socks;
+        std::vector<int> sports;
+        for (int i = 0; i < kTries; i++) {
+            SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (s == INVALID_SOCKET) continue;
+#ifdef _WIN32
+            tcpNoSynRetries(s);             // RST виден сразу, без повторов SYN
+#endif
+            DWORD ttlv = (DWORD)ttl;        // до connect: ограничен сам SYN
+            setsockopt(s, IPPROTO_IP, IP_TTL, (char*)&ttlv, sizeof(ttlv));
+            u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
+            connect(s, (sockaddr*)&sa, sizeof(sa));
+            sockaddr_in me{}; socklen_t ml = sizeof(me);
+            getsockname(s, (sockaddr*)&me, &ml);
+            socks.push_back(s);
+            sports.push_back(ntohs(me.sin_port));
+        }
+
+        std::string router;
+        const char* reply = nullptr;
+        std::vector<bool> done(socks.size(), false);
+        std::vector<unsigned char> vb(kRawBuf);
+        unsigned char* buf = vb.data();
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!reply && !g_traceAbort) {
+            const int el = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (el >= kWaitMs) break;
+            fd_set rf, wf, ef; FD_ZERO(&rf); FD_ZERO(&wf); FD_ZERO(&ef);
+            FD_SET(raw, &rf);
+            SOCKET mx = raw;
+            for (size_t i = 0; i < socks.size(); i++) {
+                if (done[i]) continue;
+                FD_SET(socks[i], &wf); FD_SET(socks[i], &ef);
+                if (socks[i] > mx) mx = socks[i];
+            }
+            timeval tv{}; tv.tv_usec = std::min(kWaitMs - el, 50) * 1000;
+            if (select((int)mx + 1, &rf, &wf, &ef, &tv) <= 0) continue;
+            if (FD_ISSET(raw, &rf)) {
+                sockaddr_in from{}; socklen_t fl = sizeof(from);
+                int n;
+                while ((n = (int)recvfrom(raw, (char*)buf, kRawBuf, 0, (sockaddr*)&from, &fl)) > 0) {
+                    int sp = teQuotedSport(buf, n, sa.sin_addr, port);
+                    for (int p : sports)
+                        if (sp == p) { router = ipv4Str(from.sin_addr); reply = "Time Exceeded"; }
+                    if (reply) break;
+                    fl = sizeof(from);
+                }
+            }
+            for (size_t i = 0; i < socks.size() && !reply; i++) {
+                if (done[i] || !(FD_ISSET(socks[i], &wf) || FD_ISSET(socks[i], &ef))) continue;
+                int err = 0; socklen_t len = sizeof(err);
+                getsockopt(socks[i], SOL_SOCKET, SO_ERROR, (char*)&err, &len);
+                done[i] = true;     // прочие ошибки (недоступность) — не ответ
+                if (err == 0 && FD_ISSET(socks[i], &wf)) reply = "TCP-соединение установлено";
+                else if (err == WSAECONNREFUSED) reply = "RST";
+            }
+        }
+        for (SOCKET s : socks) closeAbortive(s);
+        if (g_traceAbort) break;
+
+        if (reply)
+            printf("  %-4d %s%-16s%s %s%s%s\n", ttl, C::CYN,
+                   router.empty() ? "*" : router.c_str(), C::RST, C::GRN, reply, C::RST);
+        else
+            printf("  %-4d %-16s %sтишина%s\n", ttl, "*", C::GRY, C::RST);
+        fflush(stdout);
+        if (reply) return true;
+    }
+    return false;
+}
+
+// Режим 9, TCP до цели нет: хоп ТСПУ по контрольному серверу и проверка,
+// проходят ли SYN к цели за него.
+static void runTspuIpCheck(const std::string& ip, int port) {
+    std::cout << "Контрольный домен с HTTPS, доступный без VPN (Enter — example.com): "
+              << std::flush;
+    std::string ctl; readLine(ctl);
+    ctl = idnToAscii(trim(ctl));
+    if (ctl.empty()) ctl = "example.com";
+    // SNI контрольного CH — имя самого сервера: на чужое имя сервер может сразу
+    // закрыть сессию, и замер не состоится
+    if (!looksLikeDomainStr(ctl) || ctl.size() > 253) {
+        std::cout << "Нужно доменное имя. Отмена.\n";
+        return;
+    }
+    std::string ctlIp = resolveHostToIp(ctl);
+    if (ctlIp.empty() || !isValidIpv4Str(ctlIp)) {
+        std::cout << "Не удалось разрешить контрольный домен.\n";
+        return;
+    }
+    if (ctlIp == ip) { std::cout << "Контрольный сервер совпадает с целью. Отмена.\n"; return; }
+    in_addr localCtl{}, localDst{};
+    if (!localAddrFor(ctlIp, localCtl) || !localAddrFor(ip, localDst)) {
+        std::cout << "Не удалось определить локальный адрес.\n";
+        return;
+    }
+    std::string why;
+    SOCKET raw = openIcmpRaw(localCtl, &why);
+    if (raw == INVALID_SOCKET) { printRawSockFail(why); return; }
+
+    printf("\n=============== ХОП ТСПУ (метод cheburcheck) ===============\n");
+    printf("Контроль: %s%s%s (%s:%d)\n", C::BWHT, ctl.c_str(), C::RST, ctlIp.c_str(), port);
+    printf("  %sНа каждый TTL — своя TLS-сессия: ClientHello с обычным TTL, затем\n"
+           "  случайные байты с TTL=n. Последний узел, ответивший ICMP Time\n"
+           "  Exceeded, — хоп ТСПУ. (Ctrl+C — прервать)%s\n\n", C::GRY, C::RST);
+    fflush(stdout);
+    g_traceAbort = false;
+
+    unsigned char ch[1024];
+    int chLen = buildClientHelloSni(ch, ctl);
+    DpiHopScan sc = dpiHopScan(ctlIp, 443, raw, ch, chLen);
+
+    bool valid = false;
+    printf("\n");
+    if (g_traceAbort) {
+        printf("%sПрервано.%s\n", C::YEL, C::RST);
+    } else if (sc.connectError) {
+        printf("%sTCP к контрольному серверу не установился — хоп не определён.\n"
+               "Возьмите другой контрольный домен.%s\n", C::YEL, C::RST);
+    } else if (sc.earlyClose) {
+        printf("%sКонтрольный сервер закрыл сессию сразу после ClientHello — хоп не\n"
+               "определён. Возьмите другой контрольный домен.%s\n", C::YEL, C::RST);
+    } else if (!sc.anyIcmp) {
+        printf("%sНи одного ICMP Time Exceeded: входящий ICMP режет фаервол (Windows —\n"
+               "правило «Time Exceeded (ICMPv4-In)») или узлы молчат. Хоп не определён.%s\n",
+               C::YEL, C::RST);
+    } else if (sc.noGap) {
+        printf("%sTime Exceeded приходят вплоть до сервера — ТСПУ на маршруте не\n"
+               "выделяется. Блокировку IP этим методом не проверить.%s\n", C::YEL, C::RST);
+    } else {
+        valid = true;
+        printf("Хоп ТСПУ (кандидат): %sTTL=%d (%s)%s\n", C::BWHT, sc.hop, sc.hopIp.c_str(), C::RST);
+    }
+    fflush(stdout);
+    if (!valid) {
+        closesocket(raw);
+        g_traceAbort = false;
+        return;
+    }
+
+    // Контроль метода: та же трассировка к доступному контрольному серверу.
+    // Если и на его SYN за хопом тишина, узлы за хопом не отвечают на TCP с
+    // низким TTL (или ответы режет NAT/провайдер) — тишина к цели ничего не значит.
+    printf("\nКонтроль: TCP-трассировка к %s:443 за хопом (TTL %d..%d, по 3 SYN):\n",
+           ctlIp.c_str(), sc.hop + 1, sc.hop + 3);
+    printf("  %-4s %-19s %s\n", "TTL", "ХОП", "ОТВЕТ");
+    fflush(stdout);
+    bool ctlPassed = tcpTraceAfterHop(ctlIp, 443, raw, sc.hop + 1);
+    if (g_traceAbort) {
+        closesocket(raw);
+        printf("%sПрервано.%s\n", C::YEL, C::RST);
+        g_traceAbort = false;
+        return;
+    }
+    if (!ctlPassed) {
+        closesocket(raw);
+        printf("\n%sНа SYN к контрольному серверу за хопом тоже тишина: узлы после TTL %d\n"
+               "не отвечают Time Exceeded на TCP (так бывает у NAT и провайдеров).\n"
+               "Хоп ТСПУ не подтверждён, блокировку IP этим методом не проверить.%s\n",
+               C::YEL, sc.hop, C::RST);
+        fflush(stdout);
+        return;
+    }
+
+    // ICMP по пути к цели приходят на адрес, с которого к ней уходят пакеты
+    if (localDst.s_addr != localCtl.s_addr) {
+        closesocket(raw);
+        raw = openIcmpRaw(localDst, &why);
+        if (raw == INVALID_SOCKET) { printRawSockFail(why); return; }
+    }
+    printf("\nTCP-трассировка к %s:%d за хопом ТСПУ (TTL %d..%d, по 3 SYN):\n",
+           ip.c_str(), port, sc.hop + 1, sc.hop + 3);
+    printf("  %-4s %-19s %s\n", "TTL", "ХОП", "ОТВЕТ");
+    fflush(stdout);
+    bool passed = tcpTraceAfterHop(ip, port, raw, sc.hop + 1);
+    closesocket(raw);
+
+    printf("\n=================== ВЫВОД ===================\n");
+    if (g_traceAbort) { printf("%sПрервано.%s\n", C::YEL, C::RST); g_traceAbort = false; return; }
+    if (passed) {
+        printf("%sSYN к %s проходят за хоп ТСПУ — блокировки IP на ТСПУ нет.\n"
+               "TCP режется дальше: у сервера, его хостера, или сервер выключен.%s\n",
+               C::GRN, ip.c_str(), C::RST);
+    } else {
+        printf("%sТСПУ Блок (вероятно): SYN к %s пропадают сразу за хопом ТСПУ\n"
+               "(TTL %d) — ни ICMP, ни RST, ни соединения. Блокировка по IP.%s\n",
+               C::RED, ip.c_str(), sc.hop, C::RST);
+    }
+    printf("  %sПрим.: хоп ТСПУ найден по маршруту к контрольному серверу; ТСПУ\n"
+           "  стоит у провайдера абонента, поэтому к цели он на том же TTL, но при\n"
+           "  другой балансировке маршрута вывод может ошибиться.%s\n", C::GRY, C::RST);
+    fflush(stdout);
 }
 
 void runDpiLocatorMode() {
@@ -2677,8 +3145,12 @@ void runDpiLocatorMode() {
     fflush(stdout);
     if (ctl == DpiProbe::NoTcp) {
         printf("\n%sTCP до %s:%d не устанавливается — сервер недоступен или блокировка\n"
-               "по IP (режется SYN). SNI-локатор тут неприменим — нужна трассировка.%s\n",
+               "по IP (режется SYN). SNI-локатор тут неприменим.%s\n",
                C::YEL, ip.c_str(), PORT, C::RST);
+        std::cout << "Проверить блокировку IP на ТСПУ (хоп ТСПУ + TCP-трассировка за ним,\n"
+                     "нужны права администратора/root)? [y/N]: " << std::flush;
+        std::string yn; readLine(yn);
+        if (isYesAnswer(yn)) runTspuIpCheck(ip, PORT);
         return;
     }
     if (ctl != DpiProbe::Reply) {

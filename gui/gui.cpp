@@ -752,6 +752,8 @@ std::string wiresharkFilter(const FlowRow& r) {
     std::string f = (r.remoteIp.find(':') != std::string::npos ? "ipv6.addr==" : "ip.addr==") + r.remoteIp;
     if (r.remotePort >= 0 && (r.proto == "TCP" || r.proto == "UDP"))
         f += " && " + lowerAscii(r.proto) + ".port==" + std::to_string(r.remotePort);
+    else if (r.proto == "ESP" || r.proto == "GRE")
+        f += " && " + lowerAscii(r.proto);
     return f;
 }
 
@@ -844,7 +846,13 @@ void drawWindowButtons(float menusEnd) {
     guiSetCaptionArea(menusEnd - wp.x, x0 - wp.x, h);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const char* title = "TrafficAnalyzer — MARYNONET";
+#ifdef _WIN32
+    static const char* title = processElevated() ? "TrafficAnalyzer — MARYNONET [Администратор]"
+                                                 : "TrafficAnalyzer — MARYNONET";
+#else
+    static const char* title = processElevated() ? "TrafficAnalyzer — MARYNONET [root]"
+                                                 : "TrafficAnalyzer — MARYNONET";
+#endif
     const ImVec2 ts = ImGui::CalcTextSize(title);
     if (x0 - menusEnd > ts.x + h * 2) {                    // по центру окна, если влезает
         const float tx = std::clamp(wp.x + (ImGui::GetWindowWidth() - ts.x) * 0.5f,
@@ -1134,7 +1142,7 @@ void drawOverview(const View& v) {
     // --- блокировки ---
     if (s) {
         ImGui::Spacing();
-        // причины-не-блокировки (UDP_SESSION, TLS_CLIENT_CERT) — отдельным блоком ниже
+        // причины-не-блокировки (UDP_SESSION, PORT_CLOSED, TLS_CLIENT_CERT) — отдельным блоком ниже
         bool anyReasonBlock = false, anyReasonOther = false;
         for (const auto& r : s->blockReasons)
             (blockReasonIsBlock(r.code) ? anyReasonBlock : anyReasonOther) = true;

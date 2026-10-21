@@ -267,7 +267,10 @@ int RunGuiMain(const std::vector<std::string>& files) {
             winH = std::min(winH, ah * 92 / 100);
         }
     }
-    g_win = glfwCreateWindow(winW, winH, "TrafficAnalyzer — MARYNONET", nullptr, nullptr);
+    g_win = glfwCreateWindow(winW, winH,
+                             processElevated() ? "TrafficAnalyzer — MARYNONET [root]"
+                                               : "TrafficAnalyzer — MARYNONET",
+                             nullptr, nullptr);
     if (!g_win) {
         glfwTerminate();
         fprintf(stderr, "TrafficAnalyzer: не удалось создать окно OpenGL 3.2.\n"
