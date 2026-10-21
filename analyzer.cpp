@@ -18,7 +18,7 @@ const char* vpnPortName(int port, const std::string& proto) {
     return it == m->end() ? nullptr : it->second.c_str();
 }
 
-// UDP 500/4500: IPsec-VPN (в т.ч. корпоративный — не обязательно на хостинге),
+// UDP 500/4500 и ESP без NAT-T (IP-протокол 50): IPsec-VPN (в т.ч. корпоративный — не обязательно на хостинге),
 // звонки по Wi-Fi (VoWiFi: телефон строит IPsec до ePDG своего оператора)
 // или не понять. Точные признаки по всему дампу — Packet::ipsecPeer
 // (markIpsecPeers: IKEv1, IKE начат удалённой стороной, DNS-имя ePDG); без них
@@ -29,7 +29,8 @@ const char* vpnPortName(int port, const std::string& proto) {
 // Одно правило для guessKind, UDP-таблицы, TSPU?-пометки и причин блокировок —
 // иначе VoWiFi в одном месте «звонки», в другом «VPN режут».
 IpsecClass ipsecClass(const Packet& p, int remotePort, const IpInfo* remote) {
-    if (p.proto != "UDP" || (remotePort != 500 && remotePort != 4500)) return IPSEC_NONE;
+    if (p.proto != "ESP" && (p.proto != "UDP" || (remotePort != 500 && remotePort != 4500)))
+        return IPSEC_NONE;
     if (p.ipsecPeer == 2) return IPSEC_VOWIFI;
     if (p.ipsecPeer == 1) return IPSEC_VPN;
     if (remote && !remote->vpnWhite &&
@@ -288,7 +289,8 @@ bool looksCdnOrg(const std::string& org) {
 std::string guessKind(const Packet& p, const IpInfo& srcI, const IpInfo& dstI) {
     auto any = [&](int port) { return p.srcPort == port || p.dstPort == port; };
 
-    if (p.proto == "ICMP") return "(icmp)";
+    if (p.proto == "ICMP")
+        return p.icmpKind ? std::string("(icmp: ") + icmpKindName(p.icmpKind) + ")" : "(icmp)";
 
     // security-флаги от ipapi.is — самый сильный сигнал, ГЛОБАЛЬНО для любого порта.
     // Метку по трафику (vless, Hysteria2, VPN-порт) не теряем: computeVpnVerdict
@@ -342,6 +344,9 @@ std::string guessKind(const Packet& p, const IpInfo& srcI, const IpInfo& dstI) {
                 case IPSEC_UNSURE: return "(ipsec: IPsec или VoWiFi?)";
                 default: break;   // IPSEC_VPN — ниже, как VPN-порт
             }
+            // туннели прямо поверх IP (портов нет): ESP — IPSEC_VPN выше, PPTP — GREv1 с PPP
+            if (p.proto == "ESP") return "(VPN: IPsec ESP)";
+            if (p.gre == 1)       return "(VPN: PPTP)";
             if (const char* v = vpnPortName(remotePort, p.proto))
                 return std::string("(VPN: ") + v + ")";
             if (const char* px = proxyPortName(remotePort))
@@ -387,6 +392,9 @@ std::string guessKind(const Packet& p, const IpInfo& srcI, const IpInfo& dstI) {
     // VPN по UDP помечается только по конкретным портам (vpnPortName: WireGuard,
     // Hysteria/Hysteria2, WARP, IPsec, OpenVPN и т.п.) — это делается отдельно.
     if (p.proto == "UDP") return "(udp)";
+    // GRE без PPP (GREv0: туннели провайдеров и офисов, ERSPAN) — не VPN-сигнатура
+    if (p.proto == "ESP") return "(ipsec)";
+    if (p.proto == "GRE") return p.gre == 1 ? "(pptp)" : "(gre-туннель)";
     return "";
 }
 
@@ -485,7 +493,13 @@ std::vector<FlowRec> buildFlows(const std::vector<Packet>& packets) {
 std::string wsFilter(const std::string& ip, int port /*= -1*/, const char* l4 /*= "tcp"*/) {
     std::string f = (ip.find(':') != std::string::npos ? "ipv6.addr==" : "ip.addr==") + ip;
     if (port > 0) f += std::string(" && ") + l4 + ".port==" + std::to_string(port);
+    else if (!strcmp(l4, "esp") || !strcmp(l4, "gre")) f += std::string(" && ") + l4;   // без портов
     return f;
+}
+
+// протокол пакета ("TCP", "ESP"…) — в слово фильтра Wireshark для wsFilter
+const char* wsL4(const std::string& proto) {
+    return proto == "TCP" ? "tcp" : proto == "ESP" ? "esp" : proto == "GRE" ? "gre" : "udp";
 }
 
 // время каждого пакета в мкс с поправкой на переход через полночь

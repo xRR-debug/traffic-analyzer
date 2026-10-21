@@ -509,11 +509,15 @@ std::vector<std::string> detectDpiInjection(const std::vector<Packet>& packets,
 
 // Что за туннель на этом UDP-адресе; nullptr — не туннель. *port — порт,
 // по которому опознан. ii — сведения об удалённом адресе, если есть.
-// IKE/NAT-T (500/4500) — туннель, только если это точно IPsec-VPN (ipsecClass):
-// VoWiFi и «не ясно» VPN не называем.
+// IKE/NAT-T (500/4500) и ESP без NAT-T — туннель, только если это точно IPsec-VPN
+// (ipsecClass): VoWiFi и «не ясно» VPN не называем. Кроме UDP — голый ESP
+// (IP-протокол 50) и GRE от PPTP (47); порта у них нет (*port = -1). Прочий GRE
+// (EoIP, туннели провайдера) VPN не считаем.
 static const char* udpTunnelKind(const Packet& p, int rport, int lport,
                                  const IpInfo* ii, int* port) {
     *port = rport;
+    if (p.proto == "ESP") return ipsecClass(p, rport, ii) == IPSEC_VPN ? "IPsec (ESP)" : nullptr;
+    if (p.proto == "GRE") return p.gre == 1 ? "PPTP (GRE)" : nullptr;
     if (p.wgType != 0) return "WireGuard";   // сигнатура в payload — самый надёжный признак
     if (p.l7 == L7_OPENVPN) return "OpenVPN";
     if (const char* v = vpnPortName(rport, "UDP")) {
@@ -688,7 +692,7 @@ std::set<std::string> collectTspuBlockedIps(const std::vector<Packet>& packets,
     std::vector<long long> absT = absTimes(packets);
     for (size_t i = 0; i < packets.size(); i++) {
         const Packet& p = packets[i];
-        if (p.proto != "UDP") continue;
+        if (p.proto != "UDP" && p.proto != "ESP" && p.proto != "GRE") continue;
         bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
         if (sLoc == dLoc) continue;
         std::string ip = sLoc ? p.dstIp : p.srcIp;
@@ -696,9 +700,25 @@ std::set<std::string> collectTspuBlockedIps(const std::vector<Packet>& packets,
         int lport = sLoc ? p.srcPort : p.dstPort;
         uc[ip].add(p, sLoc, absT[i], rport, lport, ipInfoOf(ipCache, ip));
     }
+    // Сервер сам ответил ICMP «порт/протокол закрыт» на пакеты туннеля — это
+    // PORT_CLOSED, а не ТСПУ (как в collectBlockReasons). Порт: у «протокол
+    // недоступен» (ESP/GRE) его нет — -1; «порт закрыт» без порта не засчитываем.
+    std::map<std::string, std::set<int>> closedBySelf;
+    for (const auto& p : packets) {
+        if (p.proto != "ICMP" || p.srcIp != p.icmpInDst || p.icmpInProto == "TCP" ||
+            isLocal(p.srcIp) || !isLocal(p.dstIp)) continue;
+        if (p.icmpKind == ICMPK_PROTO_UNREACH) closedBySelf[p.srcIp].insert(-1);
+        else if (p.icmpKind == ICMPK_PORT_UNREACH && p.icmpInDport >= 0)
+            closedBySelf[p.srcIp].insert(p.icmpInDport);
+    }
+    auto selfClosed = [&](const std::string& ip, const UdpTunnelStat& s) {
+        auto it = closedBySelf.find(ip);
+        return it != closedBySelf.end() && (it->second.count(-1) || it->second.count(s.kindPort));
+    };
     if (inbound)
         for (const auto& kv : uc)
-            if (kv.second.kind && udpTunnelStarved(kv.second)) blocked.insert(kv.first);
+            if (kv.second.kind && udpTunnelStarved(kv.second) && !selfClosed(kv.first, kv.second))
+                blocked.insert(kv.first);
 
     return blocked;
 }
@@ -749,8 +769,9 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
         long long outBytes = 0, inBytes = 0;
         std::set<int> ports;
         bool vpn = false; std::string vpnName; int vpnPort = 0;
-        int ipsecPort = 0;                // 500/4500, не опознанный как IPsec-VPN
+        int ipsecPort = 0;                // 500/4500 (-1 — ESP без NAT-T), не опознанный как IPsec-VPN
         IpsecClass ipsecCls = IPSEC_NONE; //   VoWiFi точно или не ясно
+        bool rawEsp = false, rawGre = false;  // IP-протоколы 50/47 без порта
         long long rttSum = 0, rttCnt = 0, rttMin = -1, rttMax = -1;
         long long lastOutTime = -1;
         // IPsec по стадиям (Packet::ipsec): IKE_SA_INIT, IKE дальше (ESP — в базе)
@@ -765,7 +786,8 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
     const std::vector<long long> absT = absTimes(packets);
     for (size_t i = 0; i < packets.size(); i++) {
         const Packet& p = packets[i];
-        if (p.proto != "UDP") continue;
+        // ESP без NAT-T и GRE (PPTP) — те же туннели, только без UDP и порта
+        if (p.proto != "UDP" && p.proto != "ESP" && p.proto != "GRE") continue;
         if (!targetIp.empty() && !isTargetIp(targetIp, p.srcIp) && !isTargetIp(targetIp, p.dstIp)) continue;
         bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
         if (sLoc == dLoc) continue;
@@ -774,14 +796,18 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
         int rport = sLoc ? p.dstPort : p.srcPort;
         int lport = sLoc ? p.srcPort : p.dstPort;
         UConn& c = conns[remote];
-        c.ports.insert(rport);
+        if (rport >= 0) c.ports.insert(rport);
+        if (p.proto == "ESP") c.rawEsp = true;
+        else if (p.proto == "GRE") c.rawGre = true;
         const long long t = absT[i];
         // опознание туннеля и счёт пакетов — общие с таблицей и обзором
         const IpInfo* ii = ipInfoOf(ipCache, remote);
         c.add(p, sLoc, t, rport, lport, ii);
         // IPsec-разбор (ESP/IKE) нужен и для VoWiFi, но VPN его называем только
-        // точно (ipsecClass): VoWiFi — «звонки по Wi-Fi», не ясно — с оговоркой
-        if (!c.kind && !c.ipsecPort && vpnPortName(rport, "UDP")) {
+        // точно (ipsecClass): VoWiFi — «звонки по Wi-Fi», не ясно — с оговоркой.
+        // Сюда доходят только 500/4500 и ESP: прочие VPN-порты опознал udpTunnelKind
+        if (!c.kind && c.ipsecCls == IPSEC_NONE &&
+            (p.proto == "ESP" || vpnPortName(rport, "UDP"))) {
             c.ipsecPort = rport;
             c.ipsecCls = ipsecClass(p, rport, ii);
         }
@@ -808,11 +834,12 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
     for (auto& kv : conns) {
         UConn& c = kv.second;
         if (c.kind) { c.vpn = true; c.vpnName = c.kind; c.vpnPort = c.kindPort; }
-        else if (c.ipsecPort) {
+        else if (c.ipsecCls != IPSEC_NONE) {
             c.vpn = true; c.vpnPort = c.ipsecPort;
+            const char* pn = c.ipsecPort > 0 ? vpnPortName(c.ipsecPort, "UDP") : nullptr;
             c.vpnName = c.ipsecCls == IPSEC_VOWIFI
                 ? std::string("VoWiFi (звонки по Wi-Fi)")
-                : std::string(vpnPortName(c.ipsecPort, "UDP")) + " — IPsec-VPN или VoWiFi";
+                : std::string(pn ? pn : "ESP") + " — IPsec-VPN или VoWiFi";
         }
     }
 
@@ -839,6 +866,12 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
         std::string portsStr; int pc = 0;
         for (int p : c.ports) { if (pc++ >= 3) { portsStr += ".."; break; }
             if (!portsStr.empty()) portsStr += ","; portsStr += std::to_string(p); }
+        if (c.rawEsp) portsStr += portsStr.empty() ? "ESP" : ",ESP";
+        if (c.rawGre) portsStr += portsStr.empty() ? "GRE" : ",GRE";
+        // где туннель: «порт N, адрес» или только адрес (ESP/GRE без порта)
+        const std::string where = c.vpnPort > 0
+            ? "порт " + std::to_string(c.vpnPort) + ", " + kv.first : kv.first;
+        const char* vpnL4 = c.vpnPort > 0 ? "udp" : c.rawEsp ? "esp" : "gre";
 
         // односторонний поток: шлём, ответа нет -> порт закрыт/фильтр/блокировка
         bool oneWay = (c.out >= 3 && c.in == 0);
@@ -864,7 +897,7 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
                        C::GRY, (int)rows.size() - kShowRows, C::RST);
         }
 
-        if (inTable && oneWay && !c.vpn && inbound) {
+        if (inTable && oneWay && !c.vpn && inbound && !c.ports.empty()) {
             char b[512];
             snprintf(b, sizeof(b),
                 "UDP к %s (порт %s): %lld пакетов ушло, ответа нет — порт закрыт, "
@@ -928,53 +961,53 @@ void analyzeUdpConns(const std::vector<Packet>& packets,
             } else if (c.ikeMore > 0 && !espSeen) {
                 snprintf(b, sizeof(b),
                     "%s, IKE (%s): рукопожатие дошло дальше IKE_SA_INIT (%lld↑/%lld↓), но "
-                    "ESP-данных в UDP нет — аутентификация не прошла, в туннеле не было "
-                    "трафика или ESP идёт без NAT-T (IP-протокол 50 программа не разбирает).",
+                    "ESP-данных нет — аутентификация не прошла, в туннеле не было "
+                    "трафика или ESP (IP-протокол 50) отсеял фильтр съёма дампа.",
                     ipsecTag, kv.first.c_str(), c.out, c.in);
             } else if (!inbound && c.in == 0) {
                 snprintf(b, sizeof(b),
-                    "%s (порт %d, %s): %lld пакетов ушло, ответов нет, но входящих пакетов "
+                    "%s (%s):%lld пакетов ушло, ответов нет, но входящих пакетов "
                     "в дампе нет вовсе — похоже, дамп снят в одну сторону; вывод невозможен.",
-                    c.vpnName.c_str(), c.vpnPort, kv.first.c_str(), c.out);
+                    c.vpnName.c_str(), where.c_str(),c.out);
             } else if (starved) {
                 lvl = V_BAD;
                 snprintf(b, sizeof(b),
-                    "%s (порт %d, %s): %lld пакетов ушло за %.0f с, %lld в ответ — нет ответа: "
+                    "%s (%s):%lld пакетов ушло за %.0f с, %lld в ответ — нет ответа: "
                     "блокировка, неверный ключ или сервер недоступен. Блокировку "
                     "подтвердит проверка того же сервера с другой сети (режим 8 — UDP-проба).",
-                    c.vpnName.c_str(), c.vpnPort, kv.first.c_str(), c.out, span, c.in);
+                    c.vpnName.c_str(), where.c_str(),c.out, span, c.in);
             } else if (weakOneWay) {
                 snprintf(b, sizeof(b),
-                    "%s (порт %d, %s): %lld пакетов ушло за %.0f с, ответа нет, но для вывода "
+                    "%s (%s):%lld пакетов ушло за %.0f с, ответа нет, но для вывода "
                     "мало (нужно ≥10 пакетов за ≥10 с) — снимите дамп подольше.",
-                    c.vpnName.c_str(), c.vpnPort, kv.first.c_str(), c.out, span);
+                    c.vpnName.c_str(), where.c_str(),c.out, span);
             } else if (!espSeen && c.out >= 10 && c.in <= 2) {
                 // пара ответов на много исходящих, но без долгой тишины в конце или
                 // за короткое время — так выглядит и keepalive рабочего WG-туннеля,
                 // по которому только отдаём (см. udpTunnelStarved)
                 snprintf(b, sizeof(b),
-                    "%s (порт %d, %s): %lld↑/%lld↓ за %.0f с — ответы редкие. Так бывает и при "
+                    "%s (%s):%lld↑/%lld↓ за %.0f с — ответы редкие. Так бывает и при "
                     "обрыве после рукопожатия, и у рабочего туннеля, по которому только отдают "
                     "данные (keepalive раз в 10 с); однозначный вывод невозможен.",
-                    c.vpnName.c_str(), c.vpnPort, kv.first.c_str(), c.out, c.in, span);
+                    c.vpnName.c_str(), where.c_str(),c.out, c.in, span);
             } else if (c.out > 0 && c.in > 0) {
                 lvl = V_OK;
                 snprintf(b, sizeof(b),
-                    "%s (порт %d, %s): обмен двусторонний (%lld↑/%lld↓) — туннель РАБОТАЕТ.",
-                    c.vpnName.c_str(), c.vpnPort, kv.first.c_str(), c.out, c.in);
+                    "%s (%s):обмен двусторонний (%lld↑/%lld↓) — туннель РАБОТАЕТ.",
+                    c.vpnName.c_str(), where.c_str(),c.out, c.in);
             } else if (c.out == 0 && c.in > 0) {
                 snprintf(b, sizeof(b),
-                    "%s (порт %d, %s): только входящие пакеты (%lld↑/%lld↓) — исходящих "
+                    "%s (%s):только входящие пакеты (%lld↑/%lld↓) — исходящих "
                     "в дампе нет (дамп снят однонаправленно или туннель отвечает на чужой запрос); "
                     "однозначный вывод невозможен.",
-                    c.vpnName.c_str(), c.vpnPort, kv.first.c_str(), c.out, c.in);
+                    c.vpnName.c_str(), where.c_str(),c.out, c.in);
             } else {
                 snprintf(b, sizeof(b),
-                    "%s (порт %d, %s): слишком мало пакетов для вывода (%lld↑/%lld↓).",
-                    c.vpnName.c_str(), c.vpnPort, kv.first.c_str(), c.out, c.in);
+                    "%s (%s):слишком мало пакетов для вывода (%lld↑/%lld↓).",
+                    c.vpnName.c_str(), where.c_str(),c.out, c.in);
             }
             vpnVerdicts.push_back({ lvl, std::string(b) + "\n    Wireshark: " +
-                                         wsFilter(kv.first, c.vpnPort, "udp") });
+                                         wsFilter(kv.first, c.vpnPort, vpnL4) });
         }
     }
 
@@ -1300,14 +1333,15 @@ void analyzeConnectivityFailure(const std::vector<Packet>& packets,
         if (p.proto == "TCP") {
             peerIpsTcpAny.insert(peer);
             if (p.length > 0) peerIpsWithData.insert(peer);
-        } else if (p.proto == "UDP") {
-            peerIpsUdpAny.insert(peer);
+        } else if (p.proto == "UDP" || p.proto == "ESP" || p.proto == "GRE") {
+            peerIpsUdpAny.insert(peer);      // ESP/GRE (IPsec, PPTP) — тоже соединение
             if (p.length > 0) peerIpsWithData.insert(peer);
         }
         if (peer == p.dstIp) peerIpsTried.insert(peer);
         // ICMP от самого адреса (эхо-ответ на ping) — хост досягаем; отказы от
-        // промежуточных роутеров приходят с их адресов и сюда не попадают
-        else if (((p.proto == "TCP" || p.proto == "UDP") && p.length > 0) || p.proto == "ICMP")
+        // промежуточных роутеров приходят с их адресов и сюда не попадают, а
+        // ICMP-ошибки самого хоста («порт закрыт» и т.п.) ответом с данными не считаем
+        else if (p.proto == "ICMP" ? !icmpIsError(p.icmpKind) : p.length > 0)
             peerIpsDataIn.insert(peer);
     }
 
@@ -1651,18 +1685,31 @@ static const ReasonDef kReasonDefs[] = {
       "Начало ответа проходит, дальше данные перестают идти без RST/FIN. Типично для "
       "ограничения ТСПУ к зарубежным хостингам (Hetzner, DigitalOcean, OVH…): сайт грузится "
       "частично, VPN подключается, но не работает. Подтвердите режимом «Тест 16 КБ»." },
-    { "SYN_DROP", 5, "Нет ответа на SYN",
+    // ICMP_PROHIBITED и PORT_CLOSED — SYN_DROP/UDP_DROP, на которые пришёл ICMP-ответ
+    // (putNoReply). Запрет — уточнение, его приоритет выше; «порт закрыт» — не
+    // блокировка и не должен заслонять настоящую по другому потоку того же ресурса
+    { "ICMP_PROHIBITED", 5, "Явный запрет (ICMP «запрещено фильтром»)",
+      "На попытку соединения узел ответил ICMP «запрещено администратором»: пакеты "
+      "отбрасывает фильтр (ACL, файрвол), и он об этом сообщает — молчаливый дроп ТСПУ "
+      "выглядит иначе. Кто ответил — в подробностях: сам сервер — его файрвол; роутер в "
+      "локальной сети — его настройки (родительский контроль, правила); узел по пути — "
+      "ACL у провайдера или в транзите." },
+    { "SYN_DROP", 6, "Нет ответа на SYN",
       "Ни SYN-ACK, ни RST на повторные попытки — адрес недоступен целиком: блокировка по IP "
       "или лежит сервер/маршрут. Сравните трассировкой (режим 3) и с другой сети." },
-    { "UDP_DROP", 6, "UDP без ответа (QUIC / VPN)",
+    { "UDP_DROP", 7, "UDP без ответа (QUIC / VPN)",
       "UDP уходит, ответов нет. Для QUIC браузер сам откатится на TCP; для VPN "
-      "(WireGuard, AmneziaWG и т.п.) — протокол, скорее всего, режется ТСПУ." },
-    { "UDP_SESSION", 7, "UDP-сессия оборвалась (игра / голос)",
+      "(WireGuard, AmneziaWG, IPsec, PPTP и т.п.) — протокол, скорее всего, режется ТСПУ." },
+    { "PORT_CLOSED", 8, "Порт закрыт на сервере (ICMP)",
+      "Сам сервер ответил ICMP «порт закрыт» (или «протокол недоступен»): адрес доступен, "
+      "но на этом порту никто не слушает — сервис выключен или в настройках клиента "
+      "неверный порт. Это не блокировка.", false },
+    { "UDP_SESSION", 9, "UDP-сессия оборвалась (игра / голос)",
       "Сервер сначала отвечал, потом замолчал, а абонент шлёт дальше и переподключается — "
       "игра в это время выдаёт ошибку подключения. Это не блокировка по реестру: ответы "
       "теряются дальше по пути (CGNAT, транзит) или сервер сбросил сессию. Проверить с "
       "другим внешним адресом / без CGNAT.", false },
-    { "TLS_CLIENT_CERT", 8, "Сервер требует сертификат клиента (mTLS)",
+    { "TLS_CLIENT_CERT", 10, "Сервер требует сертификат клиента (mTLS)",
       "Это не блокировка и не проблема сети: соединение и TLS-рукопожатие проходят, но "
       "сервер запрашивает сертификат клиента, а устройство его не предъявило (или сервер "
       "его отверг) — поэтому сервер отвечает ошибкой или с задержкой, и приложение "
@@ -1751,9 +1798,60 @@ std::vector<BlockReason> collectBlockReasons(
     };
     char b[400];
 
+    // ICMP-ошибки о пакетах абонента наружу (по вложенному заголовку): кто ответил
+    // и что. Объясняют «нет ответа»: явный запрет фильтра или закрытый порт — не
+    // молчаливый дроп ТСПУ. TTL истёк (traceroute) и «больше MTU» сюда не относятся.
+    // Роутер ЛВС тоже считается (оба адреса «свои» — проверку sLoc != dLoc не ставим).
+    struct IcmpEv { uint8_t kind; std::string from, l4; int dport; };
+    std::map<std::string, std::vector<IcmpEv>> icmpTo;   // адрес назначения исходного пакета
+    for (const auto& p : packets) {
+        if (p.proto != "ICMP" || p.icmpInDst.empty() || !isLocal(p.dstIp) || isLocal(p.icmpInDst))
+            continue;
+        if (!icmpIsError(p.icmpKind) || p.icmpKind == ICMPK_TTL_EXCEEDED ||
+            p.icmpKind == ICMPK_FRAG_NEEDED) continue;
+        icmpTo[p.icmpInDst].push_back({ p.icmpKind, p.srcIp, p.icmpInProto, p.icmpInDport });
+    }
+    // Самая весомая ошибка о пакетах к ip по протоколу l4 на порты ports: запрет
+    // фильтром → порт/протокол закрыт самим адресом → прочее (недостижим и т.п.).
+    // «Порт закрыт» засчитываем, только если порт совпал: traceroute по UDP шлёт
+    // на другие порты и получает его законно. Запрет и недостижимость без порта
+    // (текстовый дамп) относятся к адресу целиком.
+    auto icmpFor = [&](const std::string& ip, const char* l4,
+                       const std::set<int>& ports) -> const IcmpEv* {
+        auto it = icmpTo.find(ip);
+        if (it == icmpTo.end()) return nullptr;
+        const IcmpEv* best = nullptr; int bestRank = 0;
+        for (const auto& e : it->second) {
+            if (!e.l4.empty() && e.l4 != l4) continue;
+            const bool closedKind = e.kind == ICMPK_PORT_UNREACH || e.kind == ICMPK_PROTO_UNREACH;
+            if (e.dport >= 0 ? !ports.count(e.dport) : e.kind == ICMPK_PORT_UNREACH) continue;
+            const int rank = e.kind == ICMPK_PROHIBITED ? 3 : (closedKind && e.from == ip) ? 2 : 1;
+            if (rank > bestRank) { best = &e; bestRank = rank; }
+        }
+        return best;
+    };
+    auto icmpWho = [&](const std::string& from, const std::string& ip) {
+        return from == ip ? std::string("сам сервер")
+             : isLocal(from) ? "роутер в локальной сети (" + from + ")"
+             : "узел по пути " + from;
+    };
+    // Причина «нет ответа» с поправкой на ICMP: запрет → ICMP_PROHIBITED, закрыт
+    // самим сервером → PORT_CLOSED (не блокировка), прочее — пометка в подробностях
+    auto putNoReply = [&](const std::string& name, const std::string& ip, const char* code,
+                          std::string detail, const IcmpEv* e) {
+        if (e) {
+            detail += "; ICMP «" + std::string(icmpKindName(e->kind)) + "» — " + icmpWho(e->from, ip);
+            if (e->kind == ICMPK_PROHIBITED) code = "ICMP_PROHIBITED";
+            else if (e->from == ip && (e->kind == ICMPK_PORT_UNREACH || e->kind == ICMPK_PROTO_UNREACH))
+                code = "PORT_CLOSED";
+        }
+        put(name, ip, code, detail);
+        return code;
+    };
+
     std::set<std::string> worked, workedIp;         // получили нормальный ответ
     std::set<std::string> ipWithSynAck;
-    struct SynAgg { long long syn = 0; int conns = 0; };
+    struct SynAgg { long long syn = 0; int conns = 0; std::set<int> ports; };
     std::map<std::string, SynAgg> synDrop;
     struct FrzAgg { std::vector<const TcpConnState*> c; long long silence = 0; };
     std::map<std::string, FrzAgg> frz;
@@ -1808,7 +1906,7 @@ std::vector<BlockReason> collectBlockReasons(
         } else if (c.syn > 0 && c.synack == 0 && !c.inRst && tt.anyInboundTcp &&
                    c.firstTime >= 0 && tt.tEnd - c.firstTime >= cfg().tailUs) {
             SynAgg& s = synDrop[c.ip];
-            s.syn += c.syn; s.conns++;
+            s.syn += c.syn; s.conns++; s.ports.insert(c.rport);
         }
         if (c.serverBytes >= 200 && fz < 0 && c.httpBlockMark.empty() && !forged) {
             worked.insert(name); workedIp.insert(c.ip);
@@ -1896,15 +1994,18 @@ std::vector<BlockReason> collectBlockReasons(
         for (const TcpConnState* c : kv.second.c) put(connName(*c), kv.first, "TCP16", d);
     }
     for (const auto& kv : synDrop) {
-        if (kv.second.syn < 3 || ipWithSynAck.count(kv.first) || workedIp.count(kv.first)) continue;
+        if (ipWithSynAck.count(kv.first) || workedIp.count(kv.first)) continue;
+        // на ICMP-запрет ОС сразу прекращает попытки — тут хватает одного SYN
+        const IcmpEv* e = icmpFor(kv.first, "TCP", kv.second.ports);
+        if (kv.second.syn < 3 && !(e && e->kind == ICMPK_PROHIBITED)) continue;
         snprintf(b, sizeof(b), "%lld SYN в %d соединени(ях) — ни SYN-ACK, ни RST",
                  kv.second.syn, kv.second.conns);
-        put(ipName(kv.first), kv.first, "SYN_DROP", b);
+        putNoReply(ipName(kv.first), kv.first, "SYN_DROP", b, e);
     }
 
     // UDP: QUIC без единого ответа или VPN-туннель, где ответов почти нет
     // (туннель — то же правило, что в журнале и таблице: udpTunnelStarved)
-    struct U : UdpTunnelStat { bool quic = false; std::string sni; };
+    struct U : UdpTunnelStat { bool quic = false; std::string sni; std::set<int> quicPorts; };
     std::map<std::string, U> uc;
     // UDP-сессия по 4-tuple, оборвавшаяся со стороны сервера (UdpSessStat).
     // Туннель без ответов — правило выше; работавший и замолчавший — здесь
@@ -1920,7 +2021,8 @@ std::vector<BlockReason> collectBlockReasons(
         bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
         if (sLoc == dLoc) continue;
         if (!sLoc && absT[i] > lastInAny) lastInAny = absT[i];
-        if (p.proto != "UDP") continue;
+        // ESP без NAT-T и GRE (PPTP) — туннели, как UDP; сессий по портам у них нет
+        if (p.proto != "UDP" && p.proto != "ESP" && p.proto != "GRE") continue;
         std::string ip = sLoc ? p.dstIp : p.srcIp;
         if (!onlyIp.empty() && !isTargetIp(onlyIp, ip)) continue;
         if (p.srcPort == 53 || p.dstPort == 53) continue;
@@ -1928,6 +2030,7 @@ std::vector<BlockReason> collectBlockReasons(
         int lport = sLoc ? p.srcPort : p.dstPort;
         U& u = uc[ip];
         u.add(p, sLoc, absT[i], rport, lport, ipInfoOf(ipCache, ip));
+        if (p.proto != "UDP") continue;
         if (absT[i] >= 0) {
             Sess& s = sess[ip + "|" + std::to_string(rport) + "|" + std::to_string(lport)];
             s.rport = rport; s.lport = lport;
@@ -1935,7 +2038,7 @@ std::vector<BlockReason> collectBlockReasons(
             if (sLoc && (p.quic || rport == 443)) s.quic = true;
         }
         if (!sLoc) continue;
-        if (p.quic || rport == 443) u.quic = true;
+        if (p.quic || rport == 443) { u.quic = true; u.quicPorts.insert(rport); }
         if (u.sni.empty() && !p.sni.empty()) u.sni = p.sni;
     }
     std::set<std::string> tunnelDrop;       // имена с UDP_DROP туннеля (не QUIC)
@@ -1951,12 +2054,17 @@ std::vector<BlockReason> collectBlockReasons(
                 else
                     snprintf(b, sizeof(b), "%s: %lld пакетов за %.0f с, ответов %lld",
                              u.kind, u.out, (u.t1 - u.t0) / 1e6, u.in);
-                put(name, kv.first, "UDP_DROP", b);
+                // туннель без порта — голый ESP (IPsec) или GRE (PPTP)
+                const char* l4 = u.kindPort > 0 ? "UDP"
+                               : std::string(u.kind).rfind("IPsec", 0) == 0 ? "ESP" : "GRE";
+                std::set<int> ports;
+                if (u.kindPort > 0) ports.insert(u.kindPort);
+                putNoReply(name, kv.first, "UDP_DROP", b, icmpFor(kv.first, l4, ports));
                 tunnelDrop.insert(name);
             } else if (u.in == 0 && u.quic && !u.kind && u.out >= 3 && tt.tEnd - u.t0 >= cfg().tailUs &&
                        !worked.count(name)) {
                 snprintf(b, sizeof(b), "QUIC: %lld датаграмм, ответов 0 (по TCP не открылось)", u.out);
-                put(name, kv.first, "UDP_DROP", b);
+                putNoReply(name, kv.first, "UDP_DROP", b, icmpFor(kv.first, "UDP", u.quicPorts));
             }
         }
         // Оборвавшаяся UDP-сессия (UdpSessStat::died)
@@ -1994,7 +2102,8 @@ std::vector<BlockReason> collectBlockReasons(
         // UDP_DROP туннеля рабочий TCP к тому же серверу (SSH, панель, VLESS на том
         // же VPS) не гасит: режется протокол, а не адрес — как «ТСПУ?» в таблице
         // (collectTspuBlockedIps) и журнал UDP. Гасится только QUIC: браузер ушёл на TCP
-        const bool tunnel = a.code == "UDP_DROP" && tunnelDrop.count(kv.first);
+        const bool tunnel = (a.code == "UDP_DROP" || a.code == "ICMP_PROHIBITED") &&
+                            tunnelDrop.count(kv.first);
         const bool ipLevel = a.code == "SYN_DROP" || a.code == "UDP_DROP";
         if (!tunnel && (worked.count(kv.first) || (ipLevel && workedIp.count(a.ip))) &&
             a.code != "HTTP_STUB" && a.code != "TCP16" && blockReasonIsBlock(a.code))

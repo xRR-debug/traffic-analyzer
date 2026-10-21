@@ -446,7 +446,9 @@ int RunGuiMain(const std::vector<std::string>& files) {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.lpszClassName = L"TrafficAnalyzerGui";
     RegisterClassExW(&wc);
-    g_hwnd = CreateWindowW(wc.lpszClassName, L"TrafficAnalyzer — MARYNONET",
+    g_hwnd = CreateWindowW(wc.lpszClassName,
+                           processElevated() ? L"TrafficAnalyzer — MARYNONET [Администратор]"
+                                             : L"TrafficAnalyzer — MARYNONET",
                            WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                            (int)(1360 * scale), (int)(860 * scale),
                            nullptr, nullptr, wc.hInstance, nullptr);

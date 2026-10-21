@@ -563,8 +563,12 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
         // (10808, 51820, 500…) VPN-портом не считаем, как и guessKind («(torrent)»)
         const bool white = infoFor(remote).vpnWhite;
         const bool p2p = p.l7 == L7_BITTORRENT || p.l7 == L7_BT_DHT || p.l7 == L7_STUN;
+        // туннели прямо поверх IP (портов нет) — по тем же правилам, что VPN-порт:
+        // ESP — если ipsecClass счёл адрес VPN (guessKind «(VPN: IPsec ESP)»), PPTP — GREv1 с PPP
         const char* vp = (white || p2p || kind.rfind("(ipsec:", 0) == 0) ? nullptr
-                                                                         : vpnPortName(remotePort, p.proto);
+                       : p.proto == "ESP" ? (kind == "(VPN: IPsec ESP)" ? "IPsec (ESP без NAT-T)" : nullptr)
+                       : p.proto == "GRE" ? (p.gre == 1 ? "PPTP (GRE)" : nullptr)
+                       : vpnPortName(remotePort, p.proto);
         const char* px = (white || p2p) ? nullptr : proxyPortName(remotePort);
         if (vp || px) {
             const int localPort = srcLocal ? p.srcPort : p.dstPort;
@@ -627,9 +631,10 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
         const bool byUser = h.init == 1 || midStream;
         const bool big = h.bytes >= kPortHitBytes;
         const bool needHost = !h.vpn || (h.proto == "UDP" && (h.rport == 8443 || h.rport == 1935));
-        char d[256];
-        snprintf(d, sizeof(d), "%s:%d/%s %s (%.0f КБ%s%s)", h.ip.c_str(), h.rport,
-                 h.proto.c_str(), h.name.c_str(), h.bytes / 1024.0,
+        char d[256], at[96];
+        if (h.rport >= 0) snprintf(at, sizeof(at), "%s:%d/%s", h.ip.c_str(), h.rport, h.proto.c_str());
+        else              snprintf(at, sizeof(at), "%s/%s", h.ip.c_str(), h.proto.c_str());   // ESP, GRE
+        snprintf(d, sizeof(d), "%s %s (%.0f КБ%s%s)", at, h.name.c_str(), h.bytes / 1024.0,
                  byUser ? "" : ", соединение открыл удалённый узел",
                  (needHost && !host) ? ", не хостинг" : "");
         if (byUser && big && (!needHost || host)) {
@@ -733,10 +738,12 @@ VpnVerdict computeVpnVerdict(const std::vector<Packet>& packets, const TcpConnTa
                 snprintf(portbuf, sizeof(portbuf), " [порт %d/%s]",
                          f.second.vpnPortNum,
                          f.second.vpnProto.empty() ? "?" : f.second.vpnProto.c_str());
+            else if (f.second.vpnProto == "ESP" || f.second.vpnProto == "GRE")
+                snprintf(portbuf, sizeof(portbuf), " [IP-протокол %s]", f.second.vpnProto.c_str());
             reasons.push_back("Трафик на VPN-порт " + f.second.vpnName + portbuf +
                               " к " + f.first + " (" + i.org + ", " + i.asn + ")" +
                               "\n    Wireshark: " + wsFilter(f.first, f.second.vpnPortNum,
-                                  f.second.vpnProto == "TCP" ? "tcp" : "udp"));
+                                  wsL4(f.second.vpnProto)));
         }
     }
 
@@ -1030,7 +1037,7 @@ void runVpnAnalysis(std::vector<Packet>& packets, const std::vector<std::string>
 
     // 4) построчный вывод в стиле tcpdump + подпись + догадка
     std::map<std::string, long long> tally; // тип трафика -> счётчик
-    long long tcp = 0, udp = 0, icmp = 0;
+    long long tcp = 0, udp = 0, icmp = 0, esp = 0, gre = 0;
     long long totalPayload = 0;
     const std::map<std::string, int> quicKind = quicFlowKinds(packets);
 
@@ -1051,6 +1058,8 @@ void runVpnAnalysis(std::vector<Packet>& packets, const std::vector<std::string>
         if (p.proto == "TCP") tcp++;
         else if (p.proto == "UDP") udp++;
         else if (p.proto == "ICMP") icmp++;
+        else if (p.proto == "ESP") esp++;
+        else if (p.proto == "GRE") gre++;
         totalPayload += p.length;
 
         // строка 1 — как в tcpdump: IP6 для IPv6, у ICMP портов нет (-1),
@@ -1063,6 +1072,15 @@ void runVpnAnalysis(std::vector<Packet>& packets, const std::vector<std::string>
             ep(p.srcIp, p.srcPort).c_str(), ep(p.dstIp, p.dstPort).c_str());
         if (p.proto == "TCP") printf("Flags %s", p.flags.empty() ? "[-]" : p.flags.c_str());
         else                  printf("%s", p.proto.c_str());
+        // ICMP-ошибка: о каком пакете сообщает узел (кому слали и на какой порт), MTU пути
+        if (p.proto == "ICMP" && icmpIsError(p.icmpKind)) {
+            printf(" %s", icmpKindName(p.icmpKind));
+            if (p.icmpMtu > 0) printf(" (mtu %d)", p.icmpMtu);
+            if (!p.icmpInDst.empty())
+                printf(" [о %s%s%s]", p.icmpInProto.empty() ? "" : (p.icmpInProto + " ").c_str(),
+                       ep(p.icmpInDst, p.icmpInDport).c_str(),
+                       p.icmpInSrc.empty() ? "" : (" от " + p.icmpInSrc).c_str());
+        }
         if (p.proto == "TCP" && p.length > 0 && p.seqStart >= 0 && p.seq >= 0)
             printf(", seq %lld:%lld", p.seqStart, p.seq);
         else if (p.seq >= 0) printf(", seq %lld", p.seq);
@@ -1097,7 +1115,10 @@ void runVpnAnalysis(std::vector<Packet>& packets, const std::vector<std::string>
                     kind.find("proxy:")       != std::string::npos ||
                     kind.find("vless")        != std::string::npos ||
                     kind.find("Hysteria")     != std::string::npos ||
-                    kind.find("icmp")         != std::string::npos;
+                    kind.find("icmp")         != std::string::npos ||
+                    kind.find("ipsec")        != std::string::npos ||
+                    kind.find("pptp")         != std::string::npos ||
+                    kind.find("gre-")         != std::string::npos;
 
                 if (!kindDescribes) {
                     if (const char* s = portService(rport); s && s[0] != '\0')
@@ -1166,8 +1187,11 @@ void runVpnAnalysis(std::vector<Packet>& packets, const std::vector<std::string>
 
     // 5) сводка
     printf("\n=================== СВОДКА ===================\n");
-    printf("Всего пакетов: %lld   (TCP: %lld, UDP: %lld, ICMP: %lld)\n",
+    printf("Всего пакетов: %lld   (TCP: %lld, UDP: %lld, ICMP: %lld",
            (long long)packets.size(), tcp, udp, icmp);
+    if (esp) printf(", ESP: %lld", esp);
+    if (gre) printf(", GRE: %lld", gre);
+    printf(")\n");
     printf("Суммарный payload: %lld байт\n", totalPayload);
     printf("Уникальных публичных IP: %lld\n\n", (long long)publicIps.size());
 

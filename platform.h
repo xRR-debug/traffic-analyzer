@@ -31,6 +31,36 @@
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "advapi32.lib")
+
+// Процесс запущен с правами администратора: группа Administrators в токене
+// включена. TokenElevation тут не годится — у урезанного токена, порождённого
+// от повышенного (runas /trustlevel), он остаётся «повышенным».
+inline bool processElevated() {
+    SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+    PSID admins = nullptr;
+    if (!AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                  DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &admins))
+        return false;
+    BOOL member = FALSE;
+    if (!CheckTokenMembership(nullptr, admins, &member)) member = FALSE;
+    FreeSid(admins);
+    return member != FALSE;
+}
+// Уровень целостности процесса ниже High. Так бывает и у администратора, если
+// на exe или его папке стоит метка «Low» (её ставят песочницы) — тогда сырые
+// сокеты запрещены (WSAEACCES).
+inline bool processBelowHighIntegrity() {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+    BYTE buf[64]; DWORD len = 0; DWORD rid = SECURITY_MANDATORY_HIGH_RID;
+    if (GetTokenInformation(tok, TokenIntegrityLevel, buf, sizeof(buf), &len)) {
+        PSID s = ((TOKEN_MANDATORY_LABEL*)buf)->Label.Sid;
+        rid = *GetSidSubAuthority(s, *GetSidSubAuthorityCount(s) - 1);
+    }
+    CloseHandle(tok);
+    return rid < SECURITY_MANDATORY_HIGH_RID;
+}
 
 // connect() неблокирующего сокета ушёл в фон (ждать через select)
 inline bool sockConnectPending() { return WSAGetLastError() == WSAEWOULDBLOCK; }
@@ -109,6 +139,9 @@ inline int ioctlsocket(SOCKET s, unsigned long cmd, u_long* arg) {
     return ioctl(s, cmd, arg);
 }
 inline bool sockConnectPending() { return errno == EINPROGRESS || errno == EWOULDBLOCK; }
+// Процесс запущен от root (sudo)
+inline bool processElevated() { return geteuid() == 0; }
+inline bool processBelowHighIntegrity() { return false; }
 inline void sockSetTimeoutMs(SOCKET s, int opt, int ms) {
     timeval tv;
     tv.tv_sec = ms / 1000;

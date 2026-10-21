@@ -616,7 +616,7 @@ static void initConsoleIo() {
 #else
 static void attachConsole() {
     if (!GetConsoleWindow()) AllocConsole();
-    SetConsoleTitleW(L"TrafficAnalyzer");
+    SetConsoleTitleW(processElevated() ? L"TrafficAnalyzer [Администратор]" : L"TrafficAnalyzer");
     FILE* f = nullptr;
     freopen_s(&f, "CONOUT$", "w", stdout);
     freopen_s(&f, "CONOUT$", "w", stderr);

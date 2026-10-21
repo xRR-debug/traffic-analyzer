@@ -216,7 +216,7 @@ struct Packet {
     std::string srcIp, dstIp;
     int         srcPort = -1;
     int         dstPort = -1;
-    std::string proto = "TCP";   // TCP / UDP / ICMP
+    std::string proto = "TCP";   // TCP / UDP / ICMP / ESP / GRE
     std::string flags;           // "[P.]" и т.п.
     long long   seq = -1;        // конец диапазона (для RTT seq->ack)
     long long   seqStart = -1;   // начало диапазона (для детекта ретрансмиссий)
@@ -286,10 +286,40 @@ struct Packet {
     std::string httpPath;        // путь из строки запроса (до 200 символов)
     std::string httpLocation;    // Location: из ответа (редирект)
     std::string httpBlockMark;   // признак страницы-заглушки о блокировке (что нашли)
+    // ICMP/ICMPv6 (ICMPK_*): что за сообщение; для ошибок — заголовок исходного
+    // пакета, о котором сообщает узел (кому слали, на какой порт), чтобы ошибку
+    // привязать к потоку. icmpMtu — MTU из Frag Needed / Packet Too Big, -1 — нет
+    uint8_t     icmpKind = 0;
+    int         icmpMtu = -1;
+    std::string icmpInProto;     // "TCP"/"UDP"/... исходного пакета; "" — заголовка нет
+    std::string icmpInSrc, icmpInDst;
+    int         icmpInSport = -1, icmpInDport = -1;
+    // GRE (IP-протокол 47): 1 — GREv1 с PPP внутри (PPTP), 2 — другой GRE; 0 — не GRE
+    uint8_t     gre = 0;
     // направление кадра по заголовку SLL/SLL2: -1 неизвестно, 0 входящий, 1 исходящий
     int         dir = -1;
     bool        valid = false;
 };
+
+// Packet::icmpKind
+enum : uint8_t {
+    ICMPK_NONE = 0,       // не ICMP или тип не распознан (текстовый дамп без подробностей)
+    ICMPK_ECHO_REQ,       // ping-запрос
+    ICMPK_ECHO_REPLY,     // ping-ответ
+    ICMPK_NET_UNREACH,    // сеть недостижима / нет маршрута
+    ICMPK_HOST_UNREACH,   // узел недостижим
+    ICMPK_PROTO_UNREACH,  // протокол недоступен
+    ICMPK_PORT_UNREACH,   // порт закрыт (UDP: на нём никто не слушает)
+    ICMPK_FRAG_NEEDED,    // нужна фрагментация / Packet Too Big (MTU на пути меньше пакета)
+    ICMPK_PROHIBITED,     // запрещено администратором (фильтр/ACL)
+    ICMPK_TTL_EXCEEDED,   // TTL истёк в пути (traceroute или петля маршрутизации)
+    ICMPK_OTHER,          // прочие (redirect, router advertisement, neighbor discovery…)
+};
+const char* icmpKindName(int k);         // "порт закрыт", "MTU", ...; "" для ICMPK_NONE
+// ошибка ICMP — сообщение о чужом пакете (а не ping и не служебное)
+inline bool icmpIsError(int k) {
+    return k >= ICMPK_NET_UNREACH && k <= ICMPK_TTL_EXCEEDED;
+}
 
 // Packet::tlsHs. До ChangeCipherSpec записи TLS 1.2 идут открытым текстом; в
 // TLS 1.3 всё после ServerHello зашифровано, и запрос сертификата не виден.
@@ -419,8 +449,9 @@ enum { JA4K_UNKNOWN = 0, JA4K_BROWSER = 1, JA4K_LIBRARY = 2, JA4K_FAKE = 3 };
 // выводятся показатели рядом и то, что появилось/пропало между A и B.
 // ------------------------------------------------------------------
 // Причина недоступности одного ресурса — итог по всем его соединениям в дампе.
-// code: HTTP_STUB, TLS_RST_FORGED, TLS_RST, TLS_DROP, TCP16, SYN_DROP, UDP_DROP;
-// UDP_SESSION (оборвавшаяся UDP-сессия игры/голоса) и TLS_CLIENT_CERT (сервер
+// code: HTTP_STUB, TLS_RST_FORGED, TLS_RST, TLS_DROP, TCP16, ICMP_PROHIBITED,
+// SYN_DROP, UDP_DROP; UDP_SESSION (оборвавшаяся UDP-сессия игры/голоса),
+// PORT_CLOSED (сервер ответил ICMP «порт закрыт») и TLS_CLIENT_CERT (сервер
 // требует сертификат клиента, mTLS) — не блокировки, см. blockReasonIsBlock.
 struct BlockReason {
     std::string target;     // домен (SNI / Host / DNS) или IP
