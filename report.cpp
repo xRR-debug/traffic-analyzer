@@ -45,7 +45,8 @@ void analyzeThroughput(const std::vector<Packet>& packets,
     };
     for (size_t i = 0; i < packets.size(); i++) {
         const Packet& p = packets[i];
-        if (p.proto != "TCP" && p.proto != "UDP") continue;
+        // ESP без NAT-T и GRE (PPTP) — туннели без портов (порты -1)
+        if (p.proto != "TCP" && p.proto != "UDP" && p.proto != "ESP" && p.proto != "GRE") continue;
         if (!targetIp.empty() && !isTargetIp(targetIp, p.srcIp) && !isTargetIp(targetIp, p.dstIp)) continue;
         if (absT[i] < 0 || p.length <= 0) continue;
         bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
@@ -56,8 +57,8 @@ void analyzeThroughput(const std::vector<Packet>& packets,
         f.rip = rip; f.proto = p.proto; f.rport = rport; f.lport = lport;
         // VoWiFi (UDP 500/4500) — звонок: его ровный поток и есть битрейт приложения;
         // 500/4500 — VPN, только если это IPsec-VPN точно (ipsecClass)
-        if (p.wgType != 0) f.vpn = true;
-        else if (vpnPortName(rport, p.proto)) {
+        if (p.wgType != 0 || p.gre == 1) f.vpn = true;
+        else if (p.proto == "ESP" || vpnPortName(rport, p.proto)) {
             const IpsecClass ic = ipsecClass(p, rport, nullptr);
             if (ic == IPSEC_NONE || ic == IPSEC_VPN) f.vpn = true;
         }
@@ -195,10 +196,16 @@ void analyzeThroughput(const std::vector<Packet>& packets,
         for (size_t b = 0; b < nb; b++) { rate[b] = bucket[b] * 8.0 / secs / 1000.0; peak = std::max(peak, rate[b]); }
 
         char hdr[384];
-        snprintf(hdr, sizeof(hdr), "  %d) %s:%d ↔ локальный порт %d, %s — %s %s за %.0f с (интервал %.1f с)",
-                 ++idx, f.rip.c_str(), f.rport, f.lport, f.proto.c_str(),
-                 down ? "принято" : "отдано", fmtBytes(down ? f.bytesIn : f.bytesOut).c_str(),
-                 dur / 1e6, secs);
+        if (f.rport >= 0)
+            snprintf(hdr, sizeof(hdr), "  %d) %s:%d ↔ локальный порт %d, %s — %s %s за %.0f с (интервал %.1f с)",
+                     ++idx, f.rip.c_str(), f.rport, f.lport, f.proto.c_str(),
+                     down ? "принято" : "отдано", fmtBytes(down ? f.bytesIn : f.bytesOut).c_str(),
+                     dur / 1e6, secs);
+        else
+            snprintf(hdr, sizeof(hdr), "  %d) %s, %s — %s %s за %.0f с (интервал %.1f с)",
+                     ++idx, f.rip.c_str(), f.proto.c_str(),
+                     down ? "принято" : "отдано", fmtBytes(down ? f.bytesIn : f.bytesOut).c_str(),
+                     dur / 1e6, secs);
         printf("%s%s%s\n", C::BWHT, hdr, C::RST);
         if (!f.ms.empty())
             printf("     %sфоновая загрузка Windows/Microsoft: %s%s\n", C::GRY, f.ms.c_str(), C::RST);
@@ -242,7 +249,7 @@ void analyzeThroughput(const std::vector<Packet>& packets,
             if (plateau) {
                 std::string m;
                 const char* col = C::WHT;
-                if (f.proto == "UDP" && !f.vpn) {
+                if (f.proto != "TCP" && !f.vpn) {
                     m = "ровный поток ~" + fmtRate(med) + " — для UDP это обычно битрейт "
                         "самого приложения (звонок, игра, стрим), а не ограничение.";
                 } else if (!f.ms.empty()) {
@@ -276,7 +283,7 @@ void analyzeThroughput(const std::vector<Packet>& packets,
             }
         }
         printf("     %sWireshark: %s  (Statistics → I/O Graphs)%s\n", C::GRY,
-               wsFilter(f.rip, f.rport, f.proto == "TCP" ? "tcp" : "udp").c_str(), C::RST);
+               wsFilter(f.rip, f.rport, wsL4(f.proto)).c_str(), C::RST);
     }
     printf("  %sГрафик: один символ — один интервал; «·» — данных не было,\n"
            "  ░ ▒ ▓ █ — скорость по возрастанию (█ — пик потока).\n"
@@ -326,6 +333,77 @@ static void printBlockedSniList(const std::map<std::string, std::string>& snis) 
         printf("    %s%s%s — %s  %s[tls.handshake.extensions_server_name==\"%s\"]%s\n",
                C::BWHT, kv.first.c_str(), C::RST, kv.second.c_str(),
                C::GRY, kv.first.c_str(), C::RST);
+}
+
+// ICMP-ошибки о пакетах абонента наружу (по вложенному заголовку): PMTU, запрет
+// фильтром, закрытый порт, недостижимость, TTL. По группам: кто ответил -> о чём.
+// Возвращает строки (цвет, текст) для «Деталей» отчёта.
+static std::vector<std::pair<const char*, std::string>> icmpDiagLines(
+        const std::vector<Packet>& packets, const std::string& localIp, const std::string& targetIp) {
+    auto isLocal = [&](const std::string& ip) {
+        return isLocalIp(ip) || (!localIp.empty() && ip == localIp);
+    };
+    enum { G_PMTU, G_BAN, G_CLOSED, G_UNREACH, G_TTL };
+    struct Ic { std::set<std::string> to; int mtu = -1; bool self = false; };
+    std::map<int, std::map<std::string, Ic>> ic;     // группа -> кто ответил -> что
+    for (const auto& p : packets) {
+        if (p.proto != "ICMP" || !icmpIsError(p.icmpKind) || p.icmpInDst.empty()) continue;
+        if (!isLocal(p.dstIp) || isLocal(p.icmpInDst)) continue;
+        if (!targetIp.empty() && !isTargetIp(targetIp, p.icmpInDst)) continue;
+        const int g = p.icmpKind == ICMPK_FRAG_NEEDED ? G_PMTU
+                    : p.icmpKind == ICMPK_PROHIBITED ? G_BAN
+                    : p.icmpKind == ICMPK_PORT_UNREACH || p.icmpKind == ICMPK_PROTO_UNREACH ? G_CLOSED
+                    : p.icmpKind == ICMPK_TTL_EXCEEDED ? G_TTL : G_UNREACH;
+        Ic& e = ic[g][p.srcIp];
+        std::string t = p.icmpInDst;
+        if (p.icmpInDport >= 0) t += " " + p.icmpInProto + "/" + std::to_string(p.icmpInDport);
+        else if (!p.icmpInProto.empty()) t += " " + p.icmpInProto;
+        e.to.insert(t);
+        if (p.icmpMtu > 0 && (e.mtu < 0 || p.icmpMtu < e.mtu)) e.mtu = p.icmpMtu;
+        if (p.srcIp == p.icmpInDst) e.self = true;
+    }
+    // «кто -> куда» не больше 4 отправителей и 3 адресов у каждого
+    auto lst = [&](const std::map<std::string, Ic>& m) {
+        std::string s; int k = 0;
+        for (const auto& kv : m) {
+            if (k++ >= 4) { s += "; ..."; break; }
+            if (!s.empty()) s += "; ";
+            s += kv.second.self ? "сервер " + kv.first
+               : isLocal(kv.first) ? "роутер ЛВС " + kv.first : "узел " + kv.first;
+            if (kv.second.mtu > 0) s += " (MTU " + std::to_string(kv.second.mtu) + ")";
+            s += " -> ";
+            int j = 0;
+            for (const auto& t : kv.second.to) {
+                if (j++ >= 3) { s += ", ..."; break; }
+                if (j > 1) s += ", ";
+                s += t;
+            }
+        }
+        return s;
+    };
+    std::vector<std::pair<const char*, std::string>> out;
+    auto it = ic.find(G_BAN);
+    if (it != ic.end())
+        out.push_back({ C::RED, "ICMP «запрещено фильтром»: " + lst(it->second) +
+            " — явный отказ фильтра, а не молчаливый дроп: роутер ЛВС — свой "
+            "файрвол, узел по пути — фильтр провайдера или хостинга." });
+    if ((it = ic.find(G_PMTU)) != ic.end())
+        out.push_back({ C::YEL, "ICMP «нужна фрагментация» (PMTU): " + lst(it->second) +
+            " — пакеты крупнее MTU на пути не проходят, стек уменьшает их сам. Если "
+            "зависают только крупные передачи, где-то режут эти ICMP (PMTU black "
+            "hole): поможет MSS-clamping или меньший MTU." });
+    if ((it = ic.find(G_UNREACH)) != ic.end())
+        out.push_back({ C::YEL, "ICMP «сеть/узел недостижим»: " + lst(it->second) +
+            " — у узла нет маршрута до адреса: сервер выключен или маршрут сломан "
+            "(так же может отвечать и фильтр)." });
+    if ((it = ic.find(G_CLOSED)) != ic.end())
+        out.push_back({ C::WHT, "ICMP «порт/протокол недоступен»: " + lst(it->second) +
+            " — от самого сервера это закрытый порт (сервис не слушает), а не "
+            "блокировка; так же заканчивается traceroute по UDP." });
+    if ((it = ic.find(G_TTL)) != ic.end())
+        out.push_back({ C::GRY, "ICMP «TTL истёк» от " + std::to_string(it->second.size()) +
+            " узл. — traceroute (режим 3) или петля маршрутизации." });
+    return out;
 }
 
 static void analyzeConnIssues(const std::vector<Packet>& packets,
@@ -919,6 +997,12 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
     // mTLS: сервер требует сертификат клиента — тоже не блокировка, свой абзац
     std::vector<const BlockReason*> clientCert;
     for (const auto& r : blockReasons) if (r.code == "TLS_CLIENT_CERT") clientCert.push_back(&r);
+    // вместо тишины пришёл ICMP: явный запрет фильтром или порт закрыт самим сервером
+    std::vector<const BlockReason*> icmpBan, portClosed;
+    for (const auto& r : blockReasons) {
+        if (r.code == "ICMP_PROHIBITED") icmpBan.push_back(&r);
+        else if (r.code == "PORT_CLOSED") portClosed.push_back(&r);
+    }
     auto listOf = [](const std::vector<const BlockReason*>& v) {
         std::string s; std::set<std::string> seen; int col = 0;
         for (const BlockReason* r : v) {
@@ -973,6 +1057,19 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
                C::YEL, also ? "Также: " : "", listOf(clientCert).c_str(), C::RST);
         for (const BlockReason* r : clientCert)
             printf("  %s- %s: %s%s\n", C::GRY, r->target.c_str(), r->detail.c_str(), C::RST);
+    };
+    auto printIcmp = [&](bool also) {
+        if (!icmpBan.empty())
+            printf("%s%sЯВНЫЙ ЗАПРЕТ (ICMP «запрещено фильтром»): %s\n"
+                   "Это не молчаливый дроп: узел прямо ответил, что пакеты отсеяны\n"
+                   "фильтром. Кто ответил — в «ПРИЧИНАХ БЛОКИРОВОК»: роутер в локальной\n"
+                   "сети — свой файрвол, узел по пути — фильтр провайдера или хостинга.%s\n",
+                   C::RED, also ? "Также: " : "", listOf(icmpBan).c_str(), C::RST);
+        if (!portClosed.empty())
+            printf("%s%sПОРТ ЗАКРЫТ НА СЕРВЕРЕ: %s\n"
+                   "Сервер сам ответил ICMP «порт закрыт»: адрес доступен, но сервис на\n"
+                   "этом порту не слушает. Это не блокировка.%s\n",
+                   C::YEL, also || !icmpBan.empty() ? "Также: " : "", listOf(portClosed).c_str(), C::RST);
     };
 
     // ---- суммарные счётчики по всем (или отфильтрованным) соединениям и вердикт ----
@@ -1078,6 +1175,12 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
                 printf("\n%s=== Признаки DPI-блокировки (RST-инъекция / дроп) ===%s\n", C::BOLD, C::RST);
                 for (auto& f : dpiFindings) printf("  %s!%s %s\n", C::RED, C::RST, f.c_str());
             }
+            // таблицы и «Деталей» нет — ICMP-ошибки (PMTU и пр.) отдельным разделом
+            const auto icmpDiag = icmpDiagLines(packets, localIp, targetIp);
+            if (!icmpDiag.empty()) {
+                printf("\n%s=== ICMP-сообщения о пакетах абонента ===%s\n", C::BOLD, C::RST);
+                for (const auto& l : icmpDiag) printf("  %s• %s%s\n", l.first, l.second.c_str(), C::RST);
+            }
             const auto udpOther = udpOtherOf(tspuBlocked);
             const bool anyBlock = !tspuBlocked.empty() || !blockedSnisAll.empty() || !dpiFindings.empty();
             // вердикт по соединениям — тот же, что в ВЫВОДе под таблицей (посчитан
@@ -1086,17 +1189,21 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             const bool connBad = connHard || heavyLoss || slowRoute;
             const bool connSoft = someLoss || elevated;
             // таблицы проблем нет, но блокировка найдена — ВЫВОД всё равно печатаем
+            const bool anyIcmp = !icmpBan.empty() || !portClosed.empty();
+            bool icmpShown = false;
             if (anyBlock || !frz16.empty() || connBad || !udpOther.empty() || !udpSess.empty() ||
-                !clientCert.empty() || connSoft)
+                !clientCert.empty() || anyIcmp || connSoft)
                 printf("\n=================== ВЫВОД ===================");
             if (!tspuBlocked.empty()) {
                 std::set<std::string> tcpIps;
                 for (const auto& kv : ttAll.conns) tcpIps.insert(kv.second.ip);
                 // туннель без ответа, а TCP к тому же VPS (SSH, панель) работает —
                 // режется UDP, это не «соединения режутся на старте»
+                // (ICMP_PROHIBITED по SYN сюда тоже попадёт, но такой адрес не бывает рабочим)
                 std::set<std::string> tunIps;
                 for (const auto& r : blockReasons)
-                    if (r.code == "UDP_DROP" && r.detail.rfind("QUIC:", 0) != 0) tunIps.insert(r.ip);
+                    if ((r.code == "UDP_DROP" || r.code == "ICMP_PROHIBITED") &&
+                        r.detail.rfind("QUIC:", 0) != 0) tunIps.insert(r.ip);
                 bool anyTcp = false;
                 std::string lst;
                 for (const auto& ip : tspuBlocked) {
@@ -1138,12 +1245,18 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
                 printf("\n");
                 printClientCert(false);
                 if (connSoft) printConnSoft(true);
+            } else if (anyIcmp) {
+                printf("\n");
+                printIcmp(false);
+                icmpShown = true;
+                if (connSoft) printConnSoft(true);
             } else if (connSoft) {
                 printf("\n");
                 printConnSoft(false);
             } else {
                 printf("\n%sЯвных проблем соединения не обнаружено.%s\n", C::GRN, C::RST);
             }
+            if (anyIcmp && !icmpShown) printIcmp(true);
             if (anyBlock && !frz16.empty()) printFreeze(true);
             if ((anyBlock || !frz16.empty() || connBad) && !udpOther.empty()) printUdpOther(udpOther, true);
             if ((anyBlock || !frz16.empty() || connBad) && !udpSess.empty()) printUdpSess(true);
@@ -1764,6 +1877,9 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             }
         }
 
+        // ICMP-ошибки о пакетах абонента: PMTU, запреты, закрытые порты
+        for (const auto& l : icmpDiagLines(packets, localIp, targetIp)) say(l.first, l.second);
+
         if (!anyFinding)
             printf("  %sПо собранным признакам проблем не выявлено.%s\n", C::GRN, C::RST);
 
@@ -1794,6 +1910,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             const auto udpOther = udpOtherOf(tspuIps);
             const bool anyBlock = tspuBlock || !blockedSnis.empty() || dpiDetected;
             bool certShown = false;   // абзац mTLS — основной вывод (ниже не повторять)
+            bool icmpShown = false;   // то же для ICMP-запрета / закрытого порта
 
             if (tspuBlock) {
                 // список ВСЕХ адресов для вывода (с переносом строк для читаемости)
@@ -1840,6 +1957,10 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
                 printClientCert(false);
                 certShown = true;
                 if (someLoss || elevated) printConnSoft(true);
+            } else if (!icmpBan.empty() || !portClosed.empty()) {
+                printIcmp(false);
+                icmpShown = true;
+                if (someLoss || elevated) printConnSoft(true);
             } else if (someLoss || elevated) {
                 printConnSoft(false);
             } else {
@@ -1853,6 +1974,7 @@ static void analyzeConnIssues(const std::vector<Packet>& packets,
             if (!udpOther.empty() && !udpShown) printUdpOther(udpOther, true);
             if (!udpSess.empty() && !udpShown) printUdpSess(true);
             if (!clientCert.empty() && !certShown) printClientCert(true);
+            if ((!icmpBan.empty() || !portClosed.empty()) && !icmpShown) printIcmp(true);
             // оговорка одной строкой, без отдельного блока «Важно»
             printf("(по дампу нельзя на 100%% отличить блокировку провайдером от\n"
                    " недоступности сервера — это признаки для проверки.)\n");

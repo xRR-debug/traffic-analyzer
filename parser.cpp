@@ -193,6 +193,8 @@ static long long grabSeqStart(const std::string& s) {
     return num.empty() ? -1 : atoll(num.c_str());
 }
 
+static void parseIcmpText(const std::string& s, Packet& pk);
+
 // ------------------------------------------------------------------
 // разбор одной (уже склеенной) строки пакета
 // named (необязательно) — следы дампа без -n, биты как у splitIpPort
@@ -272,10 +274,26 @@ static Packet parseLine(const std::string& raw, int* named = nullptr) {
     // печатается лишь для нераспознанного payload («UDP, length N»): DNS, NTP,
     // QUIC и т.п. идут своим декодером без него. Раньше такие строки считались
     // TCP — DNS из текстового дампа уходил в «DNS over TCP», QUIC — в TLS.
-    if (rest.find("ICMP") != std::string::npos) pk.proto = "ICMP";
+    // ESP и GRE — первыми: в GRE tcpdump печатает и вложенный пакет (с «Flags [»/«ICMP»).
+    const size_t r0 = rest.find_first_not_of(' ');
+    auto restStarts = [&](const char* w) {
+        return r0 != std::string::npos && rest.compare(r0, strlen(w), w) == 0;
+    };
+    const size_t icmpAt = rest.find("ICMP");
+    if (pk.srcPort < 0 && pk.dstPort < 0 && restStarts("ESP(")) {
+        pk.proto = "ESP";                  // «ESP(spi=0x…,seq=0x…), length N»
+        pk.ipsec = 3;
+        pk.flags = "[-]";
+    } else if (pk.srcPort < 0 && pk.dstPort < 0 && restStarts("GREv")) {
+        pk.proto = "GRE";                  // «GREv1, call N, seq N, length N: PPP…» — PPTP
+        pk.gre = restStarts("GREv1") ? 1 : 2;
+        pk.flags = "[-]";
+    }
+    else if (icmpAt != std::string::npos) pk.proto = "ICMP";
     else if (rest.find("Flags [") != std::string::npos) pk.proto = "TCP";
     else if (pk.srcPort >= 0 && pk.dstPort >= 0) pk.proto = "UDP";
-    else return pk;   // GRE/ESP/фрагменты без L4-портов — как и в pcap, не разбираем
+    else return pk;   // фрагменты без L4-портов и прочее — как и в pcap, не разбираем
+    if (pk.proto == "ICMP") parseIcmpText(rest.substr(icmpAt), pk);
 
     if (rest.find("HTTP") != std::string::npos) pk.appHint = "HTTP";
 
@@ -495,7 +513,8 @@ static Packet parseLine(const std::string& raw, int* named = nullptr) {
 // Чтение бинарного .pcap / .pcapng. Возвращает пакеты.
 // Поддержка: link-type 1 (Ethernet), 113/276 (Linux SLL/SLL2, с направлением
 // кадра), 0/108 (NULL/LOOP — loopback Npcap/BSD), 101/228/229 (raw IP);
-// у Ethernet и SLL — метки VLAN и сессия PPPoE. IPv4 и IPv6, TCP/UDP/ICMP/ICMPv6; из payload — SNI (с досборкой
+// у Ethernet и SLL — метки VLAN и сессия PPPoE. IPv4 и IPv6, TCP/UDP/ICMP/ICMPv6
+// (у ошибок — тип и вложенный заголовок), ESP и GRE; из payload — SNI (с досборкой
 // ClientHello по сегментам) и DNS.
 // ------------------------------------------------------------------
 static uint16_t rd16(const unsigned char* p, bool be) {
@@ -632,7 +651,7 @@ static void parseDnsPayload(const uint8_t* d, size_t n, Packet& pk) {
     pk.dnsAnswerIp = !a4.empty() ? a4 : a6;
 }
 
-// разобрать один Ethernet/SLL/raw-кадр в Packet (IPv4/IPv6, TCP/UDP/ICMP).
+// разобрать один Ethernet/SLL/raw-кадр в Packet (IPv4/IPv6, TCP/UDP/ICMP/ESP/GRE).
 // tcpPay/tcpPayLen (необязательно) — полезная нагрузка TCP-сегмента, если
 // она захвачена целиком: по ней собирается ClientHello из нескольких сегментов.
 // Для UDP сюда же отдаётся захваченная часть датаграммы (для QUIC Initial).
@@ -734,6 +753,183 @@ const char* l7Name(int code) {
         case L7_OPENVPN:    return "OpenVPN";
         default:            return "";
     }
+}
+
+const char* icmpKindName(int k) {
+    switch (k) {
+        case ICMPK_ECHO_REQ:      return "ping-запрос";
+        case ICMPK_ECHO_REPLY:    return "ping-ответ";
+        case ICMPK_NET_UNREACH:   return "сеть недостижима";
+        case ICMPK_HOST_UNREACH:  return "узел недостижим";
+        case ICMPK_PROTO_UNREACH: return "протокол недоступен";
+        case ICMPK_PORT_UNREACH:  return "порт закрыт";
+        case ICMPK_FRAG_NEEDED:   return "пакет больше MTU";
+        case ICMPK_PROHIBITED:    return "запрещено фильтром";
+        case ICMPK_TTL_EXCEEDED:  return "TTL истёк";
+        case ICMPK_OTHER:         return "служебное";
+        default:                  return "";
+    }
+}
+
+// вид сообщения по типу/коду ICMPv4 (RFC 792, 1812)
+static uint8_t icmp4Kind(uint8_t t, uint8_t c) {
+    switch (t) {
+        case 0:  return ICMPK_ECHO_REPLY;
+        case 8:  return ICMPK_ECHO_REQ;
+        case 3:
+            if (c == 0 || c == 6) return ICMPK_NET_UNREACH;
+            if (c == 2)  return ICMPK_PROTO_UNREACH;
+            if (c == 3)  return ICMPK_PORT_UNREACH;
+            if (c == 4)  return ICMPK_FRAG_NEEDED;
+            if (c == 9 || c == 10 || c == 13) return ICMPK_PROHIBITED;
+            return ICMPK_HOST_UNREACH;
+        case 11: return c == 0 ? ICMPK_TTL_EXCEEDED : ICMPK_OTHER;   // 1 — сборка фрагментов
+        default: return ICMPK_OTHER;
+    }
+}
+// то же для ICMPv6 (RFC 4443)
+static uint8_t icmp6Kind(uint8_t t, uint8_t c) {
+    switch (t) {
+        case 128: return ICMPK_ECHO_REQ;
+        case 129: return ICMPK_ECHO_REPLY;
+        case 1:
+            if (c == 0) return ICMPK_NET_UNREACH;                    // нет маршрута
+            if (c == 1 || c == 5 || c == 6) return ICMPK_PROHIBITED;  // запрет, политика, reject route
+            if (c == 4) return ICMPK_PORT_UNREACH;
+            return ICMPK_HOST_UNREACH;
+        case 2:   return ICMPK_FRAG_NEEDED;                          // Packet Too Big
+        case 3:   return c == 0 ? ICMPK_TTL_EXCEEDED : ICMPK_OTHER;
+        default:  return ICMPK_OTHER;
+    }
+}
+
+static const char* ipProtoName(int pr) {
+    switch (pr) {
+        case 6:  return "TCP";
+        case 17: return "UDP";
+        case 1: case 58: return "ICMP";
+        case 50: return "ESP";
+        case 47: return "GRE";
+        default: return "";
+    }
+}
+
+// Заголовок исходного пакета в ICMP-ошибке (за 8 байтами ICMP): IP-заголовок и
+// начало L4 — у TCP/UDP там порты. q/n — захваченные байты: кадр бывает обрезан
+// snaplen, а маршрутизатор цитирует не больше, чем обязан, — всё сверяем с n.
+static void parseIcmpInner(const unsigned char* q, size_t n, Packet& pk) {
+    if (n < 20) return;
+    uint8_t pr = 0;
+    size_t l4o = 0;
+    if ((q[0] >> 4) == 4) {
+        const size_t ihl = (size_t)(q[0] & 0x0f) * 4;
+        if (ihl < 20) return;
+        pr = q[9];
+        pk.icmpInSrc = ipToStr(q + 12);
+        pk.icmpInDst = ipToStr(q + 16);
+        if ((be16(q + 6) & 0x1FFF) == 0) l4o = ihl;   // не первый фрагмент — портов нет
+    } else if ((q[0] >> 4) == 6) {
+        if (n < 40) return;
+        pr = q[6];
+        pk.icmpInSrc = ip6ToStr(q + 8);
+        pk.icmpInDst = ip6ToStr(q + 24);
+        l4o = 40;
+        // заголовки расширения (hop-by-hop / routing / dest opts) до L4
+        for (int guard = 0; guard < 4 && (pr == 0 || pr == 43 || pr == 60); guard++) {
+            if (l4o + 2 > n) { l4o = 0; break; }
+            const size_t hl = ((size_t)q[l4o + 1] + 1) * 8;
+            pr = q[l4o];
+            l4o += hl;
+        }
+    } else {
+        return;
+    }
+    pk.icmpInProto = ipProtoName(pr);
+    if (pk.icmpInProto.empty()) pk.icmpInProto = "IP-" + std::to_string(pr);
+    if ((pr == 6 || pr == 17) && l4o && l4o + 4 <= n) {
+        pk.icmpInSport = be16(q + l4o);
+        pk.icmpInDport = be16(q + l4o + 2);
+    }
+}
+
+// ICMP из строки текстового tcpdump; s — с «ICMP»/«ICMP6». Вид сообщения, MTU и
+// адрес/порт исходного пакета в тех формах, что печатает tcpdump:
+//   «ICMP 8.8.8.8 udp port 53 unreachable», «ICMP host X unreachable - admin
+//   prohibited filter», «ICMP X unreachable - need to frag (mtu 1400)», «ICMP time
+//   exceeded in-transit», «ICMP6, packet too big, mtu 1280», «ICMP6, destination
+//   unreachable, unreachable port, X udp port 53», «unreachable prohibited X»
+// При -v tcpdump печатает и сам исходный пакет («IP a.1 > b.2: UDP…») — он точнее.
+static void parseIcmpText(const std::string& s, Packet& pk) {
+    auto has = [&](const char* w) { return s.find(w) != std::string::npos; };
+    if (has("echo request"))                              pk.icmpKind = ICMPK_ECHO_REQ;
+    else if (has("echo reply"))                           pk.icmpKind = ICMPK_ECHO_REPLY;
+    else if (has("need to frag") || has("packet too big")) pk.icmpKind = ICMPK_FRAG_NEEDED;
+    else if (has("prohibited") || has("failed policy") || has("reject route"))
+                                                          pk.icmpKind = ICMPK_PROHIBITED;
+    else if (has("unreachable port") || (has(" port ") && has(" unreachable")))
+                                                          pk.icmpKind = ICMPK_PORT_UNREACH;
+    else if (has(" protocol ") && has(" unreachable"))    pk.icmpKind = ICMPK_PROTO_UNREACH;
+    else if (has("ICMP net ") || has("unreachable route")) pk.icmpKind = ICMPK_NET_UNREACH;
+    else if (has("unreachable"))                          pk.icmpKind = ICMPK_HOST_UNREACH;
+    else if (has("time exceeded in-transit"))             pk.icmpKind = ICMPK_TTL_EXCEEDED;
+    else                                                  pk.icmpKind = ICMPK_OTHER;
+    if (pk.icmpKind == ICMPK_FRAG_NEEDED) {
+        const long long mtu = grabNum(s, "mtu ");
+        if (mtu >= 68 && mtu <= 65535) pk.icmpMtu = (int)mtu;
+    }
+    if (!icmpIsError(pk.icmpKind)) return;
+
+    // слова сообщения без запятых в конце
+    std::vector<std::string> w;
+    {
+        std::istringstream ws(s);
+        for (std::string t; ws >> t; ) {
+            while (!t.empty() && (t.back() == ',' || t.back() == ':')) t.pop_back();
+            w.push_back(t);
+        }
+    }
+    auto isAddr = [](const std::string& t) {
+        return !t.empty() && (t.find('.') != std::string::npos || t.find(':') != std::string::npos) &&
+               t.find_first_not_of("0123456789abcdefABCDEF.:") == std::string::npos;
+    };
+    // «X udp port 53» / «X tcp port 80»
+    for (size_t i = 2; i + 1 < w.size(); i++) {
+        if (w[i] != "port" || (w[i - 1] != "udp" && w[i - 1] != "tcp") || !isAddr(w[i - 2])) continue;
+        pk.icmpInProto = w[i - 1] == "udp" ? "UDP" : "TCP";
+        pk.icmpInDst = w[i - 2];
+        if (isdigit((unsigned char)w[i + 1][0])) pk.icmpInDport = atoi(w[i + 1].c_str());
+        break;
+    }
+    // «host X unreachable», «X unreachable - need to frag», «X protocol 47 unreachable»,
+    // «unreachable route|address|prohibited X», «time exceeded in-transit for X»
+    for (size_t i = 1; pk.icmpInDst.empty() && i < w.size(); i++) {
+        if (w[i] == "unreachable" && isAddr(w[i - 1])) pk.icmpInDst = w[i - 1];
+        else if (w[i] == "protocol" && isAddr(w[i - 1])) pk.icmpInDst = w[i - 1];
+        else if ((w[i - 1] == "route" || w[i - 1] == "address" || w[i - 1] == "prohibited" ||
+                  w[i - 1] == "for") && isAddr(w[i])) pk.icmpInDst = w[i];
+    }
+    // исходный пакет целиком (tcpdump -v): «… a.1 > b.2: …» за описанием ICMP
+    const size_t gt = s.find(" > ");
+    if (gt != std::string::npos) {
+        const size_t sb = s.rfind(' ', gt - 1);
+        const size_t de = s.find(' ', gt + 3);
+        std::string st = s.substr(sb == std::string::npos ? 0 : sb + 1,
+                                  gt - (sb == std::string::npos ? 0 : sb + 1));
+        std::string dt = s.substr(gt + 3, de == std::string::npos ? std::string::npos : de - gt - 3);
+        if (!dt.empty() && dt.back() == ':') dt.pop_back();
+        std::string si, di; int sp = -1, dp = -1, nm = 0;
+        splitIpPort(st, si, sp, nm);
+        splitIpPort(dt, di, dp, nm);
+        if (!nm && isAddr(si) && isAddr(di)) {
+            pk.icmpInSrc = si; pk.icmpInDst = di;
+            const std::string tail = de == std::string::npos ? std::string() : s.substr(de);
+            if (tail.find("Flags [") != std::string::npos) pk.icmpInProto = "TCP";
+            else if (sp >= 0 && dp >= 0) pk.icmpInProto = "UDP";
+            if (sp >= 0 && dp >= 0) { pk.icmpInSport = sp; pk.icmpInDport = dp; }
+        }
+    }
+    // отправитель исходного пакета — тот, кому пришла ошибка
+    if (!pk.icmpInDst.empty() && pk.icmpInSrc.empty()) pk.icmpInSrc = pk.dstIp;
 }
 
 // Протокол по первым байтам payload — свои эвристики в духе Wireshark/nDPI.
@@ -1106,6 +1302,25 @@ static bool parseFrame(const unsigned char* d, size_t len, int linkType,
         pk.proto = "ICMP";
         pk.length = (long long)l4len;
         pk.flags = "[-]";
+        const size_t in = std::min(l4len, len - l4off);   // захваченные байты ICMP
+        if (in >= 2) pk.icmpKind = proto == 1 ? icmp4Kind(l4[0], l4[1]) : icmp6Kind(l4[0], l4[1]);
+        if (in >= 8 && pk.icmpKind == ICMPK_FRAG_NEEDED) {
+            // MTU: у ICMPv4 — младшие 16 бит второго слова (RFC 1191), у ICMPv6 — всё
+            // слово. 0 — старый маршрутизатор, MTU не сообщает
+            const uint32_t mtu = proto == 1 ? be16(l4 + 6) : be32(l4 + 4);
+            if (mtu >= 68 && mtu <= 65535) pk.icmpMtu = (int)mtu;
+        }
+        if (in > 8 && icmpIsError(pk.icmpKind)) parseIcmpInner(l4 + 8, in - 8, pk);
+    } else if (proto == 50) {                 // ESP без NAT-T: IPsec прямо поверх IP
+        pk.proto = "ESP";
+        pk.ipsec = 3;
+        pk.length = (long long)l4len;
+        pk.flags = "[-]";
+    } else if (proto == 47) {                 // GRE: PPTP (GREv1 с PPP внутри) и прочие туннели
+        pk.proto = "GRE";
+        pk.length = (long long)l4len;
+        pk.flags = "[-]";
+        pk.gre = (l4 + 4 <= d + len && (l4[1] & 0x07) == 1 && be16(l4 + 2) == 0x880B) ? 1 : 2;
     } else {
         return false;
     }
@@ -2964,7 +3179,7 @@ long long tsToMicros(const std::string& ts) {
     return (hms[0] * 3600 + hms[1] * 60 + hms[2]) * 1000000LL + usec;
 }
 
-// Кто на том конце IPsec (UDP 500/4500): VPN или звонки по Wi-Fi (VoWiFi —
+// Кто на том конце IPsec (UDP 500/4500, ESP): VPN или звонки по Wi-Fi (VoWiFi —
 // телефон строит IPsec до ePDG своего мобильного оператора). По одному пакету
 // не понять, поэтому решаем по всему дампу и проставляем Packet::ipsecPeer:
 //  - VoWiFi точно: DNS в этом же дампе отдал адрес на имя ePDG (стандартное
@@ -3019,7 +3234,8 @@ static void markIpsecPeers(std::vector<Packet>& packets) {
     }
     if (epdgIps.empty() && vpnIps.empty()) return;
     for (auto& p : packets) {
-        if (!isIpsecPort(p)) continue;
+        // ESP без NAT-T (IP-протокол 50) идёт к тому же адресу, что и IKE по UDP 500
+        if (!isIpsecPort(p) && p.proto != "ESP") continue;
         bool sLoc = isLocalIp(p.srcIp), dLoc = isLocalIp(p.dstIp);
         if (sLoc == dLoc) continue;
         const std::string& remote = sLoc ? p.dstIp : p.srcIp;

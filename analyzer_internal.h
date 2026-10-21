@@ -156,7 +156,7 @@ inline const std::string* remoteSideOf(const Packet& p) {
 const char* vpnPortName(int port, const std::string& proto);
 const char* proxyPortName(int port);
 bool isOwnIspOrg(const std::string& org, const std::string& asn);
-// UDP 500/4500: IPsec-VPN точно, VoWiFi (звонки по Wi-Fi) точно или не ясно
+// UDP 500/4500 и ESP: IPsec-VPN точно, VoWiFi (звонки по Wi-Fi) точно или не ясно
 enum IpsecClass { IPSEC_NONE, IPSEC_VPN, IPSEC_VOWIFI, IPSEC_UNSURE };
 IpsecClass ipsecClass(const Packet& p, int remotePort, const IpInfo* remote);
 // WG/AmneziaWG-листенер абонента по локальному порту (не к служебному порту); nullptr — нет
@@ -166,6 +166,7 @@ std::string sideLabel(const std::string& ip, const IpInfo& info);
 bool flagHas(const std::string& f, char c);
 std::vector<FlowRec> buildFlows(const std::vector<Packet>& packets);
 std::string wsFilter(const std::string& ip, int port = -1, const char* l4 = "tcp");
+const char* wsL4(const std::string& proto);   // "TCP" → "tcp", "ESP" → "esp", "GRE" → "gre", иначе "udp"
 bool seqLess(long long a, long long b);
 TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets, const std::string& localIp);
 bool domainEndsWith(const std::string& d, const std::string& suffix);
