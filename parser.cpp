@@ -145,6 +145,24 @@ static void splitIpPort(const std::string& token, std::string& ip, int& port, in
               (v6 && (c == ':' || isxdigit((unsigned char)c))))) { named |= 1; break; }
 }
 
+// Десятичное число без знака с проверкой переполнения: -1 — цифр нет или число
+// не помещается в long long. atoll/atoi на таком входе — неопределённое поведение.
+static long long parseDec(const char* p) {
+    long long v = 0; bool any = false;
+    for (; isdigit((unsigned char)*p); p++, any = true) {
+        int d = *p - '0';
+        if (v > (LLONG_MAX - d) / 10) return -1;
+        v = v * 10 + d;
+    }
+    return any ? v : -1;
+}
+
+// поле TCP-опции / порт / тип записи: 0..65535, без цифр — 0 (как atoi)
+static int parseU16(const char* p) {
+    long long v = parseDec(p);
+    return v < 0 ? (isdigit((unsigned char)*p) ? 65535 : 0) : (int)std::min(v, 65535LL);
+}
+
 // извлечь "ключ: число" после метки (ack/win/length)
 // Ключ ищется как отдельное слово: раньше "ack" находился внутри "sackOK",
 // а "win" — внутри "wscale"/"win10"-подобных токенов, и число бралось не то.
@@ -158,9 +176,8 @@ static long long grabNum(const std::string& s, const std::string& key) {
         // за ключом без пробела в конце должен идти разделитель, а не продолжение слова
         if (key.back() != ' ' && (p >= s.size() || (s[p] != ' ' && s[p] != ':'))) continue;
         while (p < s.size() && (s[p] == ' ' || s[p] == ':')) p++;
-        long long v = 0; bool any = false;
-        while (p < s.size() && isdigit((unsigned char)s[p])) { v = v * 10 + (s[p] - '0'); p++; any = true; }
-        if (any) return v;
+        // переполнение long long — битая строка, число не берём (-1)
+        if (p < s.size() && isdigit((unsigned char)s[p])) return parseDec(s.c_str() + p);
     }
     return -1;
 }
@@ -174,7 +191,7 @@ static long long grabSeqEnd(const std::string& s) {
     while (p < s.size() && (isdigit((unsigned char)s[p]) || s[p] == ':')) { num += s[p]; p++; }
     size_t c = num.find(':');
     if (c != std::string::npos) num = num.substr(c + 1);
-    return num.empty() ? -1 : atoll(num.c_str());
+    return parseDec(num.c_str());
 }
 
 // НАЧАЛО диапазона seq (A из "A:B"). Нужно для детекта ретрансмиссий:
@@ -190,7 +207,7 @@ static long long grabSeqStart(const std::string& s) {
     while (p < s.size() && (isdigit((unsigned char)s[p]) || s[p] == ':')) { num += s[p]; p++; }
     size_t c = num.find(':');
     if (c != std::string::npos) num = num.substr(0, c);
-    return num.empty() ? -1 : atoll(num.c_str());
+    return parseDec(num.c_str());
 }
 
 static void parseIcmpText(const std::string& s, Packet& pk);
@@ -340,7 +357,7 @@ static Packet parseLine(const std::string& raw, int* named = nullptr) {
             }
         } else if (pk.proto == "TCP") {
             size_t lp = rest.find(", length ");
-            if (lp != std::string::npos && atoll(rest.c_str() + lp + 9) > 0) {
+            if (lp != std::string::npos && parseDec(rest.c_str() + lp + 9) > 0) {
                 m = rest.find(' ', lp + 9);
                 if (m != std::string::npos) m = rest.find_first_not_of(' ', m);
             }
@@ -405,7 +422,7 @@ static Packet parseLine(const std::string& raw, int* named = nullptr) {
                     {"TXT", 16}, {"AAAA", 28}, {"SRV", 33}, {"SVCB", 64}, {"HTTPS", 65}, {"ANY", 255} };
                 for (const auto& e : kQt) if (qt == e.first) { pk.dnsQtype = e.second; break; }
                 if (pk.dnsQtype == 0 && qt.size() > 4 && qt.compare(0, 4, "Type") == 0)
-                    pk.dnsQtype = (uint16_t)atoi(qt.c_str() + 4);
+                    pk.dnsQtype = (uint16_t)parseU16(qt.c_str() + 4);
                 // домен идёт сразу после "A? " / "AAAA? " / "CNAME? "
                 std::string dom;
                 size_t p = q + 2;
@@ -469,11 +486,11 @@ static Packet parseLine(const std::string& raw, int* named = nullptr) {
             std::stringstream os(rest.substr(ob + 9, oe - ob - 9));
             std::string o;
             while (std::getline(os, o, ',')) {
-                if (o.rfind("mss ", 0) == 0)         pk.mss = atoi(o.c_str() + 4);
-                else if (o.rfind("wscale ", 0) == 0) pk.wscale = std::min(atoi(o.c_str() + 7), 14);
-                else if (o.rfind("sack ", 0) == 0)   pk.sackBlocks = atoi(o.c_str() + 5);
+                if (o.rfind("mss ", 0) == 0)         pk.mss = parseU16(o.c_str() + 4);
+                else if (o.rfind("wscale ", 0) == 0) pk.wscale = std::min(parseU16(o.c_str() + 7), 14);
+                else if (o.rfind("sack ", 0) == 0)   pk.sackBlocks = parseU16(o.c_str() + 5);
                 else if (o.rfind("TS val ", 0) == 0) {           // "TS val 123 ecr 456"
-                    pk.tsVal = atoll(o.c_str() + 7);
+                    pk.tsVal = parseDec(o.c_str() + 7);
                     long long e = grabNum(o, "ecr ");
                     if (e >= 0) pk.tsEcr = e; else pk.tsVal = -1;
                 }
@@ -498,7 +515,7 @@ static Packet parseLine(const std::string& raw, int* named = nullptr) {
             size_t b = rest.rfind('(', e);
             if (b != std::string::npos && e > b + 1 &&
                 rest.find_first_not_of("0123456789", b + 1) == e)
-                pk.length = atoll(rest.c_str() + b + 1);
+                pk.length = std::max(0LL, parseDec(rest.c_str() + b + 1));
         }
     }
 
@@ -897,7 +914,7 @@ static void parseIcmpText(const std::string& s, Packet& pk) {
         if (w[i] != "port" || (w[i - 1] != "udp" && w[i - 1] != "tcp") || !isAddr(w[i - 2])) continue;
         pk.icmpInProto = w[i - 1] == "udp" ? "UDP" : "TCP";
         pk.icmpInDst = w[i - 2];
-        if (isdigit((unsigned char)w[i + 1][0])) pk.icmpInDport = atoi(w[i + 1].c_str());
+        if (isdigit((unsigned char)w[i + 1][0])) pk.icmpInDport = parseU16(w[i + 1].c_str());
         break;
     }
     // «host X unreachable», «X unreachable - need to frag», «X protocol 47 unreachable»,
@@ -1750,6 +1767,14 @@ class HelloReassembler {
     static const size_t kMaxBuf = 24 * 1024;
     static const int kMaxSegs = 64;
     static const size_t kMaxStreams = 20000;
+    // Память сборки — как у QUIC: дырка перед пришедшим сегментом не больше
+    // kMaxGap (disorder обходчиков DPI шлёт хвост ClientHello раньше головы, но
+    // это сотни байт — единицы КБ), все буферы вместе — не больше kMaxTotal.
+    // Иначе по байту в конце окна на поток раздувал буфер до 24 КБ (вдвое — с
+    // картой), и тысячи таких потоков в подложенном дампе съедали сотни МБ.
+    static const size_t kMaxGap = 8 * 1024;
+    static const size_t kMaxTotal = 32 * 1024 * 1024;
+    size_t total_ = 0;                  // байт в buf и have всех сборок
 
     // начало ClientHello. Средства обхода DPI (zapret/GoodbyeDPI/ByeDPI) режут его
     // на сегменты по 1–2 байта — поэтому начало ловим и по крошечному сегменту.
@@ -1791,7 +1816,19 @@ class HelloReassembler {
     void finish(std::vector<Packet>& out, std::unordered_map<std::string, Pending>::iterator it) {
         apply(out, it->second);
         syn_.erase(it->first);
+        drop(it);
+    }
+    void drop(std::unordered_map<std::string, Pending>::iterator it) {
+        total_ -= it->second.buf.size() + it->second.have.size();
         pend_.erase(it);
+    }
+    // бюджет исчерпан: собранные ClientHello (SNI и JA4 уже записаны) больше не
+    // держим — теряется лишь поздний настоящий ClientHello поверх фейка
+    void reclaim(std::vector<Packet>& out, const Pending* keep) {
+        for (auto i = pend_.begin(); i != pend_.end(); ) {
+            auto cur = i++;
+            if (cur->second.end && &cur->second != keep) finish(out, cur);
+        }
     }
 
 public:
@@ -1814,7 +1851,7 @@ public:
             s = Syn();
             s.isn = seq; s.ttl = pk.ttl; s.tsVal = pk.tsVal; s.md5 = pk.tcpMd5;
             auto old = pend_.find(key);               // порт занят заново — новый поток
-            if (old != pend_.end()) { apply(out, old->second); pend_.erase(old); }
+            if (old != pend_.end()) { apply(out, old->second); drop(old); }
             if (!pay || n == 0) return;
             seq++;                                    // данные в SYN (TFO) — с ISN+1
         }
@@ -1853,14 +1890,14 @@ public:
             // ClientHello это фейк из нулей с тем же seq (zapret fakedsplit) — пропускаем
             if (it == pend_.end() || it->second.idx == SIZE_MAX) {
                 if (sn) syn_.erase(sy);
-                if (it != pend_.end()) pend_.erase(it);
+                if (it != pend_.end()) drop(it);
             }
             return;
         }
         if (it == pend_.end()) {
             // без SYN поток открывает только начало ClientHello; с SYN — и часть,
             // пришедшая раньше начала (disorder)
-            if (off >= kMaxBuf || (off > 0 && !sn)) return;
+            if (off >= kMaxBuf || off > kMaxGap || (off > 0 && !sn)) return;
             if (pend_.size() >= kMaxStreams) flush(out);   // брошенные сборки
             Pending np;
             np.base = base;
@@ -1869,7 +1906,14 @@ public:
         Pending& pd = it->second;
         // за собранным ClientHello пошли следующие данные (или поток слишком длинный)
         if ((pd.end && off >= pd.end) || off >= kMaxBuf) { finish(out, it); return; }
-        if (pd.buf.size() < off + qn) { pd.buf.resize(off + qn); pd.have.resize(off + qn); }
+        if (off > pd.buf.size() + kMaxGap) return;    // далеко за собранным — не сборка ClientHello
+        if (pd.buf.size() < off + qn) {
+            const size_t add = 2 * (off + qn - pd.buf.size());   // buf и have
+            if (total_ + add > kMaxTotal) reclaim(out, &pd);
+            if (total_ + add > kMaxTotal) return;               // бюджет исчерпан — сегмент пропускаем
+            total_ += add;
+            pd.buf.resize(off + qn); pd.have.resize(off + qn);
+        }
         bool changed = off == 0;
         for (size_t i = 0; i < qn; i++) {
             if (!pd.have[off + i] || pd.buf[off + i] != q[i]) changed = true;
@@ -1894,6 +1938,7 @@ public:
     void flush(std::vector<Packet>& out) {
         for (auto& kv : pend_) apply(out, kv.second);
         pend_.clear();
+        total_ = 0;
     }
 };
 
@@ -2019,70 +2064,30 @@ public:
 // (WebSocket upgrade и ответ 101) — тогда отсчёт начинается заново, не более
 // трёх раз. Vision дополняет записи мусором — его так не видно.
 // Решение пишется в пакет с заголовком решающей записи: 2 — рисунок, 1 — нет.
+// Разбор в два этапа. Границы записей видны только в своём направлении, и
+// TlsRecordWalker при чтении файла собирает заголовки записей каждого
+// направления отдельно (Packet::tlsRecs). Рисунок же — из обеих сторон по
+// порядку: его ищет resolveTlsInTls, когда пакеты уже слиты по времени. Иначе
+// пара «_in»/«_out» (стороны в разных файлах) рисунка не давала.
 // ------------------------------------------------------------------
-class TlsInTlsTracker {
+// Packet::tlsRecs: (тип записи << 16) | длина; служебные значения — ниже
+static const uint32_t TLSREC_LOST     = 0;              // граница записей потеряна
+static const uint32_t TLSREC_START    = 1u << 16;       // направление начато (TLS-запись с начала)
+static const uint32_t TLSREC_START_CH = (1u << 16) | 1; // начато ClientHello
+
+class TlsRecordWalker {
     struct Dir {
-        uint32_t nextSeq = 0;  bool seqSet = false;
+        uint32_t startSeq = 0, nextSeq = 0;
         uint8_t rh[5] = {};  int rhHave = 0;   // заголовок записи
         uint32_t recLeft = 0;                  // тело записи — пропускаем
-    };
-    struct Conn {
-        Dir c, s;                  // клиент → сервер, сервер → клиент
-        uint32_t chSeq = 0;        // seq внешнего ClientHello
-        int phase = 0;             // 0 внешнее рукопожатие, 1 после Finished клиента TLS 1.3,
-                                   // 2 первая порция данных клиента, 3 ответ сервера
-        int rounds = 0;            // перезапусков отсчёта
-        uint32_t c1 = 0, s1 = 0;   // открытого текста в порции клиента и в ответе сервера
         uint32_t records = 0;
     };
-    std::unordered_map<std::string, Conn> conns_;
-    static const size_t kMaxConns = 20000;
+    std::unordered_map<std::string, Dir> dirs_;
+    static const size_t kMaxDirs = 40000;
     static const uint32_t kMaxRecords = 300;
-    static const uint32_t kMaxBurst = 64 * 1024;   // больше — уже передача данных
 
-    static bool innerFinished(uint32_t len) {
-        static const uint32_t over[] = {17, 24, 16};
-        for (uint32_t ov : over) {
-            if (len <= ov) continue;
-            const uint32_t pt = len - ov;
-            if (pt == 58 || pt == 64 || pt == 74 || pt == 80) return true;
-        }
-        return false;
-    }
-
-    // запись прикладных данных длиной len; false — решение принято или ждать нечего
-    static bool appRecord(Conn& k, bool fromClient, uint32_t len, Packet& pk) {
-        const uint32_t pt = len > 16 ? len - 16 : 0;   // открытый текст, грубо
-        if (!fromClient) {
-            if (k.phase < 2) return true;   // шифрованное рукопожатие сервера, NewSessionTicket
-            k.phase = 3;
-            k.s1 += pt;
-            if (k.s1 > kMaxBurst) { pk.tlsInTls = 1; return false; }
-            return true;
-        }
-        switch (k.phase) {
-        case 0:
-            // Finished внешнего TLS 1.3 (SHA-256 / SHA-384) — ещё не данные
-            if (len == 53 || len == 69) { k.phase = 1; return true; }
-            k.phase = 2; k.c1 = pt;
-            return true;
-        case 1:
-            k.phase = 2; k.c1 = pt;
-            return true;
-        case 2:
-            k.c1 += pt;
-            return k.c1 <= kMaxBurst;
-        default:
-            if (k.c1 >= 280 && k.s1 >= 600 && innerFinished(len)) { pk.tlsInTls = 2; return false; }
-            // короткий ответ сервера (101 Switching Protocols и т.п.) — туннель может начаться дальше
-            if (k.s1 < 600 && ++k.rounds <= 3) { k.phase = 2; k.c1 = pt; k.s1 = 0; return true; }
-            pk.tlsInTls = 1;
-            return false;
-        }
-    }
-
-    // false — поток бросаем (решение принято, мусор вместо записи, слишком длинно)
-    static bool walk(Conn& k, Dir& d, bool fromClient, const uint8_t* p, size_t n, Packet& pk) {
+    // false — направление бросаем (мусор вместо записи, слишком длинно)
+    static bool walk(Dir& d, const uint8_t* p, size_t n, Packet& pk) {
         while (n > 0) {
             if (d.recLeft > 0) {
                 const size_t m = std::min<size_t>(d.recLeft, n);
@@ -2095,9 +2100,9 @@ class TlsInTlsTracker {
             const uint8_t type = d.rh[0];
             const uint32_t len = ((uint32_t)d.rh[3] << 8) | d.rh[4];
             if (type < 20 || type > 23 || d.rh[1] != 3 || len == 0 || len > 18432) return false;
-            if (++k.records > kMaxRecords) return false;
+            if (++d.records > kMaxRecords) return false;
             d.recLeft = len;
-            if (type == 23 && !appRecord(k, fromClient, len, pk)) return false;
+            pk.tlsRecs.push_back(((uint32_t)type << 16) | len);
         }
         return true;
     }
@@ -2108,46 +2113,146 @@ public:
         if (out.empty() || !pay || n == 0) return;
         Packet& pk = out.back();
         if (pk.proto != "TCP" || pk.seqStart < 0) return;
-        const bool ch = n >= 6 && pay[0] == 0x16 && pay[1] == 0x03 && pay[5] == 0x01;
-        if (conns_.empty() && !ch) return;
+        const bool start = n >= 5 && pay[0] == 0x16 && pay[1] == 0x03;
+        const bool hello = start && n >= 6 && (pay[5] == 0x01 || pay[5] == 0x02);
+        if (dirs_.empty() && !start) return;
         const uint32_t seq = (uint32_t)pk.seqStart;
-        const std::string a = pk.srcIp + " " + std::to_string(pk.srcPort);
-        const std::string b = pk.dstIp + " " + std::to_string(pk.dstPort);
-
-        bool fromClient = true;
-        auto it = conns_.find(a + ">" + b);
-        if (it == conns_.end()) {
-            it = conns_.find(b + ">" + a);
-            if (it != conns_.end()) fromClient = false;
+        std::string key = pk.srcIp + " " + std::to_string(pk.srcPort) + ">" +
+                          pk.dstIp + " " + std::to_string(pk.dstPort);
+        auto it = dirs_.find(key);
+        if (it != dirs_.end() && hello && it->second.startSeq != seq) {
+            dirs_.erase(it);                      // те же порты — новое соединение
+            it = dirs_.end();
         }
-        if (it != conns_.end() && fromClient && ch && it->second.chSeq != seq) {
-            conns_.erase(it);                     // те же порты — новое соединение
-            it = conns_.end();
+        if (it == dirs_.end()) {
+            // начало направления — TLS-запись с первого байта; иначе начало не в дампе
+            if (!start) return;
+            if (dirs_.size() >= kMaxDirs) dirs_.clear();   // брошенные соединения
+            Dir d;
+            d.startSeq = d.nextSeq = seq;
+            it = dirs_.emplace(std::move(key), d).first;
+            pk.tlsRecs.push_back(n >= 6 && pay[5] == 0x01 ? TLSREC_START_CH : TLSREC_START);
         }
-        if (it == conns_.end()) {
-            if (!ch) return;
-            if (conns_.size() >= kMaxConns) conns_.clear();   // брошенные соединения
-            Conn k;
-            k.chSeq = seq;
-            k.c.nextSeq = seq; k.c.seqSet = true;
-            it = conns_.emplace(a + ">" + b, k).first;
-            fromClient = true;
-        }
-        Conn& k = it->second;
-        Dir& d = fromClient ? k.c : k.s;
-        if (!d.seqSet) {
-            // первый сегмент сервера — ServerHello; иначе начало ответа не попало в дамп
-            if (n < 5 || pay[0] != 0x16 || pay[1] != 0x03) { conns_.erase(it); return; }
-            d.nextSeq = seq; d.seqSet = true;
-        }
+        Dir& d = it->second;
         const int32_t diff = (int32_t)(seq - d.nextSeq);
-        if (diff > 0) { conns_.erase(it); return; }   // дырка — граница записей потеряна
+        if (diff > 0) {                                // дырка — граница записей потеряна
+            pk.tlsRecs.push_back(TLSREC_LOST);
+            dirs_.erase(it);
+            return;
+        }
         const size_t skip = (size_t)(-(int64_t)diff);
         if (skip >= n) return;                         // повтор уже разобранного
         d.nextSeq += (uint32_t)(n - skip);
-        if (!walk(k, d, fromClient, pay + skip, n - skip, pk)) conns_.erase(it);
+        if (!walk(d, pay + skip, n - skip, pk)) { pk.tlsRecs.push_back(TLSREC_LOST); dirs_.erase(it); }
     }
 };
+
+namespace {
+struct TitConn {
+    bool cStarted = true, sStarted = false;   // направления начаты (клиент — своим ClientHello)
+    uint32_t chSeq = 0;        // seq внешнего ClientHello
+    int phase = 0;             // 0 внешнее рукопожатие, 1 после Finished клиента TLS 1.3,
+                               // 2 первая порция данных клиента, 3 ответ сервера
+    int rounds = 0;            // перезапусков отсчёта
+    uint32_t c1 = 0, s1 = 0;   // открытого текста в порции клиента и в ответе сервера
+    uint32_t records = 0;
+};
+const uint32_t kTitMaxRecords = 300;
+const uint32_t kTitMaxBurst = 64 * 1024;   // больше — уже передача данных
+
+bool titInnerFinished(uint32_t len) {
+    static const uint32_t over[] = {17, 24, 16};
+    for (uint32_t ov : over) {
+        if (len <= ov) continue;
+        const uint32_t pt = len - ov;
+        if (pt == 58 || pt == 64 || pt == 74 || pt == 80) return true;
+    }
+    return false;
+}
+
+// запись прикладных данных длиной len; false — решение принято или ждать нечего
+bool titAppRecord(TitConn& k, bool fromClient, uint32_t len, Packet& pk) {
+    const uint32_t pt = len > 16 ? len - 16 : 0;   // открытый текст, грубо
+    if (!fromClient) {
+        if (k.phase < 2) return true;   // шифрованное рукопожатие сервера, NewSessionTicket
+        k.phase = 3;
+        k.s1 += pt;
+        if (k.s1 > kTitMaxBurst) { pk.tlsInTls = 1; return false; }
+        return true;
+    }
+    switch (k.phase) {
+    case 0:
+        // Finished внешнего TLS 1.3 (SHA-256 / SHA-384) — ещё не данные
+        if (len == 53 || len == 69) { k.phase = 1; return true; }
+        k.phase = 2; k.c1 = pt;
+        return true;
+    case 1:
+        k.phase = 2; k.c1 = pt;
+        return true;
+    case 2:
+        k.c1 += pt;
+        return k.c1 <= kTitMaxBurst;
+    default:
+        if (k.c1 >= 280 && k.s1 >= 600 && titInnerFinished(len)) { pk.tlsInTls = 2; return false; }
+        // короткий ответ сервера (101 Switching Protocols и т.п.) — туннель может начаться дальше
+        if (k.s1 < 600 && ++k.rounds <= 3) { k.phase = 2; k.c1 = pt; k.s1 = 0; return true; }
+        pk.tlsInTls = 1;
+        return false;
+    }
+}
+} // namespace
+
+// Этап 2: пакеты уже в порядке времени (после слияния файлов). Записи пакетов
+// больше не нужны — память отдаём.
+static void resolveTlsInTls(std::vector<Packet>& packets) {
+    std::unordered_map<std::string, TitConn> conns;
+    const size_t kMaxConns = 20000;
+    for (Packet& pk : packets) {
+        if (pk.proto != "TCP" || pk.seqStart < 0) continue;
+        if (pk.tlsRecs.empty() && (conns.empty() || pk.length <= 0)) continue;
+        const std::vector<uint32_t>& recs = pk.tlsRecs;
+        const uint32_t seq = (uint32_t)pk.seqStart;
+        const std::string a = pk.srcIp + " " + std::to_string(pk.srcPort);
+        const std::string b = pk.dstIp + " " + std::to_string(pk.dstPort);
+        const bool ch = !recs.empty() && recs[0] == TLSREC_START_CH;
+
+        bool fromClient = true;
+        auto it = conns.find(a + ">" + b);
+        if (it == conns.end()) {
+            it = conns.find(b + ">" + a);
+            if (it != conns.end()) fromClient = false;
+        }
+        if (it != conns.end() && fromClient && ch && it->second.chSeq != seq) {
+            conns.erase(it);                      // те же порты — новое соединение
+            it = conns.end();
+        }
+        if (it == conns.end()) {
+            if (!ch) continue;
+            if (conns.size() >= kMaxConns) conns.clear();   // брошенные соединения
+            TitConn k;
+            k.chSeq = seq;
+            it = conns.emplace(a + ">" + b, k).first;
+            fromClient = true;
+        }
+        TitConn& k = it->second;
+        bool& started = fromClient ? k.cStarted : k.sStarted;
+        if (!started) {
+            // первый сегмент сервера — ServerHello; иначе начало ответа не попало в дамп
+            if (recs.empty() || (recs[0] >> 16) != 1) { conns.erase(it); continue; }
+            started = true;
+        }
+        for (uint32_t r : recs) {
+            const uint32_t type = r >> 16;
+            if (type == 1) continue;                       // начало направления
+            if (type == 0 || ++k.records > kTitMaxRecords ||
+                (type == 23 && !titAppRecord(k, fromClient, r & 0xFFFF, pk))) {
+                conns.erase(it);
+                break;
+            }
+        }
+    }
+    for (Packet& pk : packets) std::vector<uint32_t>().swap(pk.tlsRecs);
+}
 
 // ------------------------------------------------------------------
 // DNS поверх TCP/53 (RFC 7766): перед каждым сообщением 2 байта длины; в
@@ -2501,7 +2606,12 @@ class QuicHelloCollector {
         bool done = false;
         int noHead = 0;                  // Initial-пакетов, после которых байта 0 всё нет
     };
-    std::map<std::string, Flow> fl_;    // ключ — направление потока (клиент -> сервер)
+    // ключ — направление (клиент -> сервер) и DCID: один UDP-сокет может вести
+    // несколько QUIC-соединений подряд, у каждого свой DCID и свои ключи Initial
+    std::map<std::string, Flow> fl_;
+    // направления, на которые сервер ответил Retry: следующий DCID там — то же
+    // соединение (ClientHello повторяется), второй SNI ему не пишем
+    std::set<std::string> retried_;
     static constexpr size_t kMaxCrypto = 64 * 1024;
     static constexpr size_t kMaxFlows = 20000;
     // Память сборки: буфер растёт только на пришедшие байты и дырку перед ними
@@ -2526,8 +2636,9 @@ class QuicHelloCollector {
                    const uint8_t* dcid, size_t dl,
                    const uint8_t* q, size_t pnOff, size_t end) {
         const Packet& pk = out[idx];
-        std::string key = pk.srcIp + " " + std::to_string(pk.srcPort) + ">" +
-                          pk.dstIp + " " + std::to_string(pk.dstPort);
+        const std::string dir = pk.srcIp + " " + std::to_string(pk.srcPort) + ">" +
+                                pk.dstIp + " " + std::to_string(pk.dstPort);
+        const std::string key = dir + " " + std::string((const char*)dcid, dl);
         auto it = fl_.find(key);
         if (it != fl_.end() && it->second.done) return;
         if (it == fl_.end() && (fl_.size() >= kMaxFlows || total_ >= kMaxTotal)) return;
@@ -2548,6 +2659,7 @@ class QuicHelloCollector {
             it->second.idx = idx;
             it->second.ver = ver;
             it->second.keys = k;
+            if (retried_.erase(dir)) { it->second.done = true; return; }
         }
         Flow& f = it->second;
 
@@ -2634,7 +2746,14 @@ public:
             bool v2 = (ver == QUIC_V2);
             bool initial = v2 ? (type == 1) : (type == 0);
             bool retry   = v2 ? (type == 0) : (type == 3);
-            if (retry) { if (out[idx].quic == 0) out[idx].quic = 2; break; }
+            if (retry) {
+                if (out[idx].quic == 0) out[idx].quic = 2;
+                const Packet& pk = out[idx];                   // Retry шлёт сервер
+                if (retried_.size() < kMaxFlows)
+                    retried_.insert(pk.dstIp + " " + std::to_string(pk.dstPort) + ">" +
+                                    pk.srcIp + " " + std::to_string(pk.srcPort));
+                break;
+            }
             size_t p = 5;
             size_t dl = q[p++];
             if (dl > 20 || p + dl + 1 > qn) break;
@@ -2683,7 +2802,7 @@ static std::vector<Packet> readPcapng(const std::vector<unsigned char>& buf,
     std::vector<IfDesc> ifaces;
     HelloReassembler hello;
     TlsHsTracker tlsHs;
-    TlsInTlsTracker tit;
+    TlsRecordWalker tit;
     QuicHelloCollector quic;
     DnsTcpReassembler dnsTcp;
     // у SPB своего времени нет — берём время последнего EPB, чтобы пакет не
@@ -2859,7 +2978,7 @@ std::vector<Packet> parsePcapBuffer(const std::vector<unsigned char>& buf, std::
     size_t pos = 24; // после глобального заголовка
     HelloReassembler hello;
     TlsHsTracker tlsHs;
-    TlsInTlsTracker tit;
+    TlsRecordWalker tit;
     QuicHelloCollector quic;
     DnsTcpReassembler dnsTcp;
     while (pos + 16 <= buf.size()) {
@@ -3103,6 +3222,7 @@ bool parseDumpBuffer(const unsigned char* d, size_t n, std::vector<Packet>& out,
     out.clear();
     if (n >= 4 && isPcapMagic(d)) {
         out = parsePcapBuffer(std::vector<unsigned char>(d, d + n), err);
+        resolveTlsInTls(out);
         return err.empty();
     }
     std::istringstream is(std::string((const char*)d, n));
@@ -3389,7 +3509,7 @@ bool loadDumpSet(const std::vector<std::string>& paths,
                     // одном поток мог прерваться дыркой, в другом — нет
                     if (!(packets[b].tlsHs & TLSHS_ALERT)) packets[b].tlsAlert = packets[a].tlsAlert;
                     packets[b].tlsHs |= packets[a].tlsHs;
-                    if (packets[a].tlsInTls > packets[b].tlsInTls) packets[b].tlsInTls = packets[a].tlsInTls;
+                    if (packets[b].tlsRecs.empty()) packets[b].tlsRecs.swap(packets[a].tlsRecs);
                     break;
                 }
             }
@@ -3451,6 +3571,8 @@ bool loadDumpSet(const std::vector<std::string>& paths,
                   << C::RST << "\n";
         return false;
     }
+    // TLS внутри TLS — по обеим сторонам, уже слитым по времени
+    resolveTlsInTls(packets);
 
     // ФЛОУ-МАРКИРОВКА WireGuard: детект по payload ловит только handshake
     // (148/92 байт). Data-пакеты WG (тип 4, произвольная длина) сигнатуры не

@@ -255,9 +255,12 @@ struct Packet {
     // рукопожатие TLS открытым текстом (TLSHS_*): что началось в этом сегменте; только pcap
     uint8_t     tlsHs = 0;
     int         tlsAlert = -1;   // код открытого TLS Alert (при TLSHS_ALERT), -1 — нет
-    // TLS внутри TLS по длинам записей (TlsInTlsTracker, только pcap): 2 — рисунок
+    // TLS внутри TLS по длинам записей (resolveTlsInTls, только pcap): 2 — рисунок
     // внутреннего рукопожатия (VLESS/Trojan без Vision), 1 — проверено, рисунка нет
     uint8_t     tlsInTls = 0;
+    // заголовки TLS-записей сегмента для этого разбора (только пока грузится
+    // дамп: пишет TlsRecordWalker, читает и очищает resolveTlsInTls)
+    std::vector<uint32_t> tlsRecs;
     // UDP-payload от 32 Б по захваченным байтам (только pcap): 1 — похоже на случайные
     // (шифр или мусор AmneziaWG), 2 — видна структура (нули, малая энтропия); 0 — не оценён
     uint8_t     udpRand = 0;
@@ -420,6 +423,8 @@ struct IpInfo {
     std::string flagSrc;         // откуда флаги VPN/proxy/Tor: "ipapi.is", "IP2Proxy" ("" — флагов нет)
     std::string pxType;          // тип по базе IP2Proxy: VPN, TOR, PUB, WEB, DCH, RES, CPN, EPN, SES,
                                  // AIC; "-" — в базе, но не прокси; "" — базы нет или не спрашивали
+    int pxGen = 0;               // по какой базе (ip2proxyGeneration) взят pxType
+    uint8_t pxOwn = 0;           // что поставила только база: PXOWN_* — чтобы снять при её смене
     // Белый список VPN (vpn_whitelist_*): крупный сервис — баллов VPN не даёт и
     // VPN не называется. Ставится только в копии кэша для анализа VPN
     // (withVpnWhitelist), проверки соединения видят адрес как обычно.
@@ -605,8 +610,17 @@ bool ip2proxyLookup(const std::string& ip, Ip2ProxyRec& r); // false — баз�
 std::string ip2proxyDbInfo();                               // «PX2, от 2026-09-01» или текст ошибки
 const char* ip2proxyTypeName(const std::string& type);      // «VPN-сервис», «выход Tor»…
 // Дописывает в кэш тип по базе и флаги VPN/proxy/Tor (зовётся из resolveHostingSecondary).
+// Прежний результат базы по адресу сначала снимает — повторный вызов его пересчитывает.
 void ip2proxyApply(std::unordered_map<std::string, IpInfo>& cache,
                    const std::vector<std::string>& ips);
+// IpInfo::pxOwn: флаги, поставленные базой поверх пустых, и запись, созданная
+// только по базе (онлайн-сервисы не ответили)
+enum { PXOWN_VPN = 1, PXOWN_TOR = 2, PXOWN_PROXY = 4, PXOWN_HOSTING = 8, PXOWN_ENTRY = 16 };
+// Поколение базы: растёт при каждом ip2proxyReset («Перечитать analyzer.ini»).
+// Кэш с другим поколением проверен по старой (или убранной) базе.
+int ip2proxyGeneration();
+// Снять с адреса всё, что поставила база (флаги других источников остаются)
+void ip2proxyForget(IpInfo& i);
 std::string resolveHostToIp(const std::string& host);
 // Все адреса домена (сначала IPv4, потом IPv6): 0 — есть, 1 — NXDOMAIN / нет
 // записей, 2 — ошибка резолва

@@ -574,6 +574,12 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
     // потока (фейк с неверным seq), 0 — дальше в потоке или рукопожатия в дампе нет
     struct Hello { TcpConnState* c; size_t i; long long t; int pos; };
     std::vector<Hello> hellos;
+    // Поколение сессии на кортеже: порт после закрытия переиспользуется (NAT,
+    // повторный connect), и новый SYN с другим ISN — уже другое соединение. Без
+    // этого ClientHello второго сравнивался с ISN первого и выглядел фейком
+    std::unordered_map<std::string, std::string> curKey;   // "rip|rport|lport|lip" → ключ сессии
+    std::unordered_map<std::string, int> gens;
+    std::vector<TcpConnState*> pktConn(packets.size(), nullptr);
     for (size_t i = 0; i < packets.size(); i++) {
         const Packet& p = packets[i];
         long long t = absT[i];
@@ -588,8 +594,21 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
         // локальный адрес — в ключе: в дампе сегмента LAN (или «-i any» на роутере
         // с NAT, сохраняющим порт) два устройства с одним портом к одному серверу
         // сливались — RST одного и данные другого давали «поддельный RST»
-        TcpConnState& c = tt.conns[rip + "|" + std::to_string(rport) + "|" + std::to_string(lport) +
-                                   "|" + lip];
+        const std::string base = rip + "|" + std::to_string(rport) + "|" + std::to_string(lport) + "|" + lip;
+        auto ck = curKey.find(base);
+        TcpConnState* cp = &tt.conns[ck == curKey.end() ? base : ck->second];
+        // новая сессия: SYN абонента с другим ISN, а прежняя закрыта или уже
+        // состоялась (SYN-ACK, данные). Повтор SYN идёт с тем же ISN
+        if (sLoc && flagHas(p.flags, 'S') && !flagHas(p.flags, '.') && p.seqStart >= 0 &&
+            cp->isn >= 0 && p.seqStart != cp->isn &&
+            (cp->inRst || cp->finOutTime >= 0 || cp->finInTime >= 0 || cp->synack > 0 ||
+             cp->firstOutDataTime >= 0)) {
+            const std::string key = base + "#" + std::to_string(++gens[base]);
+            curKey[base] = key;
+            cp = &tt.conns[key];
+        }
+        pktConn[i] = cp;
+        TcpConnState& c = *cp;
         if (c.ip.empty()) { c.ip = rip; c.rport = rport; c.lport = lport; c.lip = lip; }
         if (t >= 0) { if (c.firstTime < 0) c.firstTime = t; c.lastTime = t; }
         if (p.tlsInTls > c.tlsInTls) c.tlsInTls = p.tlsInTls;
@@ -733,9 +752,7 @@ TcpConnTable buildTcpConnTable(const std::vector<Packet>& packets,
             if (p.proto != "TCP" || p.length <= 0 || p.ttl <= 0 || p.ttl > 12) continue;
             bool sLoc = isLocal(p.srcIp), dLoc = isLocal(p.dstIp);
             if (!sLoc || dLoc) continue;
-            auto it = tt.conns.find(p.dstIp + "|" + std::to_string(p.dstPort) + "|" +
-                                    std::to_string(p.srcPort) + "|" + p.srcIp);
-            if (it != tt.conns.end()) it->second.lowTtlOut++;
+            if (pktConn[i]) pktConn[i]->lowTtlOut++;
         }
     }
     // Настоящий ClientHello. Обходчики DPI (zapret, GoodbyeDPI, ByeDPI) шлют перед
