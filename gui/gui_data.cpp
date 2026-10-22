@@ -605,11 +605,18 @@ void resolveDataset(const std::shared_ptr<Dataset>& ds) {
     auto cache = std::make_shared<IpCache>(old ? *old : IpCache{});
 
     std::set<std::string> pub, recheck;
+    const int pxGen = ip2proxyGeneration();
     for (const auto& r : ds->flows) {
         if (isLocalIp(r.remoteIp) || isPrivateIp(r.remoteIp)) continue;
         auto it = cache->find(r.remoteIp);
-        if (it == cache->end()) pub.insert(r.remoteIp);
-        else if (it->second.pxType.empty()) recheck.insert(r.remoteIp);
+        if (it == cache->end()) { pub.insert(r.remoteIp); continue; }
+        IpInfo& i = it->second;
+        if (!i.pxType.empty() && i.pxGen == pxGen) continue;
+        // проверен по прежней базе (её сменили или убрали в analyzer.ini) —
+        // её признаки снимаем; запись, взятую только из базы, резолвим заново
+        if (i.pxOwn & PXOWN_ENTRY) { cache->erase(it); pub.insert(r.remoteIp); continue; }
+        ip2proxyForget(i);
+        recheck.insert(r.remoteIp);
     }
     // адреса из кэша, которые ещё не сверяли с IP2Proxy (базу подключили
     // после первого резолва) — сверяем: это локальный файл, лимитов нет

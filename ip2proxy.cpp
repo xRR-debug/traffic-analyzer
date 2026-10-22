@@ -40,6 +40,7 @@ Db g_db;
 std::string g_openedPath;     // для какого пути пробовали открыть (смена ini — переоткрыть)
 std::string g_err;            // почему не открылась ("" — открыта или не задана)
 bool g_errShown = false;
+std::atomic<int> g_gen{1};             // поколение базы (ip2proxyGeneration)
 
 uint32_t le32(const uint8_t* p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -215,6 +216,23 @@ void ip2proxyReset() {
     g_openedPath.clear();
     g_err.clear();
     g_errShown = false;
+    ++g_gen;
+}
+
+int ip2proxyGeneration() { return g_gen; }
+
+void ip2proxyForget(IpInfo& i) {
+    if (i.pxOwn & PXOWN_VPN) i.isVpn = false;
+    if (i.pxOwn & PXOWN_TOR) i.isTor = false;
+    if (i.pxOwn & PXOWN_PROXY) i.isProxy = false;
+    if (i.pxOwn & PXOWN_HOSTING) i.hosting = false;
+    for (const char* s : {" + IP2Proxy", "IP2Proxy + ", "IP2Proxy"}) {
+        const size_t p = i.flagSrc.find(s);
+        if (p != std::string::npos) { i.flagSrc.erase(p, strlen(s)); break; }
+    }
+    i.pxType.clear();
+    i.pxGen = 0;
+    i.pxOwn = i.pxOwn & PXOWN_ENTRY;   // запись по базе — так и осталась записью по базе
 }
 
 bool ip2proxyLookup(const std::string& ip, Ip2ProxyRec& r) {
@@ -276,20 +294,23 @@ void ip2proxyApply(std::unordered_map<std::string, IpInfo>& cache,
             ni.country = r.country;
             ni.org = !r.as.empty() ? r.as : (!r.isp.empty() ? r.isp : "-");
             ni.asn = r.asn.empty() ? "-" : "AS" + r.asn;
+            ni.pxOwn = PXOWN_ENTRY;
             it = cache.emplace(ip, ni).first;
             added++;
         }
         IpInfo& i = it->second;
+        ip2proxyForget(i);
         i.pxType = r.type;
+        i.pxGen = g_gen;
         const bool vpn = r.type == "VPN", tor = r.type == "TOR",
                    proxy = r.type == "PUB" || r.type == "WEB";
-        if (vpn || tor || proxy || r.type == "DCH") i.hosting = true;
+        if ((vpn || tor || proxy || r.type == "DCH") && !i.hosting) { i.hosting = true; i.pxOwn |= PXOWN_HOSTING; }
         if (!(vpn || tor || proxy)) continue;
         // CDN и своя сеть — без флагов (как у ipapi.is, который их не спрашивает)
         if (looksCdnOrg(i.org) || isOwnIspOrg(i.org, i.asn)) continue;
-        i.isVpn = i.isVpn || vpn;
-        i.isTor = i.isTor || tor;
-        i.isProxy = i.isProxy || proxy;
+        if (vpn && !i.isVpn) { i.isVpn = true; i.pxOwn |= PXOWN_VPN; }
+        if (tor && !i.isTor) { i.isTor = true; i.pxOwn |= PXOWN_TOR; }
+        if (proxy && !i.isProxy) { i.isProxy = true; i.pxOwn |= PXOWN_PROXY; }
         if (i.flagSrc.empty()) i.flagSrc = "IP2Proxy";
         else if (i.flagSrc.find("IP2Proxy") == std::string::npos) i.flagSrc += " + IP2Proxy";
         flagged++;

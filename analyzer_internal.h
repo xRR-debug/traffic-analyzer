@@ -98,7 +98,7 @@ struct TcpConnState {
     int tlsInTls = 0;                 // Packet::tlsInTls соединения: 2 — рисунок TLS-in-TLS, 1 — нет
 };
 struct TcpConnTable {
-    std::map<std::string, TcpConnState> conns;   // ключ "rip|rport|lport|lip"
+    std::map<std::string, TcpConnState> conns;   // ключ "rip|rport|lport|lip", следующие сессии на кортеже — "…#N"
     long long tEnd = -1;              // время последнего пакета захвата
     bool anyInboundTcp = false;       // нет входящих — дамп однонаправленный, о дропах молчим
     int outTtlTypical = -1;           // медианный TTL исходящих пакетов абонента
