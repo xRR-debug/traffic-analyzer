@@ -3746,15 +3746,18 @@ bool loadDumpSet(const std::vector<std::string>& paths,
                          us/3600000000LL, (us/60000000LL)%60, (us/1000000LL)%60);
                 return std::string(b);
             };
-            size_t k0 = 0;                        // первый файл с пакетами
-            while (k0 < paths.size() && tMin[k0] < 0) k0++;
-            for (size_t k = k0 + 1; k < paths.size(); k++) {
-                if (tMin[k] < 0) continue;
-                if (tMax[k0] < tMin[k] || tMax[k] < tMin[k0])
-                    std::cout << C::YEL << "внимание: диапазоны времени не пересекаются ("
-                              << hhmmss(tMin[k0]) << "-" << hhmmss(tMax[k0]) << " и "
-                              << hhmmss(tMin[k]) << "-" << hhmmss(tMax[k])
-                              << ") — похоже, это дампы разных сеансов" << C::RST << "\n";
+            // все пары, а не только с первым: в наборе NAT _natwan и _wan могут
+            // оба пересекаться с _lan, но не друг с другом
+            for (size_t j = 0; j < paths.size(); j++) {
+                if (tMin[j] < 0) continue;            // файл без пакетов
+                for (size_t k = j + 1; k < paths.size(); k++) {
+                    if (tMin[k] < 0) continue;
+                    if (tMax[j] < tMin[k] || tMax[k] < tMin[j])
+                        std::cout << C::YEL << "внимание: диапазоны времени не пересекаются ("
+                                  << hhmmss(tMin[j]) << "-" << hhmmss(tMax[j]) << " и "
+                                  << hhmmss(tMin[k]) << "-" << hhmmss(tMax[k])
+                                  << ") — похоже, это дампы разных сеансов" << C::RST << "\n";
+                }
             }
         }
 

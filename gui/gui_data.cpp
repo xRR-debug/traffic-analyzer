@@ -673,8 +673,9 @@ std::string jobTitle() {
 }
 
 bool jobMustAbortOnExit() {
-    // пинг может ждать ответа до 2 с — закрытие окна этим не держим
-    if (g_busy || g_pingRunning) return true;
+    // пинг может ждать ответа до 2 с — закрытие окна этим не держим; потоки
+    // проверки РКН отсоединены, и после WSACleanup/DestroyContext им нельзя
+    if (g_busy || g_pingRunning || rknRunning()) return true;
     if (g_job.joinable()) g_job.join();
     if (g_ping.joinable()) g_ping.join();
     return false;

@@ -213,6 +213,8 @@ struct GuiColors { ImVec4 accent, good, warn, bad, dim, panelBg; };
 bool rknDrawTab(const GuiColors& c);
 // Подставить цель в поле ввода и сразу проверить (из меню соединения).
 void rknCheck(const std::string& target);
+// Идёт поток проверки (в т.ч. брошенный): при выходе его не дождаться.
+bool rknRunning();
 
 // ------------------------------------------------------------------
 // Окно (gui.cpp / gui_main.cpp)
