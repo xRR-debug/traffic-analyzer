@@ -971,7 +971,8 @@ void drawToolbar(const View& v) {
     ImGui::BeginDisabled(busy);
     if (ImGui::Button("Открыть…")) actOpen();
     ImGui::EndDisabled();
-    ImGui::SetItemTooltip("Дамп tcpdump (.txt) или .pcap/.pcapng. Можно выбрать пару «_in» + «_out».");
+    ImGui::SetItemTooltip("Дамп tcpdump (.txt) или .pcap/.pcapng. Можно выбрать пару «_in» + «_out»; "
+                          "из набора «_lan»/«_natlan»/«_natwan»/«_wan» хватит одного файла.");
 
     ImGui::SameLine();
     ImGui::BeginDisabled(!can);
@@ -996,6 +997,14 @@ void drawToolbar(const View& v) {
         spinner(kWarn);
         ImGui::SameLine();
         ImGui::TextColored(kWarn, "%s", jobTitle().c_str());
+    }
+    // пинг идёт в фоне и с других вкладок не виден — «Стоп» доступен отсюда
+    if (pingRunning()) {
+        ImGui::SameLine();
+        ImGui::TextColored(kDim, "пинг");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Стоп##ping")) stopPing();
+        ImGui::SetItemTooltip("Остановить пинг (вывод — на вкладке «Инструменты»).");
     }
 
     // тонкая «бегущая» полоса под панелью, пока идёт задача (место под неё
@@ -1040,7 +1049,8 @@ void drawOverview(const View& v) {
         ImGui::TextColored(kDim, "Дамп не загружен.");
         ImGui::TextWrapped("Перетащите файл на окно или нажмите «Открыть…» (" GUI_MOD "+O). Поддерживаются "
                            "текстовый вывод tcpdump и .pcap/.pcapng; два файла «..._in» и «..._out» "
-                           "загружаются как один набор.");
+                           "загружаются как один набор, четыре точки «..._lan», «..._natlan», "
+                           "«..._natwan», «..._wan» — тоже (с проверкой потерь между точками).");
         return;
     }
     const Dataset& ds = *v.ds;
@@ -2334,6 +2344,44 @@ void drawTools() {
     if ((ImGui::Button("Проверить") || enter) && s_owner[0]) startIpOwner(s_owner);
     ImGui::EndDisabled();
     ImGui::SetItemTooltip("Провайдер, ASN, диапазон сети из реестра и ответы разных резолверов — в журнал.");
+
+    // пинг без таймаута: шлёт, пока не нажат «Стоп»; ответы — в окно под кнопками,
+    // задачи (загрузка, анализ) при этом доступны
+    ImGui::SeparatorText("Пинг без остановки — прямо в окне");
+    static char s_ping[256] = "";
+    static int s_pingIv = 0;
+    static const char* const kPingIv[] = { "1000 мс", "500 мс", "200 мс", "100 мс" };
+    static const int kPingIvMs[] = { 1000, 500, 200, 100 };
+    const bool pinging = pingRunning();
+    ImGui::BeginDisabled(pinging);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16);
+    const bool pingEnter = ImGui::InputTextWithHint("##ping", "IP или домен", s_ping, sizeof(s_ping),
+                                                    ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6);
+    ImGui::Combo("##pingiv", &s_pingIv, kPingIv, IM_ARRAYSIZE(kPingIv));
+    ImGui::SetItemTooltip("Интервал между запросами.");
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (pinging) {
+        if (ImGui::Button("Стоп")) stopPing();
+    } else {
+        if ((ImGui::Button("Старт") || pingEnter) && s_ping[0]) startPing(s_ping, kPingIvMs[s_pingIv]);
+    }
+    ImGui::SetItemTooltip("Эхо-запросы без остановки, как ping -t. Каждый ответ и таймаут — строкой "
+                          "ниже, по «Стоп» — потери и мин/сред/макс задержки.");
+    if (pinging || pingLog().lineCount() > 1) {
+        pushPanelBg();
+        ImGui::BeginChild("##pinglog", ImVec2(0, ImGui::GetTextLineHeightWithSpacing() * 10),
+                          ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::PopStyleColor();
+        if (g_fontMono) ImGui::PushFont(g_fontMono, g_fontMono->LegacySize);
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 1));
+        pingLog().draw("", true);
+        ImGui::PopStyleVar();
+        if (g_fontMono) ImGui::PopFont();
+        ImGui::EndChild();
+    }
     ImGui::Spacing();
     if (ImGui::BeginTable("##tools", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp |
                                         ImGuiTableFlags_BordersInnerH)) {

@@ -143,7 +143,7 @@ struct FlowRow {
 };
 
 // ------------------------------------------------------------------
-// Загруженный набор (один файл или пара _in/_out).
+// Загруженный набор (один файл, пара _in/_out или точки _lan…_wan).
 // packets трогают ТОЛЬКО фоновые задачи (по одной за раз); flows и прочие
 // поля неизменны после загрузки; summary/ipCache заменяются целиком под
 // мьютексом (см. snapshot()).
@@ -184,6 +184,11 @@ void startResolve();
 void startVpnAnalysis();
 void startConnAnalysis(const std::string& target);
 void startIpOwner(const std::string& target);   // режим 13 (кому принадлежит IP) в журнал
+// Пинг без остановки — не задача: свой поток и свой журнал, идёт параллельно с ними.
+void startPing(const std::string& target, int intervalMs);
+bool pingRunning();         // идёт пинг из startPing
+void stopPing();            // остановить его (флаг отмены; поток завершится сам)
+LogBuffer& pingLog();       // вывод пинга (на вкладке «Инструменты»)
 // сравнение: A — текущий набор (если pathsA пуст) или указанные файлы
 void startCompare(std::vector<std::string> pathsA, std::vector<std::string> pathsB);
 void startReloadConfig();

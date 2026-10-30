@@ -4487,6 +4487,156 @@ static void queryResolver(ResolverAns& a, const std::string& name) {
     }
 }
 
+// ------------------------------------------------------------------
+// Пинг без остановки (GUI, вкладка «Инструменты»): эхо-запросы к цели раз в
+// intervalMs, пока не поднят abort (кнопка «Стоп»), как ping -t.
+// Каждый ответ — строкой в out, при остановке — сводка потерь и RTT.
+// Идёт параллельно с анализом, поэтому не через printf: иначе строки пинга
+// перемешались бы с журналом задачи и попали бы в её файл-отчёт.
+// ------------------------------------------------------------------
+void runContinuousPing(const std::string& input, int intervalMs, std::atomic<bool>& abort,
+                       const std::function<void(const std::string&)>& out) {
+    // строка по формату (всегда с аргументами: формат не литерал)
+    auto say = [&](const char* fmt, auto... args) {
+        char buf[512];
+        snprintf(buf, sizeof(buf), fmt, args...);
+        out(buf);
+    };
+    ensureWsa();
+    std::string s = idnToAscii(trim(input));
+    if (s.empty()) { out("Цель не указана.\n"); return; }
+    std::string ip, name;
+    if (isValidIpv4Str(s)) {
+        ip = s;
+    } else if (looksLikeDomainStr(s)) {
+        name = s;
+        ip = resolveHostToIp(s);
+        if (ip.empty() || !isValidIpv4Str(ip)) {
+            out("Домен не существует или нет ответа DNS.\n");
+            return;
+        }
+    } else {
+        out("Это не похоже на IP-адрес или доменное имя.\n");
+        return;
+    }
+    if (intervalMs < 50) intervalMs = 50;
+    // ожидание одного ответа; интервал между запросами от него не зависит
+    const int TIMEOUT = 2000;
+
+    if (!name.empty()) say("Пинг %s [%s], ", name.c_str(), ip.c_str());
+    else               say("Пинг %s, ", ip.c_str());
+    say("раз в %d мс, ожидание ответа %d мс. Остановка — кнопкой «Стоп».\n\n",
+        intervalMs, TIMEOUT);
+
+#ifdef _WIN32
+    IPAddr dest = 0;
+    inet_pton(AF_INET, ip.c_str(), &dest);
+    HANDLE hIcmp = IcmpCreateFile();
+    if (hIcmp == INVALID_HANDLE_VALUE) { out("Не удалось создать ICMP-хендл.\n"); return; }
+    HANDLE hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!hEvent) {
+        out("Не удалось создать событие для ICMP.\n");
+        IcmpCloseHandle(hIcmp);
+        return;
+    }
+    const DWORD WAIT_STEP = 50;
+    char sendData[32] = "maryno-ping";
+#endif
+
+    unsigned long sent = 0, recv = 0;
+    double rttMin = 0, rttMax = 0, rttSum = 0;
+    const auto tStart = std::chrono::steady_clock::now();
+    while (!abort) {
+        const auto t0 = std::chrono::steady_clock::now();
+        int status = -1, ttl = -1;
+        double rtt = -1;
+        std::string from;
+#ifndef _WIN32
+        IcmpReply ir = icmpEcho(ip, 0, TIMEOUT, "maryno-ping", &abort);
+        if (ir.noSocket) { out("Не удалось открыть ICMP-сокет.\n"); break; }
+        if (ir.aborted) break;                  // незаконченный запрос в счёт не идёт
+        status = ir.status; rtt = ir.rttMs; from = ir.from;
+#else
+        char replyBuf[sizeof(ICMP_ECHO_REPLY) + sizeof(sendData) + 64] = {0};
+        LARGE_INTEGER qpcFreq, qpcStart, qpcEnd;
+        QueryPerformanceFrequency(&qpcFreq);
+        QueryPerformanceCounter(&qpcStart);
+        ResetEvent(hEvent);
+        DWORD r = IcmpSendEcho2(hIcmp, hEvent, nullptr, nullptr, dest, sendData, sizeof(sendData),
+                                nullptr, replyBuf, sizeof(replyBuf), TIMEOUT);
+        if (r == 0 && GetLastError() != ERROR_IO_PENDING) SetEvent(hEvent);
+        DWORD waited = 0; bool gotReply = false, aborted = false;
+        while (waited < (DWORD)TIMEOUT + 200) {
+            if (WaitForSingleObject(hEvent, WAIT_STEP) == WAIT_OBJECT_0) { gotReply = true; break; }
+            if (abort) { aborted = true; break; }
+            waited += WAIT_STEP;
+        }
+        QueryPerformanceCounter(&qpcEnd);
+        // replyBuf на стеке: уходить можно только после завершения запроса (см. runTraceMode)
+        if (!gotReply) WaitForSingleObject(hEvent, TIMEOUT + 2000);
+        if (aborted) break;
+        if (gotReply && IcmpParseReplies(replyBuf, sizeof(replyBuf)) > 0) {
+            ICMP_ECHO_REPLY* reply = (ICMP_ECHO_REPLY*)replyBuf;
+            status = (int)reply->Status;
+            if (status != IP_REQ_TIMED_OUT) {
+                in_addr addr; addr.s_addr = reply->Address;
+                char ipbuf[64] = {0};
+                inet_ntop(AF_INET, &addr, ipbuf, sizeof(ipbuf));
+                from = ipbuf;
+                rtt = qpcFreq.QuadPart > 0
+                    ? (double)(qpcEnd.QuadPart - qpcStart.QuadPart) * 1000.0 / (double)qpcFreq.QuadPart
+                    : (double)reply->RoundTripTime;
+                ttl = reply->Options.Ttl;
+            } else {
+                status = -1;
+            }
+        }
+#endif
+        sent++;
+        if (status == IP_SUCCESS) {
+            recv++;
+            if (recv == 1 || rtt < rttMin) rttMin = rtt;
+            if (recv == 1 || rtt > rttMax) rttMax = rtt;
+            rttSum += rtt;
+            if (ttl >= 0) say("Ответ от %s: время=%.1f мс TTL=%d\n", from.c_str(), rtt, ttl);
+            else          say("Ответ от %s: время=%.1f мс\n", from.c_str(), rtt);
+        } else if (status < 0) {
+            say("%sПревышен интервал ожидания (%d мс).%s\n", C::YEL, TIMEOUT, C::RST);
+        } else {
+            const char* what = status == IP_TTL_EXPIRED_TRANSIT  ? "TTL истёк в пути"
+                             : status == IP_DEST_NET_UNREACHABLE ? "сеть недоступна"
+                             : status == IP_DEST_HOST_UNREACHABLE ? "узел недоступен"
+                                                                  : "ошибка";
+            say("%sОтвет от %s: %s (код %d).%s\n", C::RED,
+                from.empty() ? "?" : from.c_str(), what, status, C::RST);
+        }
+
+        // пауза до следующего запроса — от начала предыдущего, мелкими шагами,
+        // чтобы «Стоп» срабатывал сразу
+        for (;;) {
+            if (abort) break;
+            const int el = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (el >= intervalMs) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds((std::min)(50, intervalMs - el)));
+        }
+    }
+#ifdef _WIN32
+    CloseHandle(hEvent);
+    IcmpCloseHandle(hIcmp);
+#endif
+
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - tStart).count();
+    say("\nСтатистика пинга %s за %.0f с:\n", ip.c_str(), secs);
+    const double lossPct = sent ? 100.0 * (double)(sent - recv) / (double)sent : 0.0;
+    const char* col = sent == recv ? C::GRN : lossPct >= 5.0 ? C::RED : C::YEL;
+    say("  отправлено %lu, получено %lu, %sпотеряно %lu (%.1f%%)%s\n",
+        sent, recv, col, sent - recv, lossPct, C::RST);
+    if (recv)
+        say("  время: мин %.1f мс, сред %.1f мс, макс %.1f мс\n",
+            rttMin, rttSum / (double)recv, rttMax);
+}
+
 void runIpOwnerMode() {
     std::cout << "Кому принадлежит IP / домен.\n"
                  "IP или домен (можно несколько через запятую или пробел): " << std::flush;

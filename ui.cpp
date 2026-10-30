@@ -195,7 +195,8 @@ std::string countryNameRu(const std::string& cc) {
 // Диалог выбора файлов дампа (если программу запустили без аргумента).
 // Множественный выбор разрешён: трафик часто пишут двумя файлами —
 // «..._in» (только входящие) и «..._out» (только исходящие), и анализировать
-// их нужно вместе, иначе картина заведомо неверная.
+// их нужно вместе, иначе картина заведомо неверная. Или четырьмя — точки
+// «..._lan»/«..._natlan»/«..._natwan»/«..._wan» до и после NAT.
 // Возвращает список путей; пустой список = пользователь отменил.
 // owner — окно-владелец диалога (GUI) или nullptr (консоль).
 #ifndef _WIN32
@@ -325,19 +326,43 @@ std::vector<std::string> pickDumpFiles(HWND owner) {
 #endif
 
 // Выбран один файл с суффиксом _in/_out — подтягиваем парный, если он лежит
-// рядом: анализировать половину дампа почти всегда ошибка.
+// рядом: анализировать половину дампа почти всегда ошибка. Точка набора NAT
+// (_lan/_natlan/_natwan/_wan) — подтягиваем остальные точки. Точки набора
+// ставим по ходу пакета от абонента, в каком бы порядке их ни выбрали.
 bool addSiblingDump(std::vector<std::string>& paths) {
-    if (paths.size() != 1) return false;
-    std::string sib = siblingDumpPath(paths[0]);
-    if (sib.empty()) return false;
-    paths.push_back(sib);
-    std::cout << C::BYEL << "Рядом найдена вторая половина дампа — беру оба файла."
-              << C::RST << "\n";
-    return true;
+    bool added = false;
+    if (paths.size() == 1) {
+        std::vector<std::string> sib = dumpSetSiblings(paths[0]);
+        if (!sib.empty()) {
+            const bool nat = natPointOf(paths[0]) >= 0;
+            paths.insert(paths.end(), sib.begin(), sib.end());
+            if (nat)
+                std::cout << C::BYEL << "Рядом найдены другие точки съёма (lan/natlan/natwan/wan) — "
+                             "беру " << paths.size() << " файла." << C::RST << "\n";
+            else
+                std::cout << C::BYEL << "Рядом найдена вторая половина дампа — беру оба файла."
+                          << C::RST << "\n";
+            added = true;
+        }
+    }
+    bool natSet = paths.size() > 1;
+    for (const auto& p : paths) if (natPointOf(p) < 0) natSet = false;
+    if (natSet)
+        std::stable_sort(paths.begin(), paths.end(), [](const std::string& a, const std::string& b) {
+            return natPointOf(a) < natPointOf(b);
+        });
+    return added;
 }
 
 // Имя набора для заголовков: «a.pcap + b.pcap» без каталогов.
 std::string dumpSetName(const std::vector<std::string>& paths) {
+    bool natSet = paths.size() > 1;
+    for (const auto& p : paths) if (natPointOf(p) < 0) natSet = false;
+    if (natSet) {
+        size_t sl = paths[0].find_last_of("\\/");
+        return (sl == std::string::npos ? paths[0] : paths[0].substr(sl + 1)) +
+               " + ещё точек NAT: " + std::to_string(paths.size() - 1);
+    }
     std::string r;
     for (const auto& p : paths) {
         size_t sl = p.find_last_of("\\/");
@@ -839,7 +864,7 @@ static int consoleMain(std::vector<std::string> files, int tool) {
     boxLine("");
     boxLine(std::string("  ") + C::BMAG + "[1]" + C::BWHT + " Анализ на VPN / прокси");
     boxLine(std::string("  ") + C::BMAG + "[2]" + C::BWHT + " Анализ на блокировки и проблемы соединения");
-    boxLine(std::string("      ") + C::GRY + "(1 и 2: можно выбрать пару файлов «..._in» и «..._out»)");
+    boxLine(std::string("      ") + C::GRY + "(1 и 2: пара _in + _out или точки _lan … _wan)");
     boxLine(std::string("  ") + C::BMAG + "[3]" + C::BWHT + " Трассировка маршрута (trace) до IP / домена");
     boxLine(std::string("  ") + C::BMAG + "[4]" + C::BWHT + " Проверка гео по RTT (детект подмены локации)");
     boxLine(std::string("  ") + C::BMAG + "[5]" + C::BWHT + " Захват трафика с интерфейса в .pcap (Npcap)");
@@ -912,7 +937,8 @@ static int consoleMain(std::vector<std::string> files, int tool) {
         paths.swap(files);   // первый раз берём из командной строки, дальше — диалог
     } else {
         std::cout << "Откройте файл дампа в диалоге выбора...\n";
-        std::cout << C::GRY << "  (можно выделить сразу два файла — «..._in» и «..._out»)"
+        std::cout << C::GRY << "  (можно выделить сразу два файла — «..._in» и «..._out»; "
+                               "из набора «_lan»/«_natlan»/«_natwan»/«_wan» хватит одного)"
                   << C::RST << "\n";
         paths = pickDumpFiles(nullptr);
         if (paths.empty()) {

@@ -1346,18 +1346,36 @@ static bool parseFrame(const unsigned char* d, size_t len, int linkType,
     // DSCP/traffic class, контрольная сумма IP; у TCP — без контрольной суммы и
     // опций (BRAS правит MSS в SYN): порты, seq, ack, флаги и окно и так
     // однозначно задают сегмент. У UDP/ICMP — заголовок и начало данных.
+    // natHash — тот же отпечаток без адресов, портов, IP ID и идентификатора
+    // ICMP-эха: их переписывает NAT. По нему сверяются точки съёма до и после
+    // NAT (набор «_lan»/«_natlan»/«_natwan»/«_wan»).
     {
-        uint32_t h = 2166136261u;                  // FNV-1a
-        auto mix = [&](const unsigned char* b, size_t n) {
-            for (size_t k = 0; k < n; k++) { h ^= b[k]; h *= 16777619u; }
+        uint32_t h = 2166136261u, g = 2166136261u; // FNV-1a
+        auto mixTo = [](uint32_t& x, const unsigned char* b, size_t n) {
+            for (size_t k = 0; k < n; k++) { x ^= b[k]; x *= 16777619u; }
         };
+        auto mix = [&](const unsigned char* b, size_t n) { mixTo(h, b, n); };
         const unsigned char* ip = d + off;
-        if (ethertype == 0x0800) { mix(ip + 2, 6); mix(ip + 9, 1); mix(ip + 12, 8); }
-        else                     { mix(ip + 4, 3); mix(ip + 8, 32); }
+        if (ethertype == 0x0800) {
+            mix(ip + 2, 6); mix(ip + 9, 1); mix(ip + 12, 8);
+            mixTo(g, ip + 2, 2); mixTo(g, ip + 9, 1);
+        } else {
+            mix(ip + 4, 3); mix(ip + 8, 32);
+            mixTo(g, ip + 4, 3);
+        }
         const size_t cap = len - l4off;            // l4off <= len проверено выше
-        if (proto == 6) mix(l4, 16);
-        else            mix(l4, std::min<size_t>(64, std::min(l4len, cap)));
+        const size_t n = std::min<size_t>(64, std::min(l4len, cap));
+        if (proto == 6) { mix(l4, 16); mixTo(g, l4 + 4, 12); }
+        else {
+            mix(l4, n);
+            if (proto == 17) { if (n >= 6) mixTo(g, l4 + 4, 2); if (n > 8) mixTo(g, l4 + 8, n - 8); }
+            else if (proto == 1 || proto == 58) {
+                if (n >= 2) mixTo(g, l4, 2);
+                if (n > 6) mixTo(g, l4 + 6, n - 6);
+            } else mixTo(g, l4, n);
+        }
         pk.wireHash = h ? h : 1;                   // 0 — «отпечатка нет»
+        pk.natHash  = g ? g : 1;
     }
     pk.valid = !pk.srcIp.empty() && !pk.dstIp.empty();
     return pk.valid;
@@ -3034,28 +3052,56 @@ static std::string lowerExt(const std::string& path) {
     return e;
 }
 
-// По пути «..._in.pcap» подбирает парный «..._out.pcap» (и наоборот).
-// Пустая строка = суффикса нет или парного файла не существует.
-std::string siblingDumpPath(const std::string& path) {
+// Имя файла дампа без расширения и само расширение (точка — именно в имени
+// файла, а не в каком-то каталоге выше по пути).
+static void splitDumpExt(const std::string& path, std::string& stem, std::string& ext) {
     size_t slash = path.find_last_of("\\/");
     size_t dot   = path.find_last_of('.');
-    // точка должна быть в имени файла, а не в каком-то каталоге выше по пути
     bool hasExt = (dot != std::string::npos &&
                    (slash == std::string::npos || dot > slash));
-    std::string stem = hasExt ? path.substr(0, dot) : path;
-    std::string ext  = hasExt ? path.substr(dot)    : std::string();
+    stem = hasExt ? path.substr(0, dot) : path;
+    ext  = hasExt ? path.substr(dot)    : std::string();
+}
 
-    auto endsWith = [](const std::string& s, const char* suf) {
-        size_t n = strlen(suf);
-        return s.size() > n && _stricmp(s.c_str() + s.size() - n, suf) == 0;
-    };
-    std::string cand;
-    if      (endsWith(stem, "_in"))  cand = stem.substr(0, stem.size() - 3) + "_out" + ext;
-    else if (endsWith(stem, "_out")) cand = stem.substr(0, stem.size() - 4) + "_in"  + ext;
-    else return "";
+static bool stemEndsWith(const std::string& s, const char* suf) {
+    size_t n = strlen(suf);
+    return s.size() > n && _stricmp(s.c_str() + s.size() - n, suf) == 0;
+}
 
-    std::ifstream f(upath(cand), std::ios::binary);
-    return f ? cand : std::string();
+// Точки съёма набора «до и после NAT» — по ходу пакета от абонента в сеть:
+// сторона абонента, вход NAT, выход NAT, аплинк.
+static const char* const kNatPoints[] = { "_lan", "_natlan", "_natwan", "_wan" };
+
+int natPointOf(const std::string& path) {
+    std::string stem, ext;
+    splitDumpExt(path, stem, ext);
+    // «_natlan» кончается не на «_lan», а «_natwan» — не на «_wan», но
+    // длинные суффиксы всё равно проверяем первыми
+    for (int k : { 1, 2, 0, 3 })
+        if (stemEndsWith(stem, kNatPoints[k])) return k;
+    return -1;
+}
+
+// Остальные файлы набора, лежащие рядом: для «..._in» — «..._out» (и наоборот),
+// для точки набора NAT — существующие из «_lan»/«_natlan»/«_natwan»/«_wan».
+// Пусто — суффикса нет или других файлов набора рядом нет.
+std::vector<std::string> dumpSetSiblings(const std::string& path) {
+    std::string stem, ext;
+    splitDumpExt(path, stem, ext);
+    std::vector<std::string> cand;
+    if      (stemEndsWith(stem, "_in"))  cand.push_back(stem.substr(0, stem.size() - 3) + "_out" + ext);
+    else if (stemEndsWith(stem, "_out")) cand.push_back(stem.substr(0, stem.size() - 4) + "_in"  + ext);
+    else if (int me = natPointOf(path); me >= 0) {
+        const std::string base = stem.substr(0, stem.size() - strlen(kNatPoints[me]));
+        for (int k = 0; k < 4; k++)
+            if (k != me) cand.push_back(base + kNatPoints[k] + ext);
+    }
+    std::vector<std::string> out;
+    for (const auto& c : cand) {
+        std::ifstream f(upath(c), std::ios::binary);
+        if (f) out.push_back(c);
+    }
+    return out;
 }
 
 // tcpdump без -S печатает номера TCP от начала беседы, а первый пакет беседы с
@@ -3364,9 +3410,206 @@ static void markIpsecPeers(std::vector<Packet>& packets) {
     }
 }
 
-// Загрузка набора файлов дампа (один файл или пара «_in»/«_out»): разбор,
-// слияние по времени, удаление дублей, флоу-маркировка WireGuard и
-// определение локального адреса абонента (g_localIp / g_localIp6).
+// Сверка точек съёма набора NAT («_lan» → «_natlan» → «_natwan» → «_wan»):
+// чей адрес в каждой точке, сколько пакетов дошло до следующей точки в каждую
+// сторону и как NAT переписал адрес абонента. Пакет узнаём по natHash — в нём
+// нет адресов и портов, — так что копия находится и по ту сторону NAT.
+// packets ещё не слиты: пакеты каждого файла идут подряд, origin — номер файла.
+static void reportNatPoints(const std::vector<std::string>& paths,
+                            const std::vector<Packet>& packets,
+                            const std::vector<int>& origin) {
+    const size_t nf = paths.size();
+    const long long DAY = 86400LL * 1000000;
+    std::vector<int> role(nf);
+    for (size_t k = 0; k < nf; k++) role[k] = natPointOf(paths[k]);
+
+    // адрес точки — самый частый в её файле (абонент до NAT, внешний адрес после).
+    // Если удалённый адрес один (пинг одного ресурса), он встречается столько же
+    // раз: тогда до NAT берём адрес из имени файла («..._10.1.2.3_lan.pcap»),
+    // после NAT — адрес, которого нет в точках до NAT (серверы есть по обе стороны).
+    std::vector<std::string> own(nf);
+    std::vector<long long> cnt(nf, 0), tMin(nf, -1), tMax(nf, -1);
+    {
+        std::vector<std::map<std::string, long long>> freq(nf);
+        for (size_t i = 0; i < packets.size(); i++) {
+            const Packet& p = packets[i];
+            auto& m = freq[(size_t)origin[i]];
+            m[p.srcIp]++;
+            if (p.dstIp != p.srcIp) m[p.dstIp]++;
+            cnt[(size_t)origin[i]]++;
+        }
+        std::set<std::string> preIps;
+        for (size_t k = 0; k < nf; k++)
+            if (role[k] < 2) for (auto& kv : freq[k]) preIps.insert(kv.first);
+        for (size_t k = 0; k < nf; k++) {
+            const size_t sl = paths[k].find_last_of("\\/");
+            const std::string fname = sl == std::string::npos ? paths[k] : paths[k].substr(sl + 1);
+            long long best = 0;
+            int bestBonus = -1;
+            for (auto& kv : freq[k]) {
+                const int bonus = role[k] < 2 ? (fname.find("_" + kv.first + "_") != std::string::npos)
+                                              : (preIps.count(kv.first) == 0);
+                if (kv.second > best || (kv.second == best && bonus > bestBonus)) {
+                    best = kv.second; bestBonus = bonus; own[k] = kv.first;
+                }
+            }
+        }
+    }
+    // время в мкс; переход через полночь внутри файла — как при слиянии
+    std::vector<long long> t(packets.size(), -1), prevT(nf, -1), dayOff(nf, 0);
+    for (size_t i = 0; i < packets.size(); i++) {
+        const size_t fo = (size_t)origin[i];
+        long long x = tsToMicros(packets[i].ts);
+        if (x < 0) continue;
+        x += dayOff[fo];
+        if (prevT[fo] >= 0 && x < prevT[fo] - DAY / 2) { dayOff[fo] += DAY; x += DAY; }
+        prevT[fo] = std::max(prevT[fo], x);
+        t[i] = x;
+        if (tMin[fo] < 0 || x < tMin[fo]) tMin[fo] = x;
+        if (x > tMax[fo])                 tMax[fo] = x;
+    }
+    // направление (0 — от абонента, 1 — к нему) и ключ пакета; 0 — не сверяем
+    std::vector<int> dirOf(packets.size(), -1);
+    std::vector<uint64_t> key(packets.size(), 0);
+    for (size_t i = 0; i < packets.size(); i++) {
+        const Packet& p = packets[i];
+        const std::string& me = own[(size_t)origin[i]];
+        if (p.srcIp == p.dstIp) continue;
+        if (p.srcIp == me) dirOf[i] = 0; else if (p.dstIp == me) dirOf[i] = 1; else continue;
+        uint32_t h = p.natHash;
+        if (!h) {
+            // текстовый tcpdump: отпечатка нет — у TCP хватает номеров и флагов
+            if (p.proto != "TCP") continue;
+            h = (uint32_t)std::hash<std::string>()(p.flags + "|" + std::to_string(p.seqStart) + "|" +
+                std::to_string(p.seq) + "|" + std::to_string(p.ack) + "|" + std::to_string(p.length));
+            if (!h) h = 1;
+        }
+        key[i] = ((uint64_t)h << 32) | ((uint64_t)(p.length & 0x7fffffff) << 1) | (uint64_t)dirOf[i];
+    }
+    std::vector<std::vector<size_t>> idx(nf);
+    for (size_t i = 0; i < packets.size(); i++) idx[(size_t)origin[i]].push_back(i);
+
+    auto hhmmss = [DAY](long long us) {
+        us %= DAY;
+        char b[16];
+        snprintf(b, sizeof(b), "%02lld:%02lld:%02lld",
+                 us/3600000000LL, (us/60000000LL)%60, (us/1000000LL)%60);
+        return std::string(b);
+    };
+    std::vector<size_t> ord;                      // файлы по ходу пакета от абонента
+    for (int r = 0; r < 4; r++)
+        for (size_t k = 0; k < nf; k++) if (role[k] == r) ord.push_back(k);
+
+    std::cout << C::BWHT << "Точки съёма (до и после NAT):" << C::RST << "\n";
+    for (size_t k : ord) {
+        char line[160];
+        snprintf(line, sizeof(line), "  %-7s %-40s пакетов %lld", kNatPoints[role[k]] + 1,
+                 own[k].empty() ? "-" : own[k].c_str(), cnt[k]);
+        std::cout << line;
+        if (tMin[k] >= 0) std::cout << ", " << hhmmss(tMin[k]) << "-" << hhmmss(tMax[k]);
+        std::cout << "\n";
+    }
+
+    // Сколько пакетов направления dir из точки a не нашлось в точке b. Берём
+    // только общее время записи обеих точек (без краёв — до секунды, у коротких
+    // записей меньше): пакеты до начала или после конца записи в другой точке —
+    // не потери. Копии сводятся
+    // один к одному: повтор сегмента должен найтись в b столько же раз.
+    struct Hop { long long sent = 0, lost = 0; bool ok = false; };
+    std::map<std::string, std::set<std::pair<int,int>>> natMap;   // «до -> после» -> пары портов
+    long long crossSent = 0;                      // сверено пакетов через NAT
+    long long crossTcp = 0, crossTcpLost = 0;     // из них TCP и не найденных TCP
+    auto compare = [&](size_t a, size_t b, int dir) {
+        Hop r;
+        if (tMin[a] < 0 || tMin[b] < 0) return r;
+        const long long lo0 = std::max(tMin[a], tMin[b]), hi0 = std::min(tMax[a], tMax[b]);
+        if (lo0 >= hi0) return r;
+        const long long edge = std::min(1000000LL, (hi0 - lo0) / 20);
+        const long long lo = lo0 + edge, hi = hi0 - edge;
+        r.ok = true;
+        std::unordered_map<uint64_t, std::pair<long long, size_t>> inB;   // ключ -> (сколько, первый)
+        for (size_t i : idx[b]) {
+            if (dirOf[i] != dir || !key[i]) continue;
+            auto& e = inB[key[i]];
+            if (e.first++ == 0) e.second = i;
+        }
+        const bool crossNat = own[a] != own[b];
+        for (size_t i : idx[a]) {
+            if (dirOf[i] != dir || !key[i] || t[i] < lo || t[i] > hi) continue;
+            r.sent++;
+            const bool tcp = packets[i].proto == "TCP";
+            if (crossNat) { crossSent++; if (tcp) crossTcp++; }
+            auto it = inB.find(key[i]);
+            if (it == inB.end() || it->second.first == 0) {
+                r.lost++;
+                if (crossNat && tcp) crossTcpLost++;
+                continue;
+            }
+            it->second.first--;
+            if (!crossNat) continue;
+            const Packet& pa = packets[i];
+            const Packet& pb = packets[it->second.second];
+            // адрес абонента: у пакета от него — источник, к нему — получатель
+            const std::string& ia = dir == 0 ? pa.srcIp : pa.dstIp;
+            const std::string& ib = dir == 0 ? pb.srcIp : pb.dstIp;
+            const int pta = dir == 0 ? pa.srcPort : pa.dstPort;
+            const int ptb = dir == 0 ? pb.srcPort : pb.dstPort;
+            const bool up = role[a] < role[b];
+            const std::string k = up ? ia + " -> " + ib : ib + " -> " + ia;
+            auto& ports = natMap[k];
+            if (ports.size() < 65536) ports.insert(up ? std::make_pair(pta, ptb) : std::make_pair(ptb, pta));
+        }
+        return r;
+    };
+    auto printDir = [&](const char* title, int dir) {
+        std::cout << "  " << title;
+        bool first = true;
+        for (size_t j = 0; j + 1 < ord.size(); j++) {
+            // от абонента — по ходу точек, к абоненту — навстречу
+            size_t a = dir == 0 ? ord[j] : ord[ord.size() - 1 - j];
+            size_t b = dir == 0 ? ord[j + 1] : ord[ord.size() - 2 - j];
+            Hop h = compare(a, b, dir);
+            std::cout << (first ? " " : " · ") << (kNatPoints[role[a]] + 1) << "→"
+                      << (kNatPoints[role[b]] + 1) << " ";
+            first = false;
+            if (!h.ok) { std::cout << C::GRY << "нет общего времени" << C::RST; continue; }
+            const double pct = h.sent ? 100.0 * (double)h.lost / (double)h.sent : 0.0;
+            const char* col = (h.lost >= 3 && pct >= 5.0) ? C::RED
+                            : (h.lost >= 3 && pct >= 1.0) ? C::YEL : "";
+            char b2[96];
+            if (h.lost) snprintf(b2, sizeof(b2), "потеряно %lld из %lld (%.1f%%)", h.lost, h.sent, pct);
+            else        snprintf(b2, sizeof(b2), "потерь нет (%lld)", h.sent);
+            std::cout << col << b2 << (*col ? C::RST : "");
+        }
+        std::cout << "\n";
+    };
+    if (ord.size() >= 2) {
+        std::cout << C::GRY << "Потери между точками (сверка по содержимому пакетов, "
+                               "только общее время записи):" << C::RST << "\n";
+        printDir("от абонента:", 0);
+        printDir("к абоненту: ", 1);
+        if (!natMap.empty()) {
+            for (auto& kv : natMap)
+                std::cout << "  NAT: " << kv.first << " (пар портов: " << kv.second.size() << ")\n";
+        } else if (crossSent > 0) {
+            std::cout << C::YEL << "  Пакеты до и после NAT не сопоставились: NAT меняет номера "
+                                   "TCP (рандомизация seq) или файлы от разных сеансов — потери "
+                                   "через NAT посчитаны неверно." << C::RST << "\n";
+        }
+        // UDP/ICMP через NAT нашлись, а TCP почти весь «потерян» — это не потери,
+        // а NAT, переписывающий seq/ack: отпечаток TCP по ту сторону другой
+        if (!natMap.empty() && crossTcp >= 20 && crossTcpLost * 10 >= crossTcp * 9)
+            std::cout << C::YEL << "  TCP через NAT почти не сопоставился (" << crossTcpLost << " из "
+                      << crossTcp << "), а остальной трафик — да: похоже, NAT меняет номера TCP "
+                         "(рандомизация seq). Потери natlan↔natwan завышены." << C::RST << "\n";
+    }
+    fflush(stdout);
+}
+
+// Загрузка набора файлов дампа (один файл, пара «_in»/«_out» или точки
+// «_lan»/«_natlan»/«_natwan»/«_wan»): разбор, слияние по времени, удаление
+// дублей, флоу-маркировка WireGuard и определение локального адреса абонента
+// (g_localIp / g_localIp6).
 // false — файл не прочитан или пакетов нет (сообщение уже напечатано).
 bool loadDumpSet(const std::vector<std::string>& paths,
                  std::vector<Packet>& packets, std::vector<int>& origin) {
@@ -3393,6 +3636,37 @@ bool loadDumpSet(const std::vector<std::string>& paths,
     }
     if (loadFailed) return false;
 
+    // --- набор точек до и после NAT ---
+    // До NAT у абонента свой адрес, после — внешний адрес NAT: слив все точки,
+    // получили бы каждое соединение дважды, под двумя адресами. Поэтому точки
+    // сначала сверяем между собой (где теряются пакеты), а соединения разбираем
+    // по точкам до NAT; после NAT — только если до NAT пакетов нет.
+    std::vector<char> used(paths.size(), 1);
+    bool natSet = paths.size() > 1;
+    {
+        for (const auto& pth : paths) if (natPointOf(pth) < 0) natSet = false;
+        if (natSet && !packets.empty()) {
+            reportNatPoints(paths, packets, origin);
+            bool before = false, after = false;
+            for (int o : origin) (natPointOf(paths[(size_t)o]) < 2 ? before : after) = true;
+            if (before && after) {
+                for (size_t k = 0; k < paths.size(); k++) used[k] = natPointOf(paths[k]) < 2;
+                size_t w = 0;
+                for (size_t i = 0; i < packets.size(); i++) {
+                    if (!used[(size_t)origin[i]]) continue;
+                    if (w != i) { packets[w] = std::move(packets[i]); origin[w] = origin[i]; }
+                    w++;
+                }
+                packets.resize(w); origin.resize(w);
+                std::cout << C::GRY << "Соединения разбираются по точкам до NAT (lan/natlan) — "
+                                       "там настоящий адрес абонента; точки после NAT только "
+                                       "сверены с ними." << C::RST << "\n";
+            }
+        }
+    }
+    size_t nUsed = 0;
+    for (char u : used) nUsed += u ? 1 : 0;
+
     // --- слияние половин дампа по времени ---
     // Простая склейка недопустима: все пакеты из «_in» встали бы перед всеми
     // из «_out», и разбор развалился бы — SYN-ACK оказался бы «раньше» своего
@@ -3404,7 +3678,7 @@ bool loadDumpSet(const std::vector<std::string>& paths,
     // чем на полсуток = новые сутки; между файлами — файл, начавшийся на
     // полсуток «раньше» другого, на самом деле начат после полуночи. Раньше
     // пакеты после 00:00 вставали в начало, перед пакетами из 23:59.
-    if (paths.size() > 1 && !packets.empty()) {
+    if (nUsed > 1 && !packets.empty()) {
         // Ключи считаем заранее: tsToMicros разбирает строку, внутри компаратора
         // это обошлось бы в тысячи лишних разборов. Пакеты с неразобранным
         // временем (-1) не выбрасываем — даём им время предыдущего, чтобы они
@@ -3472,11 +3746,13 @@ bool loadDumpSet(const std::vector<std::string>& paths,
                          us/3600000000LL, (us/60000000LL)%60, (us/1000000LL)%60);
                 return std::string(b);
             };
-            for (size_t k = 1; k < paths.size(); k++) {
-                if (tMin[0] < 0 || tMin[k] < 0) continue;
-                if (tMax[0] < tMin[k] || tMax[k] < tMin[0])
+            size_t k0 = 0;                        // первый файл с пакетами
+            while (k0 < paths.size() && tMin[k0] < 0) k0++;
+            for (size_t k = k0 + 1; k < paths.size(); k++) {
+                if (tMin[k] < 0) continue;
+                if (tMax[k0] < tMin[k] || tMax[k] < tMin[k0])
                     std::cout << C::YEL << "внимание: диапазоны времени не пересекаются ("
-                              << hhmmss(tMin[0]) << "-" << hhmmss(tMax[0]) << " и "
+                              << hhmmss(tMin[k0]) << "-" << hhmmss(tMax[k0]) << " и "
                               << hhmmss(tMin[k]) << "-" << hhmmss(tMax[k])
                               << ") — похоже, это дампы разных сеансов" << C::RST << "\n";
             }
@@ -3555,7 +3831,8 @@ bool loadDumpSet(const std::vector<std::string>& paths,
                           << " пакет(ов), попавших сразу в оба файла — иначе они считались "
                              "бы ретрансмиссиями";
                 // больше трети — не перекрытие фильтров, а один трафик в двух точках
-                if ((size_t)dupCross * 3 >= total)
+                // (у точек lan/natlan так и задумано — не подсказываем)
+                if ((size_t)dupCross * 3 >= total && !natSet)
                     std::cout << ". Файлы содержат почти один и тот же трафик (сняты на двух "
                                  "интерфейсах) — для анализа хватило бы одного";
                 std::cout << C::RST << "\n";
@@ -3563,7 +3840,7 @@ bool loadDumpSet(const std::vector<std::string>& paths,
         }
 
         std::cout << C::GRN << "Объединено по времени: " << packets.size()
-                  << " пакетов из " << paths.size() << " файлов" << C::RST << "\n";
+                  << " пакетов из " << nUsed << " файлов" << C::RST << "\n";
     }
 
     if (packets.empty()) {
@@ -3788,7 +4065,7 @@ bool loadDumpSet(const std::vector<std::string>& paths,
     // Если файл «_in» на деле полон исходящих (или выбраны два несвязанных
     // дампа), об этом лучше сказать сразу: дальше расхождение проявится уже
     // в виде странных выводов про потери и односторонние соединения.
-    if (paths.size() > 1 && origin.size() == packets.size() && !g_localIp.empty()) {
+    if (nUsed > 1 && !natSet && origin.size() == packets.size() && !g_localIp.empty()) {
         std::vector<long long> nIn(paths.size(), 0), nOut(paths.size(), 0);
         for (size_t i = 0; i < packets.size(); i++) {
             // направление из заголовка SLL/SLL2 точнее догадки по адресам
@@ -3803,6 +4080,7 @@ bool loadDumpSet(const std::vector<std::string>& paths,
         }
         std::cout << C::GRY << "Состав объединённого дампа:" << C::RST << "\n";
         for (size_t k = 0; k < paths.size(); k++) {
+            if (!used[k]) continue;
             size_t slash = paths[k].find_last_of("\\/");
             std::string name = (slash == std::string::npos) ? paths[k] : paths[k].substr(slash + 1);
             std::cout << "  " << name << ": входящих " << nIn[k]
