@@ -29,6 +29,10 @@ ImVec4 withAlpha(ImVec4 c, float a) { c.w *= a; return c; }
 const size_t kMaxBody = 32u << 20;        // ответ по AS бывает на мегабайты
 const size_t kMaxShow = 1u << 20;         // столько текста JSON показываем в окне
 
+// Потоки проверки отсоединены — при закрытии окна их не дождаться, считаем
+// сами. Счётчик растёт до запуска потока, уменьшается в его конце.
+std::atomic<int> s_workers{0};
+
 // ------------------------------------------------------------------
 // JSON: небольшой разборщик в дерево (порядок ключей как в ответе)
 // ------------------------------------------------------------------
@@ -538,6 +542,7 @@ void sseBlock(const std::string& block, std::string& name, std::string& data) {
 }
 
 void worker(std::shared_ptr<RknState> st) {
+    struct Exit { ~Exit() { s_workers--; } } onExit;   // и при исключении
     std::string target;
     bool withProbe;
     {
@@ -1047,9 +1052,11 @@ void startCheck(const std::string& raw) {
         finishLocked(*st);
         return;
     }
+    s_workers++;
     try {
         std::thread(worker, st).detach();
     } catch (...) {
+        s_workers--;
         st->checkErr = "не удалось запустить поток проверки";
         finishLocked(*st);
     }
@@ -1760,6 +1767,8 @@ void drawIntro() {
 }
 
 } // namespace
+
+bool rknRunning() { return s_workers > 0; }
 
 void rknCheck(const std::string& target) {
     snprintf(s_input, sizeof(s_input), "%s", target.c_str());

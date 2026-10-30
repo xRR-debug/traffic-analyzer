@@ -2040,9 +2040,10 @@ static int tcpProbeBanner(const std::string& ip, int port, int timeoutMs,
         u_long bl = 0; ioctlsocket(s, FIONBIO, &bl);
         if (banner) {
             sockSetTimeoutMs(s, SO_RCVTIMEO, 600);
-            // веб-порты сами не представляются — подтолкнём HEAD-запросом
+            // веб-порты сами не представляются — подтолкнём HEAD-запросом.
+            // 443/8443 — TLS: на открытый текст там ответят TLS-алертом, не баннером
             bool webPort = (port==80||port==8080||port==8000||port==8888||
-                            port==443||port==8443||port==3000||port==5000);
+                            port==3000||port==5000);
             if (webPort) {
                 std::string req = "HEAD / HTTP/1.0\r\nHost: probe\r\n\r\n";
                 send(s, req.c_str(), (int)req.size(), 0);

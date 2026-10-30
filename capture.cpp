@@ -27,6 +27,9 @@ void runCaptureMode() {
     // совместимости с WinPcap). Грузим по полному пути и НЕ выгружаем: delay-load
     // возьмёт уже загруженный модуль по имени и не пойдёт искать DLL в каталоге
     // exe / текущем каталоге (подмена DLL в процессе с правами администратора).
+    // SetDllDirectoryW действует на весь процесс — по выходе из режима вернуть
+    // обычный порядок поиска DLL (Packet.dll к этому времени уже загружена)
+    struct DllDirReset { ~DllDirReset() { SetDllDirectoryW(nullptr); } } dllDirReset;
     HMODULE hWpcap = nullptr;
     {
         wchar_t sysDir[MAX_PATH] = {0};
@@ -139,6 +142,11 @@ void runCaptureMode() {
             if (p >= 1 && p <= 65535) { filter = "port " + filter;
                 printf("  (фильтр развёрнут в: %s)\n", filter.c_str()); }
         } else if (looksIp) {
+            in_addr a4;
+            if (inet_pton(AF_INET, filter.c_str(), &a4) != 1) {
+                printf("%sНеверный IP-адрес: %s%s\n", C::RED, filter.c_str(), C::RST);
+                pcap_freealldevs(alldevs); return;
+            }
             filter = "host " + filter;
             printf("  (фильтр развёрнут в: %s)\n", filter.c_str());
         }
@@ -159,13 +167,20 @@ void runCaptureMode() {
     if (!filter.empty()) {
         bpf_program fp;
         bpf_u_int32 net = 0;
-        if (pcap_compile(h, &fp, filter.c_str(), 1, net) == -1) {
-            printf("%sОшибка в фильтре: %s%s\n", C::YEL, pcap_geterr(h), C::RST);
-            printf("Продолжаю без фильтра.\n");
+        // без фильтра не продолжаем: в файл ушёл бы весь трафик интерфейса,
+        // в том числе чужой
+        bool ok = pcap_compile(h, &fp, filter.c_str(), 1, net) != -1;
+        if (!ok) {
+            printf("%sОшибка в фильтре: %s%s\n", C::RED, pcap_geterr(h), C::RST);
         } else {
-            if (pcap_setfilter(h, &fp) == -1)
-                printf("%sНе удалось применить фильтр: %s%s\n", C::YEL, pcap_geterr(h), C::RST);
+            ok = pcap_setfilter(h, &fp) != -1;
+            if (!ok)
+                printf("%sНе удалось применить фильтр: %s%s\n", C::RED, pcap_geterr(h), C::RST);
             pcap_freecode(&fp);
+        }
+        if (!ok) {
+            printf("Захват не начат. Исправьте фильтр или оставьте его пустым.\n");
+            pcap_close(h); pcap_freealldevs(alldevs); return;
         }
     }
 
@@ -238,6 +253,9 @@ void runCaptureMode() {
 
     g_traceAbort = false;
     long long pktCount = 0, byteCount = 0;
+    // сбрасываем буфер файла раз в секунду: при закрытии консоли или падении
+    // хвост захвата не пропадёт
+    auto lastFlush = std::chrono::steady_clock::now();
     struct pcap_pkthdr* hdr = nullptr;
     const u_char* data = nullptr;
     while (!g_traceAbort) {
@@ -250,11 +268,14 @@ void runCaptureMode() {
                        C::BWHT, pktCount, C::RST, byteCount);
                 fflush(stdout);
             }
-        } else if (r == 0) {
-            continue;            // таймаут чтения — проверяем Ctrl+C и дальше
-        } else {                 // ошибка или EOF
+        } else if (r != 0) {     // ошибка или EOF (0 — таймаут чтения)
             printf("\n%sЗахват прерван: %s%s\n", C::YEL, pcap_geterr(h), C::RST);
             break;
+        }
+        auto now = std::chrono::steady_clock::now();
+        if (now - lastFlush >= std::chrono::seconds(1)) {
+            pcap_dump_flush(dumper);
+            lastFlush = now;
         }
     }
 
