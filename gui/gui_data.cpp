@@ -19,6 +19,11 @@ std::mutex g_titleMx;
 std::string g_title;
 std::thread g_job;
 
+// ---- пинг без остановки (вне слота задач, со своим флагом отмены) ----
+std::atomic<bool> g_pingRunning{false};
+std::atomic<bool> g_pingAbort{false};
+std::thread g_ping;
+
 // ---- запущенные инструменты ----
 #ifdef _WIN32
 struct ToolEntry { HANDLE h; int mode; std::string title; };
@@ -668,8 +673,10 @@ std::string jobTitle() {
 }
 
 bool jobMustAbortOnExit() {
-    if (g_busy) return true;
+    // пинг может ждать ответа до 2 с — закрытие окна этим не держим
+    if (g_busy || g_pingRunning) return true;
     if (g_job.joinable()) g_job.join();
+    if (g_ping.joinable()) g_ping.join();
     return false;
 }
 
@@ -728,6 +735,40 @@ void startIpOwner(const std::string& target) {
     if (t.empty()) return;
     startJob("Кому принадлежит: " + t, [t] { runIpOwnerFor(t); });
 }
+
+// Пинг без остановки: свой поток и свой журнал, слот задач не занимает — пока
+// он идёт, можно грузить и разбирать дампы. Отмена — своим флагом, а не
+// g_traceAbort, который задача сбрасывает при старте.
+LogBuffer& pingLog() {
+    static LogBuffer log;
+    return log;
+}
+
+void startPing(const std::string& target, int intervalMs) {
+    std::string t = trim(target);
+    if (t.empty() || g_pingRunning) return;
+    if (g_ping.joinable()) g_ping.join();   // предыдущий уже закончился
+    // флаги — до запуска потока: «Стоп», нажатый сразу после «Старт», не
+    // потеряется, а первый же кадр покажет «Стоп»
+    g_pingAbort = false;
+    g_pingRunning = true;
+    pingLog().clear();
+    g_ping = std::thread([t, intervalMs] {
+        struct Done { ~Done() { g_pingRunning = false; } } done;   // и при исключении
+        auto out = [](const std::string& s) { pingLog().append(s.data(), s.size()); };
+        try {
+            runContinuousPing(t, intervalMs, g_pingAbort, out);
+        } catch (const std::exception& e) {
+            out(std::string(C::RED) + "Ошибка: " + e.what() + C::RST + "\n");
+        } catch (...) {
+            out(std::string(C::RED) + "Неизвестная ошибка пинга." + C::RST + "\n");
+        }
+    });
+}
+
+bool pingRunning() { return g_pingRunning; }
+
+void stopPing() { g_pingAbort = true; }
 
 void startCompare(std::vector<std::string> pathsA, std::vector<std::string> pathsB) {
     if (pathsB.empty()) return;

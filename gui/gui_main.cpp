@@ -499,7 +499,8 @@ int RunGuiMain(const std::vector<std::string>& files) {
 
     logLine(C::BCYN, "TrafficAnalyzer — анализ дампов трафика абонента (MARYNONET)");
     logLine(C::GRY, "Откройте дамп (Ctrl+O) или перетащите .pcap/.pcapng/.txt на окно. "
-                    "Два файла «..._in» и «..._out» загружаются как один набор.");
+                    "Два файла «..._in» и «..._out» загружаются как один набор, "
+                    "точки «..._lan»/«..._natlan»/«..._natwan»/«..._wan» — тоже.");
     if (!cfg().warnings.empty()) {
         logLine(C::YEL, "Ошибки в " + (cfg().loadedFrom.empty() ? std::string("analyzer.ini")
                                                                 : cfg().loadedFrom) + ":");

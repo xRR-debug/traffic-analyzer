@@ -50,6 +50,7 @@
 #include <cmath>
 #include <mutex>
 #include <atomic>
+#include <functional>
 
 #include "config.h"
 
@@ -239,6 +240,8 @@ struct Packet {
     // контрольной суммы + неизменяемая часть L4. Совпадает у копий одного пакета,
     // снятых в двух точках, — по нему loadDumpSet склеивает дубли из двух файлов
     uint32_t    wireHash = 0;
+    // то же без адресов, портов и IP ID (их меняет NAT) — сверка точек до и после NAT
+    uint32_t    natHash = 0;
     int         wgType = 0;      // WireGuard по сигнатуре payload: 1=init(148B), 2=response(92B), 0=нет
     // IPsec (UDP 500/4500): 1 = IKE_SA_INIT / открытая фаза 1 IKEv1, 2 = IKE дальше
     // (IKE_AUTH, CHILD_SA, INFORMATIONAL, шифрованный IKEv1), 3 = ESP-данные в UDP; 0 = нет/не видно
@@ -528,7 +531,10 @@ void compareDumpSets(const DumpRef& a, const DumpRef& b);
 std::vector<long long> absTimes(const std::vector<Packet>& packets);
 
 // ---- parser.cpp ----
-std::string siblingDumpPath(const std::string& path);
+// остальные файлы набора рядом с path: пара «_in»/«_out» или точки NAT
+std::vector<std::string> dumpSetSiblings(const std::string& path);
+// точка набора NAT по имени: 0..3 — «_lan»/«_natlan»/«_natwan»/«_wan»; -1 — нет
+int natPointOf(const std::string& path);
 long long tsToMicros(const std::string& ts);
 bool loadDumpSet(const std::vector<std::string>& paths,
                  std::vector<Packet>& packets, std::vector<int>& origin);
@@ -635,6 +641,9 @@ void runDnsHonestyMode();   // режим 11: честность DNS (подме
 void runTcp16Mode();        // режим 12: тест обрыва на ~16 КБ по хостингам
 void runIpOwnerMode();      // режим 13: кому принадлежит IP / домен (геобаза + RDAP)
 void runIpOwnerFor(const std::string& input);   // то же без ввода с консоли (для GUI)
+// пинг цели раз в intervalMs, пока не поднят abort (GUI: «Стоп»); вывод — в out
+void runContinuousPing(const std::string& target, int intervalMs, std::atomic<bool>& abort,
+                       const std::function<void(const std::string&)>& out);
 
 // ---- capture.cpp ----
 void runCaptureMode();
